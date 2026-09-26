@@ -1,0 +1,118 @@
+# WHTP2 TBM tracker + Prometheus + Grafana.
+#
+#   docker compose up -d         start everything (first pull of python:3.12-alpine)
+#   docker compose logs -f tbm-exporter
+#   docker compose down          stop (named volumes keep the TSDB and Grafana state)
+#
+# Requires the Compose v2 plugin (`docker compose`); the v1 python
+# docker-compose cannot reconcile containers on current Docker engines.
+#
+# Stack layout, verify commands, and a log of problems hit here and their fixes:
+# README.md and NOTES.md next to this file. Scraper internals and the upstream
+# ArcGIS item ids: scrapers/README.md and scrapers/NOTES.md.
+#
+# `name:` below is load-bearing. The project name would otherwise default to this
+# directory's name, which changed from `bone` to `monitoring` when the stack moved
+# out of ~. That rename would produce a new network and a new project-prefixed
+# `monitoring_exporter-cache` volume (losing the discovered layer config), while
+# the pinned container_name values below collide with the running stack.
+#
+# The exporter is a stdlib-only Python script, so it runs in the official python
+# image with the script bind-mounted from ./scrapers. It binds 0.0.0.0:9109 so
+# Prometheus can reach it over the compose network - do NOT put it back on
+# 127.0.0.1, that only works while Prometheus shares the host network namespace.
+
+name: bone
+
+services:
+  tbm-exporter:
+    image: python:3.12-alpine
+    container_name: wht-tbm-exporter
+    command:
+      - python
+      - /app/wht_tbm_exporter.py
+      - --listen-address=0.0.0.0
+      - --port=9109
+      - --cache-file=/cache/config.json
+      - --cache-ttl=60
+    volumes:
+      - ./scrapers/wht_tbm_exporter.py:/app/wht_tbm_exporter.py:ro
+      - exporter-cache:/cache
+    networks: [monitoring]
+    restart: unless-stopped
+    # TCP probe only: /healthz triggers a real upstream scrape, so probing it
+    # every 30s would hit caportal.com.au far more often than needed.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import socket; socket.create_connection(('127.0.0.1', 9109), 3).close()"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  prometheus:
+    image: prom/prometheus
+    container_name: prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+      - --web.listen-address=0.0.0.0:9090
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    networks: [monitoring]
+    restart: unless-stopped
+    depends_on:
+      tbm-exporter:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:9090/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  grafana:
+    image: grafana/grafana
+    container_name: grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:-admin}"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+    volumes:
+      - grafana-storage:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3000:3000"
+    networks: [monitoring]
+    restart: unless-stopped
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:3000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+networks:
+  monitoring:
+    driver: bridge
+
+volumes:
+  # external: reuse the volumes docker volume create already made, so existing
+  # TSDB blocks and Grafana state survive the move into compose.
+  prometheus-data:
+    name: prometheus-data
+    external: true
+  grafana-storage:
+    name: grafana-storage
+    external: true
+  exporter-cache:

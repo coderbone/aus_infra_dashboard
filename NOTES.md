@@ -121,6 +121,15 @@ don't panic if the first scrape is slow.
   `prometheus.yml` needs `docker compose restart prometheus`.
 - Host is not 24/7-managed: nothing restarts Docker or the stack on reboot
   beyond `restart: unless-stopped`. No systemd unit for the stack.
+- **`patyegarang` has not published a survey report since 2026-09-25**, ~44 h at
+  the time of writing, and it is *not* finished: 441 m of a 1560 m target, ring
+  170. `barangaroo` over the same period is at 229 m of 1567 m, ring 84, and
+  reports every ~10 min. This is upstream, not us — `wht_tbm_scrape_success` is
+  1 and `wht_tbm_config_stale` is 0, so the exporter is scraping and serving
+  fresh layer config. Either that TBM has stopped, or the tracker stopped
+  publishing survey rows for it. The *Report age* panel is what makes it
+  obvious; it goes red at 6 h. Unresolved — do not "fix" it by touching the
+  exporter.
 
 ## 6. After the move (2026-09-27)
 
@@ -207,3 +216,132 @@ TBMs* in metres (`wht_tbm_distance_excavated_m`, `wht_tbm_remaining_distance_m`,
 `wht_tbm_target_distance_m`) and *TBM progress* as a percentage
 (`wht_tbm_progress_ratio`). They are separate panels because the metres series
 and the 0–1 ratio do not share an axis sensibly.
+
+Two stat panels below them show when each TBM last reported, in the viewer's
+local timezone:
+
+| Panel | Query | Unit |
+| --- | --- | --- |
+| *Last survey report* | `wht_tbm_last_report_timestamp_seconds * 1000` | `dateTimeAsIso` |
+| *Report age* | `time() - wht_tbm_last_report_timestamp_seconds` | `dtdhms` |
+
+**The two panels are formatted differently on purpose: one is an instant, one is
+a duration, and Grafana has a different unit family for each. Do not
+"simplify" them onto the same one.**
+
+*Last survey report* shows an **instant** (when the report happened), so it uses
+a Date & time unit. Those all take **milliseconds**, which is why the query is
+multiplied by 1000 — the metric is Unix epoch *seconds* (the exporter divides
+the ArcGIS millisecond value by 1000). Every Date & time formatter bottoms out
+in one helper, and it is `moment().utc(value)`, so the input is milliseconds
+exactly as with `moment(value)`; only `moment.unix()` would mean seconds:
+
+```js
+// grafana-data, date & time formatters
+f  = (h,u) => { const P = n().utc(h); ... return P.local() }
+LE = (h,u) => f(h, tz).format(...)   // dateTimeAsIso, dateTimeAsLocal, ...
+fq = (h,u) => f(h, tz).fromNow()     // dateTimeFromNow -- see below, do not use here
+```
+
+*Report age* shows a **duration**, so it uses a duration unit. `dtdhms`
+("duration (d hh:mm:ss)") takes **seconds**, so that query is left
+unmultiplied and the staleness thresholds are plain seconds (1 h = `3600`,
+6 h = `21600`). It renders `00:13:06` and `1 d 19:43:03`.
+
+**Never use `dateTimeFromNow` for the age.** It is a Date & time unit, so it
+reinterprets the number as an absolute instant, and it caused the second round
+of wrong numbers here. It is a trap because it *nearly* works: an age in seconds
+scaled to ms lands inside 1970, and moment's `fromNow()` buckets
+(`m`/`mm`/`h`/`hh`/`d`/`dd`/`M`/`MM`/`y`/`yy`) read the 1970 instant back as a
+plausible elapsed time — but only while it stays small. Past about a day the
+reinterpretation crosses a bucket boundary and inverts:
+
+| age | `* 1000` with `dateTimeFromNow` | correct, `dtdhms` |
+| --- | --- | --- |
+| 13 min | `1970-01-01 00:13` → "12 minutes ago" (right by luck) | `00:13:06` |
+| 44 h | `1970-01-02 19:41` → **"57 years ago"** | `1 d 19:43:03` |
+
+That is the shape of the bug: one TBM read correctly and the other said "57
+years", which looks like a units error but is really a duration being formatted
+as a date. A duration unit cannot be misread that way.
+
+The general rule: **if the number is a point in time, scale seconds by 1000 and
+use a Date & time unit; if it is an elapsed length, leave it in seconds and use
+a duration unit.** The tells that you have picked wrong are a "seconds old"
+figure that comes back in decades, and an age over ~1 day that reads as months
+or years.
+
+Other things that make *Last survey report* local time, all easy to break:
+
+- The dashboard's `"timezone": "browser"` renders in the *viewer's* own zone.
+  `f` above does `moment.tz.zone(tz)`, which is undefined for `browser`, so it
+  falls through to `P.local()`. Set the dashboard timezone to `utc` and the
+  panel silently switches to UTC.
+- Both queries need `instant: true`. With a range query `time()` ramps across
+  the range and a stat panel reduces it to an arbitrary point.
+
+*Report age* is coloured by staleness — green under 1 h, orange under 6 h, red
+beyond — so a TBM that has stopped publishing stands out. Thresholds compare
+the raw field value, so they are in seconds to match the query.
+
+**These two are separate panels on purpose. Do not merge them back into one
+panel with two queries and a field override.** That was the first attempt: the
+`dateTimeFromNow` unit landed on the *absolute timestamp* field and rendered
+"57 years ago".
+
+The override could not have worked anyway, because the two frames are
+indistinguishable. Asking the datasource for both queries the way the panel does
+returns `frame.name: null` and a field named `Time` for **both** of them —
+
+```bash
+python3 - <<'PY' > /tmp/two-queries.json
+import json, time
+ds = {"type": "prometheus", "uid": "PBFA97CFB590B2093"}
+q = [{"refId": r, "datasource": ds, "instant": True, "range": False,
+      "format": "time_series", "legendFormat": "{{tbm}}", "expr": e}
+     for r, e in (("A", "wht_tbm_last_report_timestamp_seconds"),
+                  ("B", "time() - wht_tbm_last_report_timestamp_seconds"))]
+print(json.dumps({"from": str(int((time.time() - 3600) * 1000)),
+                  "to": str(int(time.time() * 1000)), "queries": q}))
+PY
+curl -s -u admin:admin -H 'Content-Type: application/json' -X POST \
+  localhost:3000/api/ds/query --data-binary @/tmp/two-queries.json
+# refId A | frame.name= None | field.name= 'Time'
+# refId B | frame.name= None | field.name= 'Time'
+```
+
+`legendFormat` is applied in the frontend, not by the datasource, so neither
+`byFrameRefID` nor `byName` has anything reliable to match on, and the override
+silently resolved onto the first field instead of raising an error. One query
+per panel means one field, so the panel's own default unit always applies and
+there is no matcher to get wrong. *Last survey report* also uses
+`colorMode: "none"`, which is what stops the raw 1.79e9 value from rendering as
+a permanent red.
+
+Note the metric name is `..._last_report_timestamp_seconds` (not
+`..._timestamp`) — it is a gauge of epoch seconds, not a Prometheus timestamp
+type.
+
+The dashboard has `"refresh": "5m"`, so these panels re-query on that interval
+rather than only on load. A 5 m refresh against a 5 m `scrape_interval` is fine
+here — the report times only move when the tracker publishes. Note that refresh
+re-runs the *queries* only: a tab that is already open keeps the dashboard model
+it loaded, so a panel edit here needs a page reload before the browser picks it
+up. Check `version` in the API when a panel "did not change":
+
+```bash
+curl -s -u admin:admin localhost:3000/api/dashboards/uid/adr468z \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin)["dashboard"]; print(d["version"], [(p["id"],p["title"],p["fieldConfig"]["defaults"].get("unit")) for p in d["panels"]])'
+```
+
+To check these panels without a browser, run the queries through Prometheus and
+do the arithmetic yourself — they are plain PromQL:
+
+```bash
+curl -s --get --data-urlencode \
+  'query=wht_tbm_last_report_timestamp_seconds * 1000' \
+  localhost:9090/api/v1/query
+curl -s --get --data-urlencode \
+  'query=time() - wht_tbm_last_report_timestamp_seconds' \
+  localhost:9090/api/v1/query
+```

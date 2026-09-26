@@ -5,7 +5,8 @@ tracker as Prometheus metrics and charts it in Grafana.
 
 - `docker-compose.yml` — the three services (`tbm-exporter`, `prometheus`, `grafana`)
 - `prometheus.yml` — scrape config, target `tbm-exporter:9109`
-- `grafana/provisioning/` — Grafana datasource provisioning
+- `grafana/provisioning/` — Grafana datasource and dashboard provisioning
+  (see `NOTES.md` §7 before changing the datasource uid)
 - `scrapers/` — the exporter itself; see `scrapers/README.md` for metrics and
   `scrapers/NOTES.md` for the upstream ArcGIS item ids
 - `NOTES.md` — working notes: layout history, how to move the stack, a log of

@@ -114,9 +114,9 @@ don't panic if the first scrape is slow.
 
 - `GRAFANA_ADMIN_PASSWORD` still unset.
 - No recording or alerting rules; `prometheus.yml` has scrape configs only.
-- The `Western Harbour TBM` dashboard is now wired up to the scraper metrics
-  (see section 7), but there is no dashboard *provisioning* — it lives only in
-  the `grafana-storage` volume, so it will not reappear on a fresh volume.
+- The `Western Harbour TBM` dashboard is provisioned from
+  `grafana/provisioning/dashboards/` (see section 7), but there is no
+  provisioning of Grafana *users* or folders.
 - The exporter has a `web.enable-lifecycle`-style reload nowhere; changing
   `prometheus.yml` needs `docker compose restart prometheus`.
 - Host is not 24/7-managed: nothing restarts Docker or the stack on reboot
@@ -134,37 +134,76 @@ first-scrape jitter for a 5m interval — `/api/v1/targets` showed
 `health: unknown` with a zero `lastScrape` and an empty `lastError` until it
 arrived. That is the symptom in section 3, not a fault.
 
-Grafana carries a second, hand-made datasource `prometheus-1` alongside the
-provisioned `Prometheus` datasource. It lives in the `grafana-storage` volume
-from the pre-compose setup, so provisioning will not remove it. It was pointing
-at `http://localhost:9090`, which can never work — Grafana runs in a container,
-so `localhost` there is the Grafana container itself. Its URL is now
-`http://prometheus:9090`, the compose service name on the `bone_monitoring`
-network, and the dashboard panels use it.
+Grafana used to carry a second, hand-made datasource `prometheus-1` alongside
+the provisioned `Prometheus` datasource. It lived in the `grafana-storage`
+volume from the pre-compose setup and pointed at `http://localhost:9090`, which
+can never work — Grafana runs in a container, so `localhost` there is the
+Grafana container itself. The dashboard panels were moved onto the provisioned
+`Prometheus` datasource and `prometheus-1` is now gone, leaving one datasource.
+If it ever comes back, its URL has to be the service name, not `localhost`.
 
-## 7. Grafana datasource URL
+## 7. Grafana provisioning
 
-**`http://prometheus:9090`, not `http://localhost:9090`.** Grafana reaches
-Prometheus over the compose network by service name, for the same reason the
-exporter has to bind `0.0.0.0` (section 3). The port is not published to the
-host for Grafana's benefit; `9090:9090` is only there for the Prometheus UI on
-the LAN.
+`grafana/provisioning/` is the whole Grafana config, bind-mounted read-only
+from the host and applied on every boot:
 
-Check a datasource from the host with the proxy, which is the real test:
+```
+grafana/provisioning/datasources/prometheus.yml            # the Prometheus datasource
+grafana/provisioning/dashboards/default.yml                # the dashboard file provider
+grafana/provisioning/dashboards/western-harbour-tbm.json   # the dashboard itself
+```
+
+**The datasource URL is `http://prometheus:9090`, not
+`http://localhost:9090`.** Grafana reaches Prometheus over the compose network
+by service name, for the same reason the exporter has to bind `0.0.0.0`
+(section 3). The port is not published for Grafana's benefit; `9090:9090` is
+only there for the Prometheus UI on the LAN.
+
+**The datasource `uid` is pinned to `PBFA97CFB590B2093` and must stay in sync
+with the uid in the dashboard JSON.** Grafana invents a random uid when the
+provisioning file omits one, and the dashboard refers to the datasource by uid,
+so an unpinned uid means the dashboard only works on whichever volume happened
+to be created first. It is an ugly uid, but pinning it means a fresh volume
+reproduces the same identity with no manual step. If you would rather have a
+readable uid, change it in both files, delete the old datasource in the UI, and
+let provisioning recreate it.
+
+**The dashboard uid `adr468z` must stay stable too.** Provisioning matches an
+existing dashboard by uid, so keeping it updates the dashboard in place;
+changing it creates a second copy of the same dashboard.
+
+`allowUiUpdates: true` means the file wins: an edit made in the Grafana UI is
+overwritten by the file within `updateIntervalSeconds` (30). Edit the JSON in
+git instead, or turn the flag off if you would rather work in the UI.
+
+Check a datasource from the host — the proxy is the real test, because it is
+what Grafana itself uses:
 
 ```bash
-curl -s -u admin:admin localhost:3000/api/datasources/uid/<uid>/health
+curl -s -u admin:admin localhost:3000/api/datasources/uid/PBFA97CFB590B2093/health
 curl -s -u admin:admin --get \
-  'localhost:3000/api/datasources/proxy/uid/<uid>/api/v1/query' \
+  'localhost:3000/api/datasources/proxy/uid/PBFA97CFB590B2093/api/v1/query' \
   --data-urlencode 'query=wht_tbm_progress_ratio'
+```
+
+To prove the files reproduce the stack from nothing, run a throwaway Grafana on
+a fresh volume — it must come up with the same datasource uid and the same
+dashboard, and no manual step:
+
+```bash
+docker run -d --name grafana-provision-test -p 127.0.0.1:3300:3000 \
+  -v ~/src/monitoring/grafana/provisioning:/etc/grafana/provisioning:ro \
+  grafana/grafana
+curl -s -u admin:admin localhost:3300/api/datasources
+curl -s -u admin:admin 'localhost:3300/api/search?type=dash-db'
+docker rm -f grafana-provision-test
 ```
 
 Grafana 13 note: `PUT /api/dashboards/uid/<uid>` returns 404. Save dashboards
 with `POST /api/dashboards/db` and the dashboard's numeric `id` instead.
 
-The `Western Harbour TBM` dashboard (uid `adr468z`) has two timeseries panels,
-both on `prometheus-1`: *Western Harbour TBMs* in metres
-(`wht_tbm_distance_excavated_m`, `wht_tbm_remaining_distance_m`,
+The `Western Harbour TBM` dashboard has two timeseries panels: *Western Harbour
+TBMs* in metres (`wht_tbm_distance_excavated_m`, `wht_tbm_remaining_distance_m`,
 `wht_tbm_target_distance_m`) and *TBM progress* as a percentage
 (`wht_tbm_progress_ratio`). They are separate panels because the metres series
 and the 0–1 ratio do not share an axis sensibly.

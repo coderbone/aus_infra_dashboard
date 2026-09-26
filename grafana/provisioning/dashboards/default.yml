@@ -1,0 +1,23 @@
+# Grafana dashboard provider.
+#
+# Every *.json in this directory is loaded into Grafana at boot and re-synced
+# every updateIntervalSeconds. The dashboards are also served straight from the
+# bind mount, so a dashboard file is read-only as far as Grafana is concerned
+# and the files in git are the source of truth.
+#
+# allowUiUpdates: true means a change made in the UI is overwritten by the file
+# on the next sync. Turn it off if you would rather edit dashboards in the UI
+# and treat git as a backup.
+apiVersion: 1
+
+providers:
+  - name: default
+    orgId: 1
+    folder: ""
+    type: file
+    disableDeletion: false
+    allowUiUpdates: true
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/provisioning/dashboards
+      foldersFromFilesStructure: false

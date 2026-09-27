@@ -56,7 +56,7 @@
             },
             "showPoints": "auto",
             "showValues": false,
-            "spanNulls": false,
+            "spanNulls": true,
             "stacking": {
               "group": "A",
               "mode": "none"
@@ -83,7 +83,7 @@
         }
       },
       "gridPos": {
-        "h": 8,
+        "h": 23,
         "w": 12,
         "x": 0,
         "y": 0
@@ -91,9 +91,7 @@
       "id": 1,
       "options": {
         "legend": {
-          "calcs": [
-            "uniqueValues"
-          ],
+          "calcs": [],
           "displayMode": "list",
           "placement": "bottom",
           "showLegend": true
@@ -181,7 +179,7 @@
             },
             "showPoints": "auto",
             "showValues": false,
-            "spanNulls": false,
+            "spanNulls": true,
             "stacking": {
               "group": "A",
               "mode": "none"
@@ -209,7 +207,7 @@
         }
       },
       "gridPos": {
-        "h": 8,
+        "h": 23,
         "w": 12,
         "x": 12,
         "y": 0
@@ -217,10 +215,7 @@
       "id": 2,
       "options": {
         "legend": {
-          "calcs": [
-            "lastNotNull",
-            "mean"
-          ],
+          "calcs": [],
           "displayMode": "list",
           "placement": "bottom",
           "showLegend": true
@@ -276,7 +271,7 @@
         "h": 4,
         "w": 12,
         "x": 0,
-        "y": 8
+        "y": 23
       },
       "id": 3,
       "options": {
@@ -332,14 +327,14 @@
                 "color": "green",
                 "value": null
               },
-                    {
-                      "color": "orange",
-                      "value": 3600
-                    },
-                    {
-                      "color": "red",
-                      "value": 21600
-                    }
+              {
+                "color": "orange",
+                "value": 3600
+              },
+              {
+                "color": "red",
+                "value": 21600
+              }
             ]
           },
           "unit": "dtdhms"
@@ -349,7 +344,7 @@
         "h": 4,
         "w": 12,
         "x": 12,
-        "y": 8
+        "y": 23
       },
       "id": 4,
       "options": {

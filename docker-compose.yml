@@ -35,6 +35,17 @@ services:
       - --port=9109
       - --cache-file=/cache/config.json
       - --cache-ttl=60
+      - --retries=3
+      - --retry-budget=6
+    # Docker's embedded resolver (127.0.0.11 -> systemd-resolved) intermittently
+    # gives up on the ArcGIS hosts with EAI_AGAIN, and when it does it burns a
+    # full 5s before failing. Measured during a live failure window: default
+    # resolver 2/130 lookups failed at ~5005ms each, while 1.1.1.1 and 9.9.9.9
+    # had 0/141 and 0/147. That 5s cliff is what ate the retry budget, so point
+    # the container at public resolvers. --retry-budget stays as a backstop.
+    dns:
+      - 1.1.1.1
+      - 9.9.9.9
     volumes:
       - ./scrapers/wht_tbm_exporter.py:/app/wht_tbm_exporter.py:ro
       - exporter-cache:/cache

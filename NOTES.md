@@ -65,6 +65,53 @@ the old bind mounts. Only `up -d` recreates containers and picks up new paths.
 
 Each of these cost time; check they haven't regressed.
 
+- **Intermittent `EAI_AGAIN` from the ArcGIS endpoints, losing whole scrapes.**
+  The interesting part is what the measurements *ruled out*, so don't "fix" this
+  again by swapping the DNS.
+
+  Shipped: transient-failure retries with exponential backoff **and jitter**,
+  per-TBM error isolation, `wht_tbm_info` retained from a cache of the last good
+  read, and `wht_tbm_config_stale` split out from scrape success (it used to go
+  to 1 on *any* failure, which mislabelled an upstream outage as a config
+  problem). `collect()` now returns `(samples, errors)`; `wht_tbm_scrape_success`
+  is 0 if *any* TBM failed, so partial data is never mistaken for complete data.
+  HTTP error responses are deliberately not retried — those are real answers.
+
+  The retry budget is the load-bearing part. A failing lookup takes ~5s to give
+  up, so the first version (3 retries, count-bounded) measured **23.7s for a
+  single request** and 48s for a real scrape. Two TBMs would run to ~47s and blow
+  through Prometheus's 30s `scrape_timeout`, which marks the target *down* — a
+  worse outcome than the gap we were trying to close. `--retry-budget`
+  (default 6s) caps total retry time per request, keeping scrapes at 1-10s.
+  If you raise `scrape_timeout`, raise the budget with it; if you lower it,
+  lower the budget.
+
+  The resolver was the underlying culprit and is now overridden in compose
+  (`dns: [1.1.1.1, 9.9.9.9]`). **The first measurement of this was wrong, and
+  the way it was wrong is the useful part.** Comparing resolvers while DNS was
+  healthy made the default look fine — 30/30 at 2ms median against 8-9ms for
+  public resolvers — and the obvious conclusion was "don't touch it, the
+  failures are just burst-correlated". Re-measuring *during a live failure
+  window* reversed that: the default resolver's failures take **exactly
+  5005ms** (a 5s upstream timeout, not a fast `EAI_AGAIN`), 2 of 130 lookups,
+  while 1.1.1.1 and 9.9.9.9 returned 0/141 and 0/147. The 2ms median was
+  measuring the healthy path and hiding a 5s cliff. That cliff is what ate the
+  whole retry budget — two of them exhaust it, which is exactly the 21s scrape
+  observed live. So: measure failure latency during an outage, not success
+  latency during health, and do not let a good median average away a cliff.
+  Post-change, 176 in-container lookups through the override: 0 failures, 9ms
+  median, 166ms max.
+
+  Both fixes are kept deliberately. The resolver removes the failure mode; the
+  retry and budget are the backstop for when public resolvers blip too, and the
+  budget is the only thing that guarantees a scrape stays inside
+  `scrape_timeout` regardless of cause.
+
+  Also noted: the exporter serves HTTP 200 on `/metrics` even when the upstream
+  scrape fails, so the Prometheus target stays `up` and only the gauge gap plus
+  `wht_tbm_scrape_success` reveal the failure. That is intentional (see
+  section 7) but it means `up` is not a health signal here.
+
 - **"Works on curl localhost, dead from the container."** The exporter defaulted
   to `--listen-address 127.0.0.1`. On a bridge network, `127.0.0.1` inside a
   container is that container. Fixed by binding `0.0.0.0` in compose while
@@ -106,12 +153,39 @@ curl -s --get --data-urlencode 'query=up{job="wht_tbm"}' localhost:9090/api/v1/q
 docker compose logs --tail 20 tbm-exporter          # upstream errors land here
 ```
 
+The exporter's own timing gauge is the quickest check that the DNS retry path is
+behaving — a durable scrape should sit around 1-10s, not tens of seconds:
+
+```bash
+curl -s --get --data-urlencode \
+  'query=max_over_time(wht_tbm_scrape_duration_seconds[1h])' \
+  localhost:9090/api/v1/query
+```
+
+Transient retry warnings in the exporter log are expected and self-clearing:
+
+```
+WARNING transient failure (attempt 1 of 4) on https://...: [Errno -3] Try again; retrying in 0.4s
+```
+
 First `/metrics` request after an exporter restart is cold: it does full
 discovery and takes ~5-9 s. `scrape_timeout` is 30 s, so that is fine, but
 don't panic if the first scrape is slow.
 
 ## 5. Not done / open
 
+- **The exporter loses ~6.6% of scrapes to intermittent DNS failure.** 19 of
+  289 scrapes failed in the 24h to 2026-09-28, and 20 of the logged failures
+  were `[Errno -3] Try again` — `EAGAIN` out of `getaddrinfo` resolving
+  `utility.arcgis.com`, not a timeout (the 20s timeout is not close to being
+  reached). Reproduced in the container: 4 of 40 lookups failed, and 40 lookups
+  took 24.5s, ~0.6s each against ~1-20ms for healthy DNS. Consequences:
+  `collect()` had no retry and no per-machine `try`, so the first machine to
+  fail aborted the whole scrape and both TBMs were lost for that interval; and
+  because the gauges were then omitted (see section 7) the ring series got
+  real holes, which breaks any PromQL that needs "the previous sample".
+  **Fixed** — see the exporter section below for what shipped and what the
+  measurements ruled out.
 - `GRAFANA_ADMIN_PASSWORD` still unset.
 - No recording or alerting rules; `prometheus.yml` has scrape configs only.
 - The `Western Harbour TBM` dashboard is provisioned from
@@ -278,6 +352,41 @@ the 0–1 ratio and the ring count do not share an axis sensibly.
 column. *Western Harbour TBMs* hides the two `<tbm> excavated` series via a
 `hideSeriesFrom` field override, so the excavated line is on its own axis
 scale from the remaining and target distances.
+
+*Rings* uses `lineInterpolation: stepAfter`, because the metric is a step
+function: scraped every 5m but the ring only advances every few hours, so
+24h of `barangaroo` is 270 samples carrying **3** distinct values (98.9%
+duplicates). A stepped line shows each ring as its own step. This is a
+rendering change only — it does not reduce the sample count, and at 270
+points/series/day there is no performance reason to.
+
+**There is no way to drop the duplicate samples in Prometheus or in a stock
+Grafana transformation, and the obvious workaround is actively unsafe on this
+data.** PromQL evaluates each timestamp independently, so it has no notion of
+"the previous sample"; `offset` is a fixed *time* shift and only approximates
+one. The approximation
+
+```
+wht_tbm_ring_number and (wht_tbm_ring_number != wht_tbm_ring_number offset 5m)
+```
+
+was measured on 24h of real data: it kept 1 of 270 samples and **silently lost
+one of the two real ring changes**, because the series has holes (below) and
+`and` drops any sample whose offset side is empty. The offset value also has to
+be tuned to the panel's step grid — 5m/6m/10m/1h kept 1/1/3/22 samples. Of the
+32 documented Grafana transformations, none collapses consecutive duplicates
+(`Smoothing` does the reverse; `Filter data by values` compares against
+constants, never the previous row).
+
+**The holes were DNS failures, not an intrinsic property of the data.** 19 of
+289 scrapes failed in 24h (6.6%), 20 of those failures logged
+`[Errno -3] Try again` — `EAGAIN` from `getaddrinfo` on `utility.arcgis.com`.
+Reproduced in the container: **4 of 40 lookups failed, and 40 lookups took
+24.5s** (~0.6s each, against ~1-20ms for healthy DNS). `collect()` had no retry
+and no per-machine error handling, so one machine's lookup failing aborted the
+whole scrape and lost *both* TBMs. Fixed in the exporter: transient-failure
+retries plus per-machine isolation, with `wht_tbm_info` retained from cache so
+a failed poll still shows which TBM a hole belongs to. See section 5.
 
 Two stat panels beside *Rings* show when each TBM last reported, in the viewer's
 local timezone:

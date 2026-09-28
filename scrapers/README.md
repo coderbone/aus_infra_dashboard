@@ -35,12 +35,61 @@ CloudFront outage degrades to `wht_tbm_config_stale 1` rather than a dead target
 | `wht_tbm_progress_ratio` | gauge | `tbm` | `distance / target`, 0–1 |
 | `wht_tbm_ring_number` | gauge | `tbm` | Tunnel ring currently being excavated |
 | `wht_tbm_last_report_timestamp_seconds` | gauge | `tbm` | Unix time of the newest survey report |
-| `wht_tbm_scrape_success` | gauge | — | 1 on success, 0 on failure |
-| `wht_tbm_config_stale` | gauge | — | 1 when serving the cached layer config |
+| `wht_tbm_scrape_success` | gauge | — | 1 only if *every* TBM was read; 0 on any per-TBM failure |
+| `wht_tbm_config_stale` | gauge | — | 1 when serving the cached layer config; independent of scrape success |
 | `wht_tbm_scrape_duration_seconds` | gauge | — | Wall time of the last scrape |
 | `wht_tbm_last_scrape_timestamp_seconds` | gauge | — | Unix time of the last scrape |
 
 Unknown values are exported as `NaN`.
+
+`wht_tbm_info` is exported from a cache of the last successful read, so a TBM's
+name and machine number stay visible through a failed poll. The measurement
+gauges are *not* cached: a TBM that cannot be read simply loses its series for
+that scrape, which is what makes the gap honest. `wht_tbm_scrape_success` is
+still 0 in that case, so partial data is never mistaken for complete data.
+
+## Upstream flakiness
+
+The ArcGIS endpoints intermittently fail DNS resolution with
+`socket.gaierror(-3)` (`EAI_AGAIN`, "Try again"). Historically this hit
+**19 of 289 scrapes (6.6%)** over 24h, and because the old collector had no
+per-TBM isolation a single lookup failure blanked *both* TBMs and dropped
+`wht_tbm_info` with them.
+
+Two mitigations, both on by default:
+
+- **Retry with a time budget.** Transient failures (DNS `EAI_AGAIN`, resets,
+  timeouts) are retried with exponential backoff plus jitter. The jitter matters
+  as much as the retry: failures arrive in correlated bursts, so a flat delay
+  just walks back into the same outage and lockstep retries pile both TBM layers
+  onto the resolver at once. HTTP error responses are *not* retried — those are
+  real answers, not faults.
+- **Per-TBM isolation.** Each TBM is read independently, so one failure no
+  longer takes out the other.
+
+Both mitigations ship on by default, and the container also sets
+`dns: [1.1.1.1, 9.9.9.9]` — the retry is the backstop, the resolver is the fix.
+`--retry-budget` (default `6s`) caps the total time one request may spend
+retrying, and is the knob that keeps this safe. A failing lookup on the default
+Docker resolver takes ~5s to give up, so an uncapped loop measured **23.2s for a
+single request** — two TBMs would run to ~47s and blow through Prometheus's 30s
+`scrape_timeout`, converting a recoverable gap into a target marked down. With
+the budget a scrape stays around 1-10s, and a live 21s scrape was observed
+landing safely inside the timeout. Raise the budget only if `scrape_timeout` is
+raised to match.
+
+**Why the resolver is overridden.** The default resolver (Docker's embedded
+`127.0.0.11` forwarding to systemd-resolved) intermittently gives up with
+`EAI_AGAIN` after a full **5s**. Measured during a live failure window: default
+`2/130` lookups failed at `~5005ms` each, `1.1.1.1` `0/141`, `9.9.9.9` `0/147`.
+
+Worth knowing if this is ever re-litigated: comparing resolvers while DNS was
+*healthy* makes the default look better than the public ones (2ms median vs
+8-9ms) and argues for leaving it alone. That is measuring the wrong thing — a
+good median hides the 5s cliff, and the cliff is what consumes the retry
+budget. Measure failure latency during an outage, not success latency during
+health. Post-change: 176 in-container lookups, 0 failures, 9ms median.
+
 
 ## Running
 
@@ -55,7 +104,8 @@ curl -s localhost:9109/healthz
 ```
 
 Options: `--page-url`, `--cache-file`, `--timeout`, `--cache-ttl` (seconds a scrape
-is reused before re-querying upstream, default 60), `--once`, `-v`.
+is reused before re-querying upstream, default 60), `--retries` (default 3),
+`--retry-budget` (default 6s), `--once`, `-v`.
 
 Standard library only — no third-party packages required.
 
@@ -103,3 +153,8 @@ interval is plenty; alert on `wht_tbm_scrape_success == 0` and
 `time() - wht_tbm_last_report_timestamp_seconds`. Note that a long
 `scrape_interval` also delays the *first* scrape by up to a full interval, since
 Prometheus jitters the initial one — keep it at 5m or less.
+
+`scrape_timeout: 30s` is what the retry budget is sized against. If you raise
+the timeout, `--retry-budget` can go up with it; if you lower it, lower the
+budget too. `wht_tbm_scrape_duration_seconds` is the direct signal — sustained
+values near the timeout mean the budget is too generous for your timeout.

@@ -19,6 +19,11 @@ Exposed metrics
     wht_tbm_config_stale                            1 when serving cached layer config
     wht_tbm_scrape_duration_seconds                 last scrape wall time
 
+wht_tbm_scrape_success is 0 if *any* TBM failed, so a partial scrape is still
+reported as a failure. The gauges are then emitted only for the TBMs that did
+answer, and wht_tbm_info is carried over from the last good scrape rather than
+being dropped - it is static metadata, and its absence would break joins on it.
+
 Usage
     wht_tbm_exporter.py                      # serve /metrics on 127.0.0.1:9109
     wht_tbm_exporter.py --once               # print exposition to stdout and exit
@@ -30,11 +35,14 @@ Standard library only.
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import logging
 import math
 import os
+import random
 import re
+import socket
 import sys
 import threading
 import time
@@ -68,7 +76,41 @@ class ScrapeError(Exception):
 # --------------------------------------------------------------------------- #
 
 
-def http_get(url: str, timeout: float) -> bytes:
+# Errnos worth a second attempt. The one actually seen here is EAI_AGAIN (-3,
+# "Try again") out of getaddrinfo: about 10% of lookups fail inside the
+# container (Docker's embedded resolver at 127.0.0.11 forwarding to
+# systemd-resolved), and one failed lookup used to cost the whole scrape.
+# HTTP errors are deliberately absent - the server answered, so an immediate
+# retry is unlikely to differ.
+TRANSIENT_ERRNOS = frozenset(
+    {
+        socket.EAI_AGAIN,  # -3, only in socket, not errno
+        errno.EAGAIN,
+        errno.ECONNRESET,
+        errno.ECONNABORTED,
+    }
+)
+
+
+RETRY_BASE_DELAY = 0.5
+
+
+def is_transient(reason: object) -> bool:
+    """True for faults a second attempt a moment later can plausibly clear."""
+    if isinstance(reason, (TimeoutError, ConnectionResetError, ConnectionAbortedError)):
+        return True
+    return getattr(reason, "errno", None) in TRANSIENT_ERRNOS
+
+
+def http_get(url: str, timeout: float, retries: int = 0, retry_budget: float = 0.0) -> bytes:
+    """Fetch a URL, retrying transient faults.
+
+    `retries` caps the attempt count and `retry_budget` caps the total time
+    spent retrying. The budget is the one that matters: a failing lookup here
+    takes ~5s to give up, so an uncapped retry loop can outlast Prometheus's
+    `scrape_timeout` (30s) and turn a recoverable gap into a target marked
+    down. Bounding by time keeps the failure local to the request.
+    """
     request = urllib.request.Request(
         url,
         headers={
@@ -78,17 +120,50 @@ def http_get(url: str, timeout: float) -> bytes:
             "Accept-Language": "en-AU,en;q=0.9",
         },
     )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return response.read()
-    except urllib.error.HTTPError as exc:
-        raise ScrapeError("GET %s -> HTTP %s" % (url, exc.code)) from exc
-    except urllib.error.URLError as exc:
-        raise ScrapeError("GET %s -> %s" % (url, exc.reason)) from exc
+    started = time.monotonic()
+    for attempt in range(retries + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return response.read()
+        except urllib.error.HTTPError as exc:
+            raise ScrapeError("GET %s -> HTTP %s" % (url, exc.code)) from exc
+        except urllib.error.URLError as exc:
+            spent = time.monotonic() - started
+            if not is_transient(exc.reason):
+                raise ScrapeError("GET %s -> %s" % (url, exc.reason)) from exc
+            if attempt >= retries:
+                raise ScrapeError("GET %s -> %s" % (url, exc.reason)) from exc
+            if retry_budget and spent >= retry_budget:
+                log.warning(
+                    "giving up on %s after %.1fs of retry budget: %s",
+                    url,
+                    spent,
+                    exc.reason,
+                )
+                raise ScrapeError("GET %s -> %s" % (url, exc.reason)) from exc
+            # Exponential backoff with jitter. The failures arrive in
+            # correlated bursts - both TBM layers can fail every attempt
+            # inside the same window - so a flat short delay just walks
+            # into the same outage, and retrying in lockstep piles two
+            # machines onto the resolver at once. Jitter de-synchronises
+            # them.
+            delay = RETRY_BASE_DELAY * (2**attempt)
+            delay *= 0.75 + 0.5 * random.random()
+            log.warning(
+                "transient failure (attempt %d of %d) on %s: %s; retrying in %.1fs",
+                attempt + 1,
+                retries + 1,
+                url,
+                exc.reason,
+                delay,
+            )
+            time.sleep(delay)
+            continue
+    raise ScrapeError("GET %s -> gave up after %d attempts" % (url, retries + 1))
 
 
-def http_get_json(url: str, timeout: float) -> dict:
-    payload = http_get(url, timeout)
+def http_get_json(url: str, timeout: float, retries: int = 0, retry_budget: float = 0.0) -> dict:
+    payload = http_get(url, timeout, retries, retry_budget)
     try:
         return json.loads(payload)
     except ValueError as exc:
@@ -131,8 +206,10 @@ def static_dataset_value(widget: dict, *names: str) -> float | None:
     return None
 
 
-def discover_dashboard_item_id(page_url: str, timeout: float) -> str:
-    page = http_get(page_url, timeout).decode("utf-8", "replace")
+def discover_dashboard_item_id(
+    page_url: str, timeout: float, retries: int = 0, retry_budget: float = 0.0
+) -> str:
+    page = http_get(page_url, timeout, retries, retry_budget).decode("utf-8", "replace")
     match = DASHBOARD_URL_RE.search(page)
     if not match:
         raise ScrapeError("no ArcGIS dashboard id found in %s" % page_url)
@@ -173,8 +250,12 @@ def collect_gauge_config(dashboard: dict) -> dict[str, dict]:
     return collected
 
 
-def web_map_layers(item_id: str, timeout: float) -> dict[str, dict]:
-    web_map = http_get_json(ARCGIS_ITEM_DATA.format(item_id=item_id), timeout)
+def web_map_layers(
+    item_id: str, timeout: float, retries: int = 0, retry_budget: float = 0.0
+) -> dict[str, dict]:
+    web_map = http_get_json(
+        ARCGIS_ITEM_DATA.format(item_id=item_id), timeout, retries, retry_budget
+    )
     layers = {}
     for layer in web_map.get("operationalLayers") or []:
         if layer.get("id") and layer.get("url"):
@@ -185,8 +266,10 @@ def web_map_layers(item_id: str, timeout: float) -> dict[str, dict]:
     return layers
 
 
-def describe_layer(layer_url: str, timeout: float) -> dict:
-    meta = http_get_json(layer_url + "?f=json", timeout)
+def describe_layer(
+    layer_url: str, timeout: float, retries: int = 0, retry_budget: float = 0.0
+) -> dict:
+    meta = http_get_json(layer_url + "?f=json", timeout, retries, retry_budget)
     names = [field["name"] for field in meta.get("fields") or []]
     lower = {name.lower(): name for name in names}
 
@@ -225,9 +308,13 @@ def describe_layer(layer_url: str, timeout: float) -> dict:
     }
 
 
-def discover(page_url: str, timeout: float) -> dict:
-    dashboard_id = discover_dashboard_item_id(page_url, timeout)
-    dashboard = http_get_json(ARCGIS_ITEM_DATA.format(item_id=dashboard_id), timeout)
+def discover(
+    page_url: str, timeout: float, retries: int = 0, retry_budget: float = 0.0
+) -> dict:
+    dashboard_id = discover_dashboard_item_id(page_url, timeout, retries, retry_budget)
+    dashboard = http_get_json(
+        ARCGIS_ITEM_DATA.format(item_id=dashboard_id), timeout, retries, retry_budget
+    )
     log.info("dashboard item %s", dashboard_id)
 
     gauges = collect_gauge_config(dashboard)
@@ -243,7 +330,9 @@ def discover(page_url: str, timeout: float) -> dict:
 
     layers: dict[str, dict] = {}
     for web_map_id in web_map_ids:
-        for layer_id, layer in web_map_layers(web_map_id, timeout).items():
+        for layer_id, layer in web_map_layers(
+            web_map_id, timeout, retries, retry_budget
+        ).items():
             if layer_id in gauges:
                 layers[layer_id] = layer
     if not layers:
@@ -252,7 +341,7 @@ def discover(page_url: str, timeout: float) -> dict:
     machines = {}
     for layer_id, layer in layers.items():
         gauge = gauges[layer_id]
-        info = describe_layer(layer["url"], timeout)
+        info = describe_layer(layer["url"], timeout, retries, retry_budget)
         slug = layer_slug(layer["title"])
         machines[slug] = {
             "tbm": slug,
@@ -306,7 +395,9 @@ def save_cache(path: str, config: dict) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def latest_record(machine: dict, timeout: float) -> dict:
+def latest_record(
+    machine: dict, timeout: float, retries: int = 0, retry_budget: float = 0.0
+) -> dict:
     out_fields = [
         field
         for field in (
@@ -326,7 +417,7 @@ def latest_record(machine: dict, timeout: float) -> dict:
         "f": "json",
     }
     url = machine["layer_url"] + "/query?" + urllib.parse.urlencode(params)
-    data = http_get_json(url, timeout)
+    data = http_get_json(url, timeout, retries, retry_budget)
     if "error" in data:
         raise ScrapeError("query failed: %s" % data["error"])
     features = data.get("features") or []
@@ -340,38 +431,53 @@ def machine_number(name: str) -> str:
     return match.group(1) if match else ""
 
 
-def collect(config: dict, timeout: float) -> list[dict]:
-    samples = []
+def collect(
+    config: dict, timeout: float, retries: int = 0, retry_budget: float = 0.0
+) -> tuple[list[dict], list[str]]:
+    """Gather the latest record per TBM.
+
+    Each machine is isolated: one failing layer costs that TBM's sample and no
+    others. Returns the samples that did succeed plus a list of per-machine
+    errors, so the caller can still serve partial data while reporting the
+    scrape as failed.
+    """
+    samples: list[dict] = []
+    errors: list[str] = []
     for slug, machine in sorted(config["machines"].items()):
-        attributes = latest_record(machine, timeout)
-        name = str(attributes.get(machine["name_field"]) or machine["layer_title"])
-        distance = attributes.get(machine["progress_field"])
-        target = machine.get("target_m")
+        try:
+            attributes = latest_record(machine, timeout, retries, retry_budget)
+            name = str(attributes.get(machine["name_field"]) or machine["layer_title"])
+            distance = attributes.get(machine["progress_field"])
 
-        if distance is None:
-            raise ScrapeError("null progress value for %r" % name)
-        distance = float(distance)
-        if target:
-            target = float(target)
+            if distance is None:
+                raise ScrapeError("null progress value for %r" % name)
+            distance = float(distance)
+            target = machine.get("target_m")
+            if target:
+                target = float(target)
 
-        samples.append(
-            {
-                "tbm": slug,
-                "name": name,
-                "machine": machine_number(name),
-                "distance_m": distance,
-                "target_m": target,
-                "remaining_m": (target - distance) if target else None,
-                "ratio": (distance / target) if target and target > 0 else None,
-                "ring": attributes.get(machine["ring_field"]) if machine["ring_field"] else None,
-                "reported_at": (
-                    attributes[machine["timestamp_field"]] / 1000.0
-                    if machine["timestamp_field"] and attributes.get(machine["timestamp_field"])
-                    else None
-                ),
-            }
-        )
-    return samples
+            samples.append(
+                {
+                    "tbm": slug,
+                    "name": name,
+                    "machine": machine_number(name),
+                    "distance_m": distance,
+                    "target_m": target,
+                    "remaining_m": (target - distance) if target else None,
+                    "ratio": (distance / target) if target and target > 0 else None,
+                    "ring": attributes.get(machine["ring_field"]) if machine["ring_field"] else None,
+                    "reported_at": (
+                        attributes[machine["timestamp_field"]] / 1000.0
+                        if machine["timestamp_field"] and attributes.get(machine["timestamp_field"])
+                        else None
+                    ),
+                }
+            )
+        except (ScrapeError, ValueError, KeyError, OSError) as exc:
+            log.error("%s: %s", slug, exc)
+            errors.append("%s: %s" % (slug, exc))
+    return samples, errors
+
 
 
 # --------------------------------------------------------------------------- #
@@ -394,12 +500,22 @@ def fmt(value) -> str:
     return repr(round(number, 4))
 
 
-def render(samples: list[dict], success: bool, stale: bool, duration: float, generated: float) -> str:
+def render(
+    samples: list[dict],
+    identities: list[dict],
+    success: bool,
+    config_stale: bool,
+    duration: float,
+    generated: float,
+) -> str:
     lines = [
         "# HELP wht_tbm_info Static attributes of a WHTP2 tunnel boring machine.",
         "# TYPE wht_tbm_info gauge",
     ]
-    for sample in samples:
+    # Emitted for every known machine, not just the ones that answered this
+    # scrape: these are static facts that do not go stale, and dropping them
+    # because of a transient upstream fault breaks any join on them.
+    for sample in identities:
         lines.append(
             'wht_tbm_info{tbm="%s",name="%s",machine="%s"} 1'
             % (
@@ -432,7 +548,7 @@ def render(samples: list[dict], success: bool, stale: bool, duration: float, gen
         "wht_tbm_scrape_success %d" % (1 if success else 0),
         "# HELP wht_tbm_config_stale Whether the served TBM configuration came from the local cache.",
         "# TYPE wht_tbm_config_stale gauge",
-        "wht_tbm_config_stale %d" % (1 if stale else 0),
+        "wht_tbm_config_stale %d" % (1 if config_stale else 0),
         "# HELP wht_tbm_scrape_duration_seconds Wall time of the last scrape.",
         "# TYPE wht_tbm_scrape_duration_seconds gauge",
         "wht_tbm_scrape_duration_seconds %s" % fmt(duration),
@@ -449,23 +565,38 @@ def render(samples: list[dict], success: bool, stale: bool, duration: float, gen
 
 
 class TbmScraper:
-    def __init__(self, page_url: str, cache_file: str, timeout: float, ttl: float) -> None:
+    def __init__(
+        self,
+        page_url: str,
+        cache_file: str,
+        timeout: float,
+        ttl: float,
+        retries: int = 0,
+        retry_budget: float = 0.0,
+    ) -> None:
         self.page_url = page_url
         self.cache_file = cache_file
         self.timeout = timeout
         self.ttl = ttl
+        self.retries = retries
+        self.retry_budget = retry_budget
         self._config: dict | None = None
         self._config_stale = False
         self._exposition: str | None = None
         self._health = (True, "")
         self._lock = threading.Lock()
         self._fetched_at = 0.0
+        # slug -> {tbm, name, machine}, last seen good. Survives a failed
+        # scrape so wht_tbm_info keeps describing the fleet.
+        self._identities: dict[str, dict] = {}
 
     def config(self) -> dict:
         if self._config is not None:
             return self._config
         try:
-            self._config = discover(self.page_url, self.timeout)
+            self._config = discover(
+                self.page_url, self.timeout, self.retries, self.retry_budget
+            )
             self._config_stale = False
             save_cache(self.cache_file, self._config)
         except ScrapeError as exc:
@@ -482,17 +613,44 @@ class TbmScraper:
         with self._lock:
             started = time.monotonic()
             samples: list[dict] = []
-            error = ""
+            errors: list[str] = []
+            config: dict | None = None
             try:
-                samples = collect(self.config(), self.timeout)
+                config = self.config()
+                samples, errors = collect(
+                    config, self.timeout, self.retries, self.retry_budget
+                )
             except (ScrapeError, ValueError, KeyError) as exc:
+                # Only discovery-level failures land here; a per-machine
+                # failure is already isolated inside collect(). config() can
+                # still re-raise when discovery fails with no cache at all, so
+                # the exposition degrades to "no machines" rather than 500ing.
                 log.error("scrape failed: %s", exc)
-                error = str(exc)
-            success = not error
-            stale = self._config_stale or not success
+                errors = [str(exc)]
+            for sample in samples:
+                self._identities[sample["tbm"]] = {
+                    "tbm": sample["tbm"],
+                    "name": sample["name"],
+                    "machine": sample["machine"],
+                }
+            if config is not None:
+                # Drop identities for machines the config no longer lists. Skipped
+                # when there is no config at all, so there is nothing to prune.
+                known = set(config["machines"])
+                for slug in set(self._identities) - known:
+                    del self._identities[slug]
+            success = not errors
+            error = "; ".join(errors)
             duration = time.monotonic() - started
             self._fetched_at = time.time()
-            self._exposition = render(samples, success, stale, duration, self._fetched_at)
+            self._exposition = render(
+                samples,
+                list(self._identities.values()),
+                success,
+                self._config_stale,
+                duration,
+                self._fetched_at,
+            )
             self._health = (success, error)
             return self._exposition, success
 
@@ -565,6 +723,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=9109)
     parser.add_argument("--timeout", type=float, default=20.0)
     parser.add_argument(
+        "--retries",
+        type=int,
+        default=3,
+        help="retries for transient upstream failures (DNS EAI_AGAIN, resets, timeouts)",
+    )
+    parser.add_argument(
+        "--retry-budget",
+        type=float,
+        default=6.0,
+        help="seconds a single request may spend retrying before giving up; keeps a scrape under Prometheus scrape_timeout",
+    )
+    parser.add_argument(
         "--cache-ttl",
         type=float,
         default=60.0,
@@ -580,7 +750,14 @@ def main(argv: list[str] | None = None) -> int:
         stream=sys.stderr,
     )
 
-    scraper = TbmScraper(args.page_url, args.cache_file, args.timeout, args.cache_ttl)
+    scraper = TbmScraper(
+        args.page_url,
+        args.cache_file,
+        args.timeout,
+        args.cache_ttl,
+        args.retries,
+        args.retry_budget,
+    )
 
     if args.once:
         body, success = scraper.refresh()

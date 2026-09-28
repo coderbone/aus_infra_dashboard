@@ -5,9 +5,11 @@
 # bind mount, so a dashboard file is read-only as far as Grafana is concerned
 # and the files in git are the source of truth.
 #
-# allowUiUpdates: true means a change made in the UI is overwritten by the file
-# on the next sync. Turn it off if you would rather edit dashboards in the UI
-# and treat git as a backup.
+# allowUiUpdates: true lets a dashboard be saved from the UI. The file still
+# wins once the file itself changes - a sync that sees a modified file
+# overwrites the UI copy. A UI save made while the file is unchanged survives,
+# so edit in whichever place suits you; see NOTES.md section 7 for pulling a
+# UI-edited dashboard back into git.
 apiVersion: 1
 
 providers:

@@ -181,9 +181,64 @@ let provisioning recreate it.
 existing dashboard by uid, so keeping it updates the dashboard in place;
 changing it creates a second copy of the same dashboard.
 
-`allowUiUpdates: true` means the file wins: an edit made in the Grafana UI is
-overwritten by the file within `updateIntervalSeconds` (30). Edit the JSON in
-git instead, or turn the flag off if you would rather work in the UI.
+`allowUiUpdates: true` lets a dashboard be saved from the UI. **The file only
+wins once the file changes** — provisioning pushes the file into the database
+when the file itself is newer, and leaves a UI save alone while the file is
+untouched. So you can work in the UI and commit the result (the round trip
+below); you just have to pull it back before someone edits the file, because
+that next file change overwrites whatever the UI holds.
+
+Earlier notes here claimed the opposite — that a UI edit was reverted within
+`updateIntervalSeconds` (30). That is not what happens. A dashboard edited in
+the UI on 2026-09-28 was still intact 36 minutes later, through roughly 72 sync
+cycles, with the provisioning file unchanged since the day before.
+
+**To adopt UI changes into git, pull the dashboard back out of the API — no
+manual export needed.** This is the whole round trip, and it is what produced
+the 2026-09-28 commit:
+
+```bash
+uid=adr468z   # or: curl -s -u admin:admin 'localhost:3000/api/search?type=dash-db'
+curl -s -u admin:admin localhost:3000/api/dashboards/uid/$uid \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin)["dashboard"]; \
+      d.pop("version",None); d["id"]=None; \
+      print(json.dumps(d,indent=2,sort_keys=True))' \
+  > grafana/provisioning/dashboards/western-harbour-tbm.json
+```
+
+Three things to strip or pin before it is a valid provisioning file, all done
+above:
+
+- `version` — instance state, not part of the model. Absent from the committed
+  file, and Grafana manages it.
+- `id` — the database row id of *this* Grafana instance. Reset to `null`, which
+  is what the committed file carries. Otherwise a fresh volume tries to reuse
+  the id.
+- `uid` — deliberately **kept**, not stripped. It is what makes provisioning
+  update the existing dashboard in place instead of creating a duplicate.
+
+The API model is also not byte-identical to what a UI "Export JSON" gives you:
+Grafana materialises defaults on save, so a round trip drops empty
+`"mappings": []`, rewrites the first threshold step's `"value": null` to `0`,
+and adds stat-panel keys like `showPercentChange`. That churn is normal and
+harmless — it only means the first commit after a round trip touches panels
+you did not change. Write it with `indent=2, sort_keys=True` to match the file
+as it stands.
+
+Check what you are about to commit before writing it, so you can tell your own
+edits from Grafana's defaults:
+
+```bash
+curl -s -u admin:admin localhost:3000/api/dashboards/uid/adr468z \
+  | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["dashboard"],indent=2,sort_keys=True))' \
+  > /tmp/live.json
+diff -u grafana/provisioning/dashboards/western-harbour-tbm.json /tmp/live.json
+```
+
+The panel list itself carries a hazard: panels are ordered by `gridPos` `y`
+then `x`, not by array position, so dragging a panel in the UI can leave the
+JSON order looking shuffled while the layout is unchanged. Read `gridPos` when
+diffing, not the array order.
 
 Check a datasource from the host — the proxy is the real test, because it is
 what Grafana itself uses:
@@ -211,13 +266,20 @@ docker rm -f grafana-provision-test
 Grafana 13 note: `PUT /api/dashboards/uid/<uid>` returns 404. Save dashboards
 with `POST /api/dashboards/db` and the dashboard's numeric `id` instead.
 
-The `Western Harbour TBM` dashboard has two timeseries panels: *Western Harbour
-TBMs* in metres (`wht_tbm_distance_excavated_m`, `wht_tbm_remaining_distance_m`,
-`wht_tbm_target_distance_m`) and *TBM progress* as a percentage
-(`wht_tbm_progress_ratio`). They are separate panels because the metres series
-and the 0–1 ratio do not share an axis sensibly.
+The `Western Harbour TBM` dashboard has three timeseries panels: *Western
+Harbour TBMs* in metres (`wht_tbm_distance_excavated_m`,
+`wht_tbm_remaining_distance_m`, `wht_tbm_target_distance_m`), *TBM progress* as
+a percentage (`wht_tbm_progress_ratio`), and *Rings*
+(`wht_tbm_ring_number`). They are separate panels because the metres series,
+the 0–1 ratio and the ring count do not share an axis sensibly.
 
-Two stat panels below them show when each TBM last reported, in the viewer's
+*Western Harbour TBMs* and *TBM progress* are 13 rows tall in a 24-column grid,
+*Rings* is 12 wide below the left one, and the two stats stack in the right-hand
+column. *Western Harbour TBMs* hides the two `<tbm> excavated` series via a
+`hideSeriesFrom` field override, so the excavated line is on its own axis
+scale from the remaining and target distances.
+
+Two stat panels beside *Rings* show when each TBM last reported, in the viewer's
 local timezone:
 
 | Panel | Query | Unit |

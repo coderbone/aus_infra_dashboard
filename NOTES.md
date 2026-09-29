@@ -168,6 +168,54 @@ Transient retry warnings in the exporter log are expected and self-clearing:
 WARNING transient failure (attempt 1 of 4) on https://...: [Errno -3] Try again; retrying in 0.4s
 ```
 
+### TODO 2026-09-29: confirm the DNS fix actually holds
+
+**Check the 24h failure rate.** The retry + per-TBM isolation + DNS override went
+live 2026-09-28 06:30 UTC. Four clean scrapes right after the change is
+suggestive, not proof — the underlying `EAI_AGAIN` bursts are intermittent, so a
+short clean window proves nothing either way. A full day of data does.
+
+```bash
+# 1. failed scrapes in 24h. NOTE: must be == bool 0 + sum_over_time.
+#    count() over a range vector is a parse error in this Prometheus, and the
+#    unfiltered `== 0` variant silently reports 0 because the series is empty.
+curl -s --get --data-urlencode \
+  'query=sum_over_time((wht_tbm_scrape_success == bool 0)[24h:5m])' \
+  localhost:9090/api/v1/query
+
+# 2. gauge gaps, per TBM. 288 is the full 24h at a 5m interval.
+curl -s --get --data-urlencode \
+  'query=count_over_time(wht_tbm_ring_number[24h])' \
+  localhost:9090/api/v1/query
+
+# 3. worst scrape duration. Must stay under the 30s scrape_timeout.
+curl -s --get --data-urlencode \
+  'query=max_over_time(wht_tbm_scrape_duration_seconds[24h])' \
+  localhost:9090/api/v1/query
+```
+
+Compare against the pre-fix baseline (24h to 2026-09-28):
+
+| Check | Baseline | Target |
+| --- | --- | --- |
+| failed scrapes / 24h | 20 (6.6%) | 0 |
+| `wht_tbm_ring_number` samples | 268 / 269 of 288 | 288 / 288 |
+| max scrape duration | 48.3s | well under 30s |
+
+Caveat on the window: `[24h]` is only a clean post-fix measurement once the
+whole 24h falls after 06:30 UTC on 2026-09-29. Checked earlier in the day it
+still contains pre-fix scrapes and the failure count will look worse than it is
+— use a shorter window, or a `query_range` with an explicit start of
+2026-09-28T06:30Z.
+
+Judgement call: a handful of failures is not a regression, it is upstream. What
+*would* mean the fix failed is the max duration creeping back toward 30s, which
+would say the 5s resolver cliff is back and the budget is again being eaten. If
+duration is fine but gaps persist, the resolver override is working and the
+remaining failures are the retry budget giving up correctly — in which case the
+fix is to raise `--retry-budget` and `scrape_timeout` together, not to swap DNS
+again.
+
 First `/metrics` request after an exporter restart is cold: it does full
 discovery and takes ~5-9 s. `scrape_timeout` is 30 s, so that is fine, but
 don't panic if the first scrape is slow.

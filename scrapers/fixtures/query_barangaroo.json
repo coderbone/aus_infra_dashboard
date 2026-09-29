@@ -1,0 +1,59 @@
+{
+  "features": [
+    {
+      "attributes": {
+        "Ring_Number": 93,
+        "TBM": "Barangaroo (M110)",
+        "Timestamp": 1790652017000,
+        "Tunnel_Progress_m": 250.88568
+      }
+    }
+  ],
+  "fields": [
+    {
+      "alias": "TBM",
+      "defaultValue": null,
+      "domain": null,
+      "length": 17,
+      "name": "TBM",
+      "sqlType": "sqlTypeOther",
+      "type": "esriFieldTypeString"
+    },
+    {
+      "alias": "Tunnel_Progress_m",
+      "defaultValue": null,
+      "domain": null,
+      "name": "Tunnel_Progress_m",
+      "sqlType": "sqlTypeOther",
+      "type": "esriFieldTypeDouble"
+    },
+    {
+      "alias": "Ring_Number",
+      "defaultValue": null,
+      "domain": null,
+      "name": "Ring_Number",
+      "sqlType": "sqlTypeOther",
+      "type": "esriFieldTypeInteger"
+    },
+    {
+      "alias": "Timestamp",
+      "defaultValue": null,
+      "domain": null,
+      "length": 8,
+      "name": "Timestamp",
+      "sqlType": "sqlTypeOther",
+      "type": "esriFieldTypeDate"
+    }
+  ],
+  "geometryType": "esriGeometryPoint",
+  "globalIdFieldName": "",
+  "objectIdFieldName": "OBJECTID",
+  "spatialReference": {
+    "latestWkid": 28356,
+    "wkid": 28356
+  },
+  "uniqueIdField": {
+    "isSystemMaintained": true,
+    "name": "OBJECTID"
+  }
+}

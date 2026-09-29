@@ -1,0 +1,8 @@
+{
+  "error": {
+    "code": 400,
+    "details": [],
+    "message": "Item does not exist or is inaccessible.",
+    "messageCode": "CONT_0001"
+  }
+}

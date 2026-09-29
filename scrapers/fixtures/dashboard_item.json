@@ -1,0 +1,1688 @@
+{
+  "authoringApp": "ArcGIS Dashboards",
+  "authoringAppVersion": "5.1.0+259753e880",
+  "desktopView": {
+    "layout": {
+      "rootElement": {
+        "elements": [
+          {
+            "elements": [
+              {
+                "height": 0.9317663303552208,
+                "id": "d0cfe0a1-dbc2-4f65-b818-55116263c6ec",
+                "type": "itemLayoutElement",
+                "width": 1
+              },
+              {
+                "height": 0.06823366964477938,
+                "id": "2d6a56ec-bf64-4d34-9712-a4a0794ca9ba",
+                "type": "itemLayoutElement",
+                "width": 1
+              }
+            ],
+            "height": 1,
+            "id": "9ad87983-ec6f-400a-8930-05b872144424",
+            "orientation": "row",
+            "type": "stackLayoutElement",
+            "width": 0.47099447513812154
+          },
+          {
+            "elements": [
+              {
+                "height": 0.15313080671513468,
+                "id": "d787a480-a6a8-4e1a-9834-e2a0b26a586a",
+                "type": "itemLayoutElement",
+                "width": 1
+              },
+              {
+                "elements": [
+                  {
+                    "height": 1,
+                    "id": "ec9003f4-bec7-4e46-aa4c-6b6a82766f06",
+                    "type": "itemLayoutElement",
+                    "width": 0.4997096602369878
+                  },
+                  {
+                    "height": 1,
+                    "id": "068c3616-c358-4e60-8ceb-e794eec82306",
+                    "type": "itemLayoutElement",
+                    "width": 0.5002903397630122
+                  }
+                ],
+                "height": 0.3468691932848652,
+                "id": "df35b792-7869-42d7-92a1-949100b1b7fe",
+                "orientation": "col",
+                "type": "stackLayoutElement",
+                "width": 1
+              },
+              {
+                "height": 0.14641905481980222,
+                "id": "498fcaa5-f4f3-43e0-a5cc-2ceaf0d09a8e",
+                "type": "itemLayoutElement",
+                "width": 1
+              },
+              {
+                "elements": [
+                  {
+                    "height": 1,
+                    "id": "743244be-0548-4e26-bc28-7eef0c0d2bfc",
+                    "type": "itemLayoutElement",
+                    "width": 0.4997096602369876
+                  },
+                  {
+                    "height": 1,
+                    "id": "32bd16c2-de0d-4541-b369-f20114133da0",
+                    "type": "itemLayoutElement",
+                    "width": 0.5002903397630124
+                  }
+                ],
+                "height": 0.3535809451801978,
+                "id": "80006aa8-84c1-431d-b426-f1067f2560c9",
+                "orientation": "col",
+                "type": "stackLayoutElement",
+                "width": 1
+              }
+            ],
+            "height": 1,
+            "id": "0791e362-1ba4-4be6-824f-4959d6032c5d",
+            "orientation": "row",
+            "type": "stackLayoutElement",
+            "width": 0.5290055248618786
+          }
+        ],
+        "height": 1,
+        "id": "758759a5-0885-4776-b6c0-3fad51990946",
+        "orientation": "col",
+        "type": "stackLayoutElement",
+        "width": 1
+      },
+      "type": "dockingLayout"
+    },
+    "settings": {
+      "allowElementResizing": false,
+      "allowReset": false
+    },
+    "type": "desktop",
+    "widgets": [
+      {
+        "dashboardItemType": "widget",
+        "editingEnabled": false,
+        "flashRepeats": 3,
+        "focusModeEnabled": false,
+        "id": "d0cfe0a1-dbc2-4f65-b818-55116263c6ec",
+        "itemId": "644ba22abece4a08bd5795ec50160d50",
+        "linkedMapWidgetIds": [],
+        "mapTools": [
+          {
+            "type": "bookmarksTool"
+          }
+        ],
+        "name": "Web Map",
+        "noDataState": {},
+        "noFilterState": {},
+        "scalebarStyle": "none",
+        "selectTool": {
+          "advanceSketchTools": [],
+          "clickToSelect": false,
+          "type": "selectTool"
+        },
+        "selectionColor": "#000000",
+        "showCompass": true,
+        "showLocate": false,
+        "showMeasureTool": false,
+        "showNavigation": false,
+        "showPanRotate": false,
+        "showPopup": true,
+        "trackedFeatureRadius": 60,
+        "type": "mapWidget"
+      },
+      {
+        "contentType": "document",
+        "dashboardItemType": "widget",
+        "datasets": [],
+        "focusModeEnabled": false,
+        "id": "d787a480-a6a8-4e1a-9834-e2a0b26a586a",
+        "imageRefreshInterval": 0,
+        "name": "Barangaroo Header",
+        "noDataState": {},
+        "noFilterState": {},
+        "showFeatureMenu": false,
+        "type": "embeddedContentWidget",
+        "url": "https://experience.arcgis.com/experience/c480edb1c4a24842bd02ea9cef13723d/page/Barangaroo_Desktop",
+        "videoSettings": {
+          "autoplay": false,
+          "controls": true,
+          "controlsList": "nodownload",
+          "loop": false,
+          "muted": false
+        }
+      },
+      {
+        "contentType": "document",
+        "dashboardItemType": "widget",
+        "datasets": [],
+        "focusModeEnabled": false,
+        "id": "498fcaa5-f4f3-43e0-a5cc-2ceaf0d09a8e",
+        "imageRefreshInterval": 0,
+        "name": "Patyegarang Header",
+        "noDataState": {},
+        "noFilterState": {},
+        "showFeatureMenu": false,
+        "type": "embeddedContentWidget",
+        "url": "https://experience.arcgis.com/experience/fa1042d71af34e03acc2b773435a3ab3/page/Patyegarang_Desktop",
+        "videoSettings": {
+          "autoplay": false,
+          "controls": true,
+          "controlsList": "nodownload",
+          "loop": false,
+          "muted": false
+        }
+      },
+      {
+        "dashboardItemType": "widget",
+        "datasets": [],
+        "focusModeEnabled": false,
+        "id": "2d6a56ec-bf64-4d34-9712-a4a0794ca9ba",
+        "name": "Rich text (1)",
+        "noDataState": {},
+        "noFilterState": {},
+        "showFeatureMenu": false,
+        "text": "<p><span style=\"background-color:#ffffff;color:#858585;\"><i>All figures are indicative only</i></span></p>",
+        "type": "richTextWidget",
+        "valueType": "none"
+      },
+      {
+        "backgroundColor": "#ecf2f8",
+        "bottomCaption": "<p><span style=\"color:hsl( 0, 33%, 94% );\">-</span></p>",
+        "chartConfig": {
+          "axes": [
+            {
+              "guides": [
+                {
+                  "above": false,
+                  "end": "100%",
+                  "name": "background",
+                  "start": "0%",
+                  "style": {
+                    "color": [
+                      214,
+                      214,
+                      214,
+                      255
+                    ],
+                    "style": "esriSFSSolid",
+                    "type": "esriSFS"
+                  },
+                  "tooltipReverseColor": true,
+                  "type": "chartGuide",
+                  "visible": true
+                },
+                {
+                  "above": false,
+                  "name": "value",
+                  "start": "0%",
+                  "style": {
+                    "color": [
+                      45,
+                      76,
+                      120,
+                      255
+                    ],
+                    "style": "esriSFSSolid",
+                    "type": "esriSFS"
+                  },
+                  "tooltipReverseColor": true,
+                  "type": "chartGuide",
+                  "visible": true
+                }
+              ],
+              "innerLabel": {
+                "content": {
+                  "angle": 0,
+                  "font": {
+                    "family": "inherit",
+                    "style": "normal",
+                    "weight": "normal"
+                  },
+                  "type": "esriTS",
+                  "verticalAlignment": "middle"
+                },
+                "type": "chartText",
+                "visible": true
+              },
+              "labels": {
+                "content": {
+                  "angle": 0,
+                  "font": {
+                    "family": "inherit",
+                    "style": "normal",
+                    "weight": "normal"
+                  },
+                  "type": "esriTS"
+                },
+                "type": "chartText",
+                "visible": true
+              },
+              "lineSymbol": {
+                "style": "esriSLSSolid",
+                "type": "esriSLS",
+                "width": 0
+              },
+              "needle": {
+                "endWidth": 1,
+                "innerRadius": 0,
+                "startWidth": 8,
+                "symbol": {
+                  "style": "esriSFSSolid",
+                  "type": "esriSFS"
+                },
+                "type": "gaugeNeedle",
+                "visible": false
+              },
+              "onlyShowFirstAndLastLabels": true,
+              "ticks": {
+                "type": "gaugeAxisTick",
+                "visible": false
+              },
+              "title": {
+                "content": {
+                  "angle": 0,
+                  "font": {
+                    "family": "inherit",
+                    "style": "normal",
+                    "weight": "bold"
+                  },
+                  "type": "esriTS"
+                },
+                "type": "chartText",
+                "visible": true
+              },
+              "type": "chartAxis",
+              "valueFormat": {
+                "intlOptions": {
+                  "maximumFractionDigits": 1,
+                  "minimumFractionDigits": 0,
+                  "notation": "standard",
+                  "style": "decimal"
+                },
+                "type": "number"
+              },
+              "visible": true
+            }
+          ],
+          "endAngle": 30,
+          "innerRadius": 75,
+          "orderOptions": {},
+          "series": [
+            {
+              "dataLabels": {
+                "content": {
+                  "angle": 0,
+                  "font": {
+                    "family": "inherit",
+                    "style": "normal",
+                    "weight": "normal"
+                  },
+                  "type": "esriTS"
+                },
+                "type": "chartText",
+                "visible": true
+              },
+              "dataTooltipReverseColor": true,
+              "dataTooltipVisible": true,
+              "id": "main",
+              "name": "main",
+              "type": "gaugeSeries",
+              "x": "Tunnel_Progress_m"
+            }
+          ],
+          "startAngle": -210,
+          "subType": "featureGauge",
+          "type": "chart",
+          "version": "25.1.0"
+        },
+        "colorThresholds": [],
+        "dashboardItemType": "widget",
+        "datasets": [
+          {
+            "data": {
+              "dataType": "number",
+              "type": "staticValues",
+              "values": [
+                {
+                  "id": "0",
+                  "label": "0",
+                  "type": "labelledValue",
+                  "value": 0
+                }
+              ]
+            },
+            "name": "min",
+            "type": "staticDataset"
+          },
+          {
+            "data": {
+              "dataType": "number",
+              "type": "staticValues",
+              "values": [
+                {
+                  "id": "0",
+                  "label": "1567",
+                  "type": "labelledValue",
+                  "value": 1567
+                }
+              ]
+            },
+            "name": "max",
+            "type": "staticDataset"
+          },
+          {
+            "allowSourceDownload": false,
+            "allowSummaryDownload": false,
+            "dataSource": {
+              "itemId": "644ba22abece4a08bd5795ec50160d50",
+              "layerId": "1a00d5f1e47-layer-9",
+              "type": "layerDataSource"
+            },
+            "groupByFields": [],
+            "maxFeatures": 1,
+            "name": "main",
+            "orderByFields": [],
+            "outFields": [
+              "*"
+            ],
+            "returnDistinctValues": false,
+            "statisticDefinitions": [],
+            "type": "serviceDataset"
+          }
+        ],
+        "displayAsPercentage": false,
+        "focusModeEnabled": false,
+        "id": "ec9003f4-bec7-4e46-aa4c-6b6a82766f06",
+        "name": "B Ring Distance (copy)",
+        "noDataState": {},
+        "noFilterState": {},
+        "noValueState": {},
+        "showFeatureMenu": false,
+        "style": "progress",
+        "topCaption": "<h2 style=\"text-align:center;\"><span style=\"font-size:18px;\"><strong>Distance excavated</strong></span></h2>",
+        "type": "gaugeWidget",
+        "valueFormat": {
+          "maximumFractionDigits": 1,
+          "name": "value",
+          "prefix": false,
+          "style": "decimal",
+          "useGrouping": false,
+          "valueSuffix": "m"
+        },
+        "valueType": "feature"
+      },
+      {
+        "backgroundColor": "#ecf2f8",
+        "bottomCaption": "<p><span style=\"color:hsl( 0, 33%, 94% );\">-</span></p>",
+        "chartConfig": {
+          "axes": [
+            {
+              "guides": [
+                {
+                  "above": false,
+                  "end": "100%",
+                  "name": "background",
+                  "start": "0%",
+                  "style": {
+                    "color": [
+                      214,
+                      214,
+                      214,
+                      255
+                    ],
+                    "style": "esriSFSSolid",
+                    "type": "esriSFS"
+                  },
+                  "tooltipReverseColor": true,
+                  "type": "chartGuide",
+                  "visible": true
+                },
+                {
+                  "above": false,
+                  "name": "value",
+                  "start": "0%",
+                  "style": {
+                    "color": [
+                      45,
+                      76,
+                      120,
+                      255
+                    ],
+                    "style": "esriSFSSolid",
+                    "type": "esriSFS"
+                  },
+                  "tooltipReverseColor": true,
+                  "type": "chartGuide",
+                  "visible": true
+                }
+              ],
+              "innerLabel": {
+                "content": {
+                  "angle": 0,
+                  "font": {
+                    "family": "inherit",
+                    "style": "normal",
+                    "weight": "normal"
+                  },
+                  "type": "esriTS",
+                  "verticalAlignment": "middle"
+                },
+                "type": "chartText",
+                "visible": true
+              },
+              "labels": {
+                "content": {
+                  "angle": 0,
+                  "font": {
+                    "family": "inherit",
+                    "style": "normal",
+                    "weight": "normal"
+                  },
+                  "type": "esriTS"
+                },
+                "type": "chartText",
+                "visible": false
+              },
+              "lineSymbol": {
+                "style": "esriSLSSolid",
+                "type": "esriSLS",
+                "width": 0
+              },
+              "needle": {
+                "endWidth": 1,
+                "innerRadius": 0,
+                "startWidth": 8,
+                "symbol": {
+                  "style": "esriSFSSolid",
+                  "type": "esriSFS"
+                },
+                "type": "gaugeNeedle",
+                "visible": false
+              },
+              "onlyShowFirstAndLastLabels": false,
+              "ticks": {
+                "type": "gaugeAxisTick",
+                "visible": false
+              },
+              "title": {
+                "content": {
+                  "angle": 0,
+                  "font": {
+                    "family": "inherit",
+                    "style": "normal",
+                    "weight": "bold"
+                  },
+                  "type": "esriTS"
+                },
+                "type": "chartText",
+                "visible": true
+              },
+              "type": "chartAxis",
+              "valueFormat": {
+                "intlOptions": {
+                  "maximumFractionDigits": 1,
+                  "minimumFractionDigits": 0,
+                  "notation": "standard",
+                  "style": "decimal"
+                },
+                "type": "number"
+              },
+              "visible": true
+            }
+          ],
+          "endAngle": 270,
+          "innerRadius": 75,
+          "orderOptions": {},
+          "series": [
+            {
+              "dataLabels": {
+                "content": {
+                  "angle": 0,
+                  "font": {
+                    "family": "inherit",
+                    "style": "normal",
+                    "weight": "normal"
+                  },
+                  "type": "esriTS"
+                },
+                "type": "chartText",
+                "visible": true
+              },
+              "dataTooltipReverseColor": true,
+              "dataTooltipVisible": true,
+              "id": "main",
+              "name": "main",
+              "type": "gaugeSeries",
+              "x": "Tunnel_Progress_m"
+            }
+          ],
+          "startAngle": -90,
+          "subType": "featureGauge",
+          "type": "chart",
+          "version": "25.1.0"
+        },
+        "colorThresholds": [],
+        "dashboardItemType": "widget",
+        "datasets": [
+          {
+            "data": {
+              "dataType": "number",
+              "type": "staticValues",
+              "values": [
+                {
+                  "id": "0",
+                  "label": "0",
+                  "type": "labelledValue",
+                  "value": 0
+                }
+              ]
+            },
+            "name": "min",
+            "type": "staticDataset"
+          },
+          {
+            "data": {
+              "dataType": "number",
+              "type": "staticValues",
+              "values": [
+                {
+                  "id": "0",
+                  "label": "1567",
+                  "type": "labelledValue",
+                  "value": 1567
+                }
+              ]
+            },
+            "name": "max",
+            "type": "staticDataset"
+          },
+          {
+            "allowSourceDownload": false,
+            "allowSummaryDownload": false,
+            "dataSource": {
+              "itemId": "644ba22abece4a08bd5795ec50160d50",
+              "layerId": "1a00d5f1e47-layer-9",
+              "type": "layerDataSource"
+            },
+            "groupByFields": [],
+            "maxFeatures": 1,
+            "name": "main",
+            "orderByFields": [],
+            "outFields": [
+              "*"
+            ],
+            "returnDistinctValues": false,
+            "statisticDefinitions": [],
+            "type": "serviceDataset"
+          }
+        ],
+        "displayAsPercentage": true,
+        "focusModeEnabled": false,
+        "id": "068c3616-c358-4e60-8ceb-e794eec82306",
+        "name": "B Ring Total Progress (copy)",
+        "noDataState": {},
+        "noFilterState": {},
+        "noValueState": {},
+        "showFeatureMenu": false,
+        "style": "progress",
+        "topCaption": "<h2 style=\"text-align:center;\"><span style=\"font-size:18px;\"><strong>Total progress completed</strong></span></h2>",
+        "type": "gaugeWidget",
+        "valueFormat": {
+          "name": "value",
+          "prefix": false,
+          "style": "percent",
+          "useGrouping": true
+        },
+        "valueType": "feature"
+      },
+      {
+        "backgroundColor": "#f4e9e9",
+        "bottomCaption": "<p><span style=\"color:hsl( 0, 33%, 94% );\">-</span></p>",
+        "chartConfig": {
+          "axes": [
+            {
+              "guides": [
+                {
+                  "above": false,
+                  "end": "100%",
+                  "name": "background",
+                  "start": "0%",
+                  "style": {
+                    "color": [
+                      214,
+                      214,
+                      214,
+                      255
+                    ],
+                    "style": "esriSFSSolid",
+                    "type": "esriSFS"
+                  },
+                  "tooltipReverseColor": true,
+                  "type": "chartGuide",
+                  "visible": true
+                },
+                {
+                  "above": false,
+                  "name": "value",
+                  "start": "0%",
+                  "style": {
+                    "color": [
+                      118,
+                      53,
+                      39,
+                      255
+                    ],
+                    "style": "esriSFSSolid",
+                    "type": "esriSFS"
+                  },
+                  "tooltipReverseColor": true,
+                  "type": "chartGuide",
+                  "visible": true
+                }
+              ],
+              "innerLabel": {
+                "content": {
+                  "angle": 0,
+                  "font": {
+                    "family": "inherit",
+                    "style": "normal",
+                    "weight": "normal"
+                  },
+                  "type": "esriTS",
+                  "verticalAlignment": "middle"
+                },
+                "type": "chartText",
+                "visible": true
+              },
+              "labels": {
+                "content": {
+                  "angle": 0,
+                  "font": {
+                    "family": "inherit",
+                    "style": "normal",
+                    "weight": "normal"
+                  },
+                  "type": "esriTS"
+                },
+                "type": "chartText",
+                "visible": true
+              },
+              "lineSymbol": {
+                "style": "esriSLSSolid",
+                "type": "esriSLS",
+                "width": 0
+              },
+              "needle": {
+                "endWidth": 1,
+                "innerRadius": 0,
+                "startWidth": 8,
+                "symbol": {
+                  "style": "esriSFSSolid",
+                  "type": "esriSFS"
+                },
+                "type": "gaugeNeedle",
+                "visible": false
+              },
+              "onlyShowFirstAndLastLabels": true,
+              "ticks": {
+                "type": "gaugeAxisTick",
+                "visible": false
+              },
+              "title": {
+                "content": {
+                  "angle": 0,
+                  "font": {
+                    "family": "inherit",
+                    "style": "normal",
+                    "weight": "bold"
+                  },
+                  "type": "esriTS"
+                },
+                "type": "chartText",
+                "visible": true
+              },
+              "type": "chartAxis",
+              "valueFormat": {
+                "intlOptions": {
+                  "maximumFractionDigits": 1,
+                  "minimumFractionDigits": 0,
+                  "notation": "standard",
+                  "style": "decimal"
+                },
+                "type": "number"
+              },
+              "visible": true
+            }
+          ],
+          "endAngle": 30,
+          "innerRadius": 75,
+          "orderOptions": {},
+          "series": [
+            {
+              "dataLabels": {
+                "content": {
+                  "angle": 0,
+                  "font": {
+                    "family": "inherit",
+                    "style": "normal",
+                    "weight": "normal"
+                  },
+                  "type": "esriTS"
+                },
+                "type": "chartText",
+                "visible": true
+              },
+              "dataTooltipReverseColor": true,
+              "dataTooltipVisible": true,
+              "id": "main",
+              "name": "main",
+              "type": "gaugeSeries",
+              "x": "Tunnel_Progress_m"
+            }
+          ],
+          "startAngle": -210,
+          "subType": "featureGauge",
+          "type": "chart",
+          "version": "25.1.0"
+        },
+        "colorThresholds": [],
+        "dashboardItemType": "widget",
+        "datasets": [
+          {
+            "data": {
+              "dataType": "number",
+              "type": "staticValues",
+              "values": [
+                {
+                  "id": "0",
+                  "label": "0",
+                  "type": "labelledValue",
+                  "value": 0
+                }
+              ]
+            },
+            "name": "min",
+            "type": "staticDataset"
+          },
+          {
+            "data": {
+              "dataType": "number",
+              "type": "staticValues",
+              "values": [
+                {
+                  "id": "0",
+                  "label": "1560",
+                  "type": "labelledValue",
+                  "value": 1560
+                }
+              ]
+            },
+            "name": "max",
+            "type": "staticDataset"
+          },
+          {
+            "allowSourceDownload": false,
+            "allowSummaryDownload": false,
+            "dataSource": {
+              "itemId": "644ba22abece4a08bd5795ec50160d50",
+              "layerId": "1a00d56bb59-layer-8",
+              "type": "layerDataSource"
+            },
+            "groupByFields": [],
+            "maxFeatures": 1,
+            "name": "main",
+            "orderByFields": [],
+            "outFields": [
+              "*"
+            ],
+            "returnDistinctValues": false,
+            "statisticDefinitions": [],
+            "type": "serviceDataset"
+          }
+        ],
+        "displayAsPercentage": false,
+        "focusModeEnabled": false,
+        "id": "743244be-0548-4e26-bc28-7eef0c0d2bfc",
+        "name": "P Ring Distance (copy)",
+        "noDataState": {},
+        "noFilterState": {},
+        "noValueState": {},
+        "showFeatureMenu": false,
+        "style": "progress",
+        "topCaption": "<h2 style=\"text-align:center;\"><span style=\"font-size:18px;\"><strong>Distance excavated</strong></span></h2>",
+        "type": "gaugeWidget",
+        "valueFormat": {
+          "maximumFractionDigits": 1,
+          "name": "value",
+          "prefix": false,
+          "style": "decimal",
+          "useGrouping": false,
+          "valueSuffix": "m"
+        },
+        "valueType": "feature"
+      },
+      {
+        "backgroundColor": "#f4e9e9",
+        "bottomCaption": "<p><span style=\"color:hsl( 0, 33%, 94% );\">-</span></p>",
+        "chartConfig": {
+          "axes": [
+            {
+              "guides": [
+                {
+                  "above": false,
+                  "end": "100%",
+                  "name": "background",
+                  "start": "0%",
+                  "style": {
+                    "color": [
+                      214,
+                      214,
+                      214,
+                      255
+                    ],
+                    "style": "esriSFSSolid",
+                    "type": "esriSFS"
+                  },
+                  "tooltipReverseColor": true,
+                  "type": "chartGuide",
+                  "visible": true
+                },
+                {
+                  "above": false,
+                  "name": "value",
+                  "start": "0%",
+                  "style": {
+                    "color": [
+                      118,
+                      53,
+                      39,
+                      255
+                    ],
+                    "style": "esriSFSSolid",
+                    "type": "esriSFS"
+                  },
+                  "tooltipReverseColor": true,
+                  "type": "chartGuide",
+                  "visible": true
+                }
+              ],
+              "innerLabel": {
+                "content": {
+                  "angle": 0,
+                  "font": {
+                    "family": "inherit",
+                    "style": "normal",
+                    "weight": "normal"
+                  },
+                  "type": "esriTS",
+                  "verticalAlignment": "middle"
+                },
+                "type": "chartText",
+                "visible": true
+              },
+              "labels": {
+                "content": {
+                  "angle": 0,
+                  "font": {
+                    "family": "inherit",
+                    "style": "normal",
+                    "weight": "normal"
+                  },
+                  "type": "esriTS"
+                },
+                "type": "chartText",
+                "visible": false
+              },
+              "lineSymbol": {
+                "style": "esriSLSSolid",
+                "type": "esriSLS",
+                "width": 0
+              },
+              "needle": {
+                "endWidth": 1,
+                "innerRadius": 0,
+                "startWidth": 8,
+                "symbol": {
+                  "style": "esriSFSSolid",
+                  "type": "esriSFS"
+                },
+                "type": "gaugeNeedle",
+                "visible": false
+              },
+              "onlyShowFirstAndLastLabels": false,
+              "ticks": {
+                "type": "gaugeAxisTick",
+                "visible": false
+              },
+              "title": {
+                "content": {
+                  "angle": 0,
+                  "font": {
+                    "family": "inherit",
+                    "style": "normal",
+                    "weight": "bold"
+                  },
+                  "type": "esriTS"
+                },
+                "type": "chartText",
+                "visible": true
+              },
+              "type": "chartAxis",
+              "valueFormat": {
+                "intlOptions": {
+                  "maximumFractionDigits": 1,
+                  "minimumFractionDigits": 0,
+                  "notation": "standard",
+                  "style": "decimal"
+                },
+                "type": "number"
+              },
+              "visible": true
+            }
+          ],
+          "endAngle": 270,
+          "innerRadius": 75,
+          "orderOptions": {},
+          "series": [
+            {
+              "dataLabels": {
+                "content": {
+                  "angle": 0,
+                  "font": {
+                    "family": "inherit",
+                    "style": "normal",
+                    "weight": "normal"
+                  },
+                  "type": "esriTS"
+                },
+                "type": "chartText",
+                "visible": true
+              },
+              "dataTooltipReverseColor": true,
+              "dataTooltipVisible": true,
+              "id": "main",
+              "name": "main",
+              "type": "gaugeSeries",
+              "x": "Tunnel_Progress_m"
+            }
+          ],
+          "startAngle": -90,
+          "subType": "featureGauge",
+          "type": "chart",
+          "version": "25.1.0"
+        },
+        "colorThresholds": [],
+        "dashboardItemType": "widget",
+        "datasets": [
+          {
+            "data": {
+              "dataType": "number",
+              "type": "staticValues",
+              "values": [
+                {
+                  "id": "0",
+                  "label": "0",
+                  "type": "labelledValue",
+                  "value": 0
+                }
+              ]
+            },
+            "name": "min",
+            "type": "staticDataset"
+          },
+          {
+            "data": {
+              "dataType": "number",
+              "type": "staticValues",
+              "values": [
+                {
+                  "id": "0",
+                  "label": "1560",
+                  "type": "labelledValue",
+                  "value": 1560
+                }
+              ]
+            },
+            "name": "max",
+            "type": "staticDataset"
+          },
+          {
+            "allowSourceDownload": false,
+            "allowSummaryDownload": false,
+            "dataSource": {
+              "itemId": "644ba22abece4a08bd5795ec50160d50",
+              "layerId": "1a00d56bb59-layer-8",
+              "type": "layerDataSource"
+            },
+            "groupByFields": [],
+            "maxFeatures": 1,
+            "name": "main",
+            "orderByFields": [],
+            "outFields": [
+              "*"
+            ],
+            "returnDistinctValues": false,
+            "statisticDefinitions": [],
+            "type": "serviceDataset"
+          }
+        ],
+        "displayAsPercentage": true,
+        "focusModeEnabled": false,
+        "id": "32bd16c2-de0d-4541-b369-f20114133da0",
+        "name": "P Ring Total Progress (copy)",
+        "noDataState": {},
+        "noFilterState": {},
+        "noValueState": {},
+        "showFeatureMenu": false,
+        "style": "progress",
+        "topCaption": "<h2 style=\"text-align:center;\"><span style=\"font-size:18px;\"><strong>Total progress completed</strong></span></h2>",
+        "type": "gaugeWidget",
+        "valueFormat": {
+          "name": "value",
+          "prefix": false,
+          "style": "percent",
+          "useGrouping": false
+        },
+        "valueType": "feature"
+      }
+    ]
+  },
+  "elementMappings": {
+    "d0cfe0a1-dbc2-4f65-b818-55116263c6ec": "dba0e1a7-8e32-4b4e-baec-1fb9a405da18"
+  },
+  "maxChartRecords": 10000,
+  "maxPaginationRecords": 50000,
+  "mobileView": {
+    "layout": {
+      "rootElement": {
+        "elements": [
+          {
+            "height": 0.06882618123235033,
+            "id": "2c7b37ad-a2c6-44be-bcdc-4b2e8930c411",
+            "type": "itemLayoutElement",
+            "width": 1
+          },
+          {
+            "elements": [
+              {
+                "height": 1,
+                "id": "4f41699b-9c58-497a-a24e-6850d6c2b1e5",
+                "type": "itemLayoutElement",
+                "width": 0.5
+              },
+              {
+                "height": 1,
+                "id": "3c6f1dee-1e01-44d3-9ea3-ff3bba6ccb32",
+                "type": "itemLayoutElement",
+                "width": 0.5
+              }
+            ],
+            "height": 0.1230764751360125,
+            "id": "ff661868-b28b-4c4b-83cb-b2be418753b7",
+            "orientation": "col",
+            "type": "stackLayoutElement",
+            "width": 1
+          },
+          {
+            "height": 0.0756675006712342,
+            "id": "440f9b02-768d-4d53-a690-4a1cd640290c",
+            "type": "itemLayoutElement",
+            "width": 1
+          },
+          {
+            "elements": [
+              {
+                "height": 1,
+                "id": "58d95348-40b0-4598-bf32-0219437561b6",
+                "type": "itemLayoutElement",
+                "width": 0.5
+              },
+              {
+                "height": 1,
+                "id": "9ab9117e-17c8-4130-a282-f16d3cb3f28d",
+                "type": "itemLayoutElement",
+                "width": 0.5
+              }
+            ],
+            "height": 0.13220774140613695,
+            "id": "3d266988-6d92-49a8-99b2-28d98311add1",
+            "orientation": "col",
+            "type": "stackLayoutElement",
+            "width": 1
+          },
+          {
+            "height": 0.6002221015542657,
+            "id": "dba0e1a7-8e32-4b4e-baec-1fb9a405da18",
+            "type": "itemLayoutElement",
+            "width": 1
+          }
+        ],
+        "height": 1,
+        "id": "590c62ec-2f5e-41eb-aa3c-5e736e3caab5",
+        "orientation": "row",
+        "type": "stackLayoutElement",
+        "width": 1
+      },
+      "type": "dockingLayout"
+    },
+    "settings": {
+      "allowElementResizing": false,
+      "allowReset": false
+    },
+    "type": "mobile",
+    "widgets": [
+      {
+        "backgroundColor": "#f7f7f7",
+        "contentType": "document",
+        "dashboardItemType": "widget",
+        "datasets": [],
+        "focusModeEnabled": false,
+        "headerBackgroundColor": "#f7f7f7",
+        "id": "2c7b37ad-a2c6-44be-bcdc-4b2e8930c411",
+        "imageRefreshInterval": 0,
+        "name": "Barangaroo Header",
+        "noDataState": {},
+        "noFilterState": {},
+        "showFeatureMenu": false,
+        "type": "embeddedContentWidget",
+        "url": "https://experience.arcgis.com/experience/c480edb1c4a24842bd02ea9cef13723d/page/Barangaroo_Mobile",
+        "videoSettings": {
+          "autoplay": false,
+          "controls": true,
+          "controlsList": "nodownload",
+          "loop": false,
+          "muted": false
+        }
+      },
+      {
+        "contentType": "document",
+        "dashboardItemType": "widget",
+        "datasets": [],
+        "focusModeEnabled": false,
+        "id": "440f9b02-768d-4d53-a690-4a1cd640290c",
+        "imageRefreshInterval": 0,
+        "name": "Patyegarang Header",
+        "noDataState": {},
+        "noFilterState": {},
+        "showFeatureMenu": false,
+        "type": "embeddedContentWidget",
+        "url": "https://experience.arcgis.com/experience/fa1042d71af34e03acc2b773435a3ab3/page/Patyegarang_Mobile",
+        "videoSettings": {
+          "autoplay": false,
+          "controls": true,
+          "controlsList": "nodownload",
+          "loop": false,
+          "muted": false
+        }
+      },
+      {
+        "dashboardItemType": "widget",
+        "editingEnabled": false,
+        "flashRepeats": 3,
+        "focusModeEnabled": false,
+        "id": "dba0e1a7-8e32-4b4e-baec-1fb9a405da18",
+        "itemId": "644ba22abece4a08bd5795ec50160d50",
+        "linkedMapWidgetIds": [],
+        "mapTools": [
+          {
+            "type": "bookmarksTool"
+          }
+        ],
+        "name": "Web Map",
+        "noDataState": {},
+        "noFilterState": {},
+        "scalebarStyle": "none",
+        "selectTool": {
+          "advanceSketchTools": [],
+          "clickToSelect": false,
+          "type": "selectTool"
+        },
+        "selectionColor": "#000000",
+        "showCompass": true,
+        "showLocate": false,
+        "showMeasureTool": false,
+        "showNavigation": false,
+        "showPanRotate": false,
+        "showPopup": true,
+        "trackedFeatureRadius": 60,
+        "type": "mapWidget"
+      },
+      {
+        "comparison": "none",
+        "dashboardItemType": "widget",
+        "datasets": [
+          {
+            "allowSourceDownload": false,
+            "allowSummaryDownload": false,
+            "dataSource": {
+              "itemId": "644ba22abece4a08bd5795ec50160d50",
+              "layerId": "1a00d5f1e47-layer-9",
+              "type": "layerDataSource"
+            },
+            "groupByFields": [],
+            "maxFeatures": 1,
+            "name": "main",
+            "orderByFields": [],
+            "outFields": [
+              "*"
+            ],
+            "returnDistinctValues": false,
+            "statisticDefinitions": [],
+            "type": "serviceDataset"
+          }
+        ],
+        "defaultSettings": {
+          "backgroundColor": "#ecf2f8",
+          "bottomSection": {
+            "maxHeight": 0,
+            "textInfo": {
+              "weight": "normal"
+            }
+          },
+          "middleSection": {
+            "maxHeight": 67,
+            "textInfo": {
+              "text": "{field/Tunnel_Progress_m}m",
+              "weight": "bold"
+            }
+          },
+          "topSection": {
+            "maxHeight": 33,
+            "textInfo": {
+              "text": "Distance excavated",
+              "weight": "normal"
+            }
+          }
+        },
+        "focusModeEnabled": false,
+        "headerBackgroundColor": "#ecf2f8",
+        "id": "4f41699b-9c58-497a-a24e-6850d6c2b1e5",
+        "name": "B Distance",
+        "noDataState": {},
+        "noFilterState": {},
+        "noValueState": {},
+        "percentageFormat": {
+          "name": "percentage",
+          "prefix": false,
+          "style": "percent",
+          "useGrouping": true
+        },
+        "ratioFormat": {
+          "maximumFractionDigits": 2,
+          "name": "ratio",
+          "prefix": false,
+          "style": "decimal",
+          "useGrouping": true
+        },
+        "showFeatureMenu": false,
+        "type": "indicatorWidget",
+        "valueField": "Tunnel_Progress_m",
+        "valueFormat": {
+          "maximumFractionDigits": 1,
+          "minimumFractionDigits": 0,
+          "name": "value",
+          "prefix": true,
+          "style": "decimal",
+          "useGrouping": true
+        },
+        "valueType": "feature",
+        "verticalAlignment": "middle"
+      },
+      {
+        "comparison": "fixed",
+        "dashboardItemType": "widget",
+        "datasets": [
+          {
+            "allowSourceDownload": false,
+            "allowSummaryDownload": false,
+            "dataSource": {
+              "itemId": "644ba22abece4a08bd5795ec50160d50",
+              "layerId": "1a00d5f1e47-layer-9",
+              "type": "layerDataSource"
+            },
+            "groupByFields": [],
+            "maxFeatures": 1,
+            "name": "main",
+            "orderByFields": [],
+            "outFields": [
+              "*"
+            ],
+            "returnDistinctValues": false,
+            "statisticDefinitions": [],
+            "type": "serviceDataset"
+          },
+          {
+            "data": {
+              "dataType": "number",
+              "type": "staticValues",
+              "values": [
+                {
+                  "id": "0",
+                  "label": "1500",
+                  "type": "labelledValue",
+                  "value": 1500
+                }
+              ]
+            },
+            "name": "reference",
+            "type": "staticDataset"
+          }
+        ],
+        "defaultSettings": {
+          "backgroundColor": "#ecf2f8",
+          "bottomSection": {
+            "maxHeight": 0,
+            "textInfo": {
+              "text": null,
+              "weight": "normal"
+            }
+          },
+          "middleSection": {
+            "maxHeight": 67,
+            "textInfo": {
+              "text": "{calculated/percentage}",
+              "weight": "bold"
+            }
+          },
+          "topSection": {
+            "maxHeight": 33,
+            "textInfo": {
+              "text": "Total progress completed",
+              "weight": "normal"
+            }
+          }
+        },
+        "focusModeEnabled": false,
+        "id": "3c6f1dee-1e01-44d3-9ea3-ff3bba6ccb32",
+        "name": "B Progress",
+        "noDataState": {},
+        "noFilterState": {},
+        "noValueState": {},
+        "percentageFormat": {
+          "name": "percentage",
+          "prefix": false,
+          "style": "percent",
+          "useGrouping": true
+        },
+        "ratioFormat": {
+          "maximumFractionDigits": 2,
+          "name": "ratio",
+          "prefix": false,
+          "style": "decimal",
+          "useGrouping": true
+        },
+        "showFeatureMenu": false,
+        "type": "indicatorWidget",
+        "valueField": "Tunnel_Progress_m",
+        "valueFormat": {
+          "name": "value",
+          "prefix": true,
+          "style": "percent",
+          "useGrouping": true
+        },
+        "valueType": "feature",
+        "verticalAlignment": "middle"
+      },
+      {
+        "comparison": "none",
+        "dashboardItemType": "widget",
+        "datasets": [
+          {
+            "allowSourceDownload": false,
+            "allowSummaryDownload": false,
+            "dataSource": {
+              "itemId": "644ba22abece4a08bd5795ec50160d50",
+              "layerId": "1a00d56bb59-layer-8",
+              "type": "layerDataSource"
+            },
+            "groupByFields": [],
+            "maxFeatures": 1,
+            "name": "main",
+            "orderByFields": [],
+            "outFields": [
+              "*"
+            ],
+            "returnDistinctValues": false,
+            "statisticDefinitions": [],
+            "type": "serviceDataset"
+          }
+        ],
+        "defaultSettings": {
+          "backgroundColor": "#f4e9e9",
+          "bottomSection": {
+            "maxHeight": 0,
+            "textInfo": {
+              "weight": "normal"
+            }
+          },
+          "middleSection": {
+            "maxHeight": 67,
+            "textInfo": {
+              "text": "{field/Tunnel_Progress_m}m",
+              "weight": "bold"
+            }
+          },
+          "topSection": {
+            "maxHeight": 33,
+            "textInfo": {
+              "text": "Distance excavated",
+              "weight": "normal"
+            }
+          }
+        },
+        "focusModeEnabled": false,
+        "headerBackgroundColor": "#ecf2f8",
+        "id": "58d95348-40b0-4598-bf32-0219437561b6",
+        "name": "P Distance",
+        "noDataState": {},
+        "noFilterState": {},
+        "noValueState": {},
+        "percentageFormat": {
+          "name": "percentage",
+          "prefix": false,
+          "style": "percent",
+          "useGrouping": true
+        },
+        "ratioFormat": {
+          "maximumFractionDigits": 2,
+          "name": "ratio",
+          "prefix": false,
+          "style": "decimal",
+          "useGrouping": true
+        },
+        "showFeatureMenu": false,
+        "type": "indicatorWidget",
+        "valueField": "Tunnel_Progress_m",
+        "valueFormat": {
+          "maximumFractionDigits": 0,
+          "minimumFractionDigits": 0,
+          "name": "value",
+          "prefix": true,
+          "style": "decimal",
+          "useGrouping": false
+        },
+        "valueType": "feature",
+        "verticalAlignment": "middle"
+      },
+      {
+        "comparison": "fixed",
+        "dashboardItemType": "widget",
+        "datasets": [
+          {
+            "data": {
+              "dataType": "number",
+              "type": "staticValues",
+              "values": [
+                {
+                  "id": "0",
+                  "label": "1500",
+                  "type": "labelledValue",
+                  "value": 1500
+                }
+              ]
+            },
+            "name": "reference",
+            "type": "staticDataset"
+          },
+          {
+            "allowSourceDownload": false,
+            "allowSummaryDownload": false,
+            "dataSource": {
+              "itemId": "644ba22abece4a08bd5795ec50160d50",
+              "layerId": "1a00d56bb59-layer-8",
+              "type": "layerDataSource"
+            },
+            "groupByFields": [],
+            "maxFeatures": 1,
+            "name": "main",
+            "orderByFields": [],
+            "outFields": [
+              "*"
+            ],
+            "returnDistinctValues": false,
+            "statisticDefinitions": [],
+            "type": "serviceDataset"
+          }
+        ],
+        "defaultSettings": {
+          "backgroundColor": "#f4e9e9",
+          "bottomSection": {
+            "maxHeight": 0,
+            "textInfo": {
+              "text": null,
+              "weight": "normal"
+            }
+          },
+          "middleSection": {
+            "maxHeight": 67,
+            "textInfo": {
+              "text": "{calculated/percentage}",
+              "weight": "bold"
+            }
+          },
+          "topSection": {
+            "maxHeight": 33,
+            "textInfo": {
+              "text": "Total progress completed",
+              "weight": "normal"
+            }
+          }
+        },
+        "focusModeEnabled": false,
+        "id": "9ab9117e-17c8-4130-a282-f16d3cb3f28d",
+        "name": "P Progress",
+        "noDataState": {},
+        "noFilterState": {},
+        "noValueState": {},
+        "percentageFormat": {
+          "name": "percentage",
+          "prefix": false,
+          "style": "percent",
+          "useGrouping": true
+        },
+        "ratioFormat": {
+          "maximumFractionDigits": 2,
+          "name": "ratio",
+          "prefix": false,
+          "style": "decimal",
+          "useGrouping": true
+        },
+        "showFeatureMenu": false,
+        "type": "indicatorWidget",
+        "valueField": "Tunnel_Progress_m",
+        "valueFormat": {
+          "name": "value",
+          "prefix": true,
+          "style": "percent",
+          "useGrouping": true
+        },
+        "valueType": "feature",
+        "verticalAlignment": "middle"
+      }
+    ]
+  },
+  "numberPrefixOverrides": [
+    {
+      "enabled": true,
+      "key": "yotta",
+      "symbol": "Y"
+    },
+    {
+      "enabled": true,
+      "key": "zeta",
+      "symbol": "Z"
+    },
+    {
+      "enabled": true,
+      "key": "exa",
+      "symbol": "E"
+    },
+    {
+      "enabled": true,
+      "key": "peta",
+      "symbol": "P"
+    },
+    {
+      "enabled": true,
+      "key": "tera",
+      "symbol": "T"
+    },
+    {
+      "enabled": true,
+      "key": "giga",
+      "symbol": "G"
+    },
+    {
+      "enabled": true,
+      "key": "mega",
+      "symbol": "M"
+    },
+    {
+      "enabled": true,
+      "key": "kilo",
+      "symbol": "k"
+    },
+    {
+      "enabled": true,
+      "key": "base",
+      "symbol": ""
+    },
+    {
+      "enabled": false,
+      "key": "deci",
+      "symbol": "d"
+    },
+    {
+      "enabled": false,
+      "key": "centi",
+      "symbol": "c"
+    },
+    {
+      "enabled": false,
+      "key": "milli",
+      "symbol": "m"
+    },
+    {
+      "enabled": false,
+      "key": "micro",
+      "symbol": "\u00b5"
+    },
+    {
+      "enabled": false,
+      "key": "nano",
+      "symbol": "n"
+    }
+  ],
+  "theme": {
+    "id": "user",
+    "type": "resource"
+  },
+  "timeZone": "system",
+  "version": "5.1.0"
+}

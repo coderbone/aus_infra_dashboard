@@ -109,6 +109,46 @@ is reused before re-querying upstream, default 60), `--retries` (default 3),
 
 Standard library only — no third-party packages required.
 
+## Tests
+
+```bash
+python3 -m unittest discover -s scrapers -t scrapers        # from the repo root
+python3 -m unittest discover -s scrapers -t scrapers -v
+./scrapers/test_wht_tbm_exporter.py                         # equivalent
+```
+
+136 tests, about 4 seconds, **no network access** — every upstream response is
+replayed from `scrapers/fixtures/`, captured verbatim from ArcGIS on
+2026-09-29. Verified offline by re-running with `socket.getaddrinfo` and every
+non-loopback `socket.connect` blocked; the suite still passes. Nothing in the
+suite reads `~/.cache/wht-tbm/config.json` or talks to caportal.com.au.
+
+`-t scrapers` is required: `unittest discover` only accepts an importable start
+directory, and `scrapers/` deliberately has no `__init__.py` so the exporter
+stays a single bind-mounted file.
+
+There is one test per failure mode, not just the happy path, because the
+failure paths are the ones that page someone at 3am. In particular each of
+these has a dedicated regression test:
+
+- **ArcGIS returning HTTP 200 with an `{"error":...}` body** — see the
+  gotcha in `NOTES.md`. Without the guard in `http_get_json` this silently
+  produced a config with four `None` field names that was then cached.
+- **A single TBM layer failing while the other succeeds** — the property the
+  whole scrape design rests on: one bad layer must cost that machine's sample
+  and nothing else.
+- **Discovery failing while a valid config cache exists** — falls back and
+  sets `wht_tbm_config_stale 1`; and failing with *no* cache — degrades to
+  `wht_tbm_scrape_success 0` rather than a 500.
+- **`wht_tbm_info` surviving a failed scrape** — static fleet metadata is
+  carried over, because dropping it breaks joins on it.
+- **The retry budget cutting in before the retry count**, and HTTP errors *not*
+  being retried at all.
+- **The desktop gauge target overriding the stale mobile `1500 m` reference** —
+  `collect_gauge_config` deliberately walks `mobileView` *before* `desktopView`
+  so the authoritative desktop value overwrites the mobile one; reversing the
+  tuple silently poisons every target with 1500.
+
 ## How it is deployed here
 
 In the normal setup this script is not run by hand: `../docker-compose.yml`

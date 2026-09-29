@@ -165,9 +165,17 @@ def http_get(url: str, timeout: float, retries: int = 0, retry_budget: float = 0
 def http_get_json(url: str, timeout: float, retries: int = 0, retry_budget: float = 0.0) -> dict:
     payload = http_get(url, timeout, retries, retry_budget)
     try:
-        return json.loads(payload)
+        data = json.loads(payload)
     except ValueError as exc:
         raise ScrapeError("GET %s -> invalid JSON" % url) from exc
+    # ArcGIS answers HTTP 200 with an error body for things like a stale or
+    # mistyped service id, so http_get's status check passes and callers read
+    # absent fields as None instead of finding out. Raise here, where the
+    # URL is still in scope, rather than letting a half-built config reach
+    # the query step.
+    if isinstance(data, dict) and "error" in data:
+        raise ScrapeError("GET %s -> ArcGIS error: %s" % (url, data["error"]))
+    return data
 
 
 # --------------------------------------------------------------------------- #
@@ -418,8 +426,6 @@ def latest_record(
     }
     url = machine["layer_url"] + "/query?" + urllib.parse.urlencode(params)
     data = http_get_json(url, timeout, retries, retry_budget)
-    if "error" in data:
-        raise ScrapeError("query failed: %s" % data["error"])
     features = data.get("features") or []
     if not features:
         raise ScrapeError("layer %r returned no features" % machine["layer_id"])

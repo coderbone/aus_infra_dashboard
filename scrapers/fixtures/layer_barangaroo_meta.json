@@ -1,0 +1,349 @@
+{
+  "advancedEditingCapabilities": {
+    "supportedApplyEditsUploadIDFormats": "JSON,PBF",
+    "supportedSqlFormatsInCalculate": [
+      "standard"
+    ],
+    "supportsApplyEditsbyUploadID": true,
+    "supportsAsyncApplyEdits": true,
+    "supportsMaxTranslations": 10,
+    "supportsReturnEditResults": true,
+    "supportsTranslation": false
+  },
+  "advancedQueryAnalyticCapabilities": {
+    "supportsAsync": true,
+    "supportsLinearRegression": true,
+    "supportsPercentileAnalytic": true,
+    "supportsTrendlineRegression": true
+  },
+  "advancedQueryCapabilities": {
+    "fullTextSearchCapabilities": {
+      "supportsAccentSensitivity": true,
+      "supportsOperator": true,
+      "supportsSearchOperator": true,
+      "supportsStopWords": true
+    },
+    "supportedLodTypes": [
+      "geohash"
+    ],
+    "supportedOperationsWithCacheHint": [
+      "query",
+      "queryTopFilter",
+      "queryAnalytics",
+      "queryAttachments",
+      "queryRelated",
+      "queryBins",
+      "queryPivot"
+    ],
+    "supportedSpatialAggregationStatistics": [
+      "EnvelopeAggregate",
+      "CentroidAggregate",
+      "ConvexHullAggregate"
+    ],
+    "supportsAdvancedQueryRelated": true,
+    "supportsAggIds": true,
+    "supportsApproxPercentileStatistics": true,
+    "supportsCountDistinct": true,
+    "supportsCurrentUserQueries": true,
+    "supportsDefaultSR": true,
+    "supportsDisjointSpatialRel": true,
+    "supportsDistinct": true,
+    "supportsFullTextSearch": true,
+    "supportsHavingClause": true,
+    "supportsISODOW": true,
+    "supportsISOWeek": true,
+    "supportsLod": true,
+    "supportsMaxRecordCountFactor": true,
+    "supportsOrderBy": true,
+    "supportsOutDistance": true,
+    "supportsOutFieldSQLExpression": true,
+    "supportsPagination": true,
+    "supportsPaginationOnAggregatedQueries": true,
+    "supportsPercentileStatistics": true,
+    "supportsQueryAnalytic": true,
+    "supportsQueryBins": true,
+    "supportsQueryPivot": true,
+    "supportsQueryRelatedPagination": true,
+    "supportsQueryWithCacheHint": true,
+    "supportsQueryWithCollation": true,
+    "supportsQueryWithDatumTransformation": true,
+    "supportsQueryWithDistance": true,
+    "supportsQueryWithLodSR": false,
+    "supportsQueryWithResultType": true,
+    "supportsReturningGeometryCentroid": false,
+    "supportsReturningGeometryEnvelope": false,
+    "supportsReturningQueryExtent": true,
+    "supportsSpatialAggregationStatistics": true,
+    "supportsSqlExpression": true,
+    "supportsStatistics": true,
+    "supportsTimeRelation": true,
+    "supportsTopFeaturesQuery": true,
+    "supportsTranslations": false
+  },
+  "allowGeometryUpdates": true,
+  "cacheMaxAge": 30,
+  "capabilities": "Query",
+  "collation": {
+    "accentSensitive": true,
+    "caseSensitive": false,
+    "locale": "neutral"
+  },
+  "copyrightText": "",
+  "currentVersion": 12,
+  "dateFieldsTimeReference": {
+    "respectsDaylightSaving": false,
+    "timeZone": "UTC",
+    "timeZoneIANA": "Etc/UTC"
+  },
+  "defaultVisibility": true,
+  "description": "",
+  "displayField": "",
+  "drawingInfo": {
+    "renderer": {
+      "symbol": {
+        "contentType": "image/png",
+        "height": 15,
+        "imageData": "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",
+        "type": "esriPMS",
+        "url": "RedSphere.png",
+        "width": 15
+      },
+      "type": "simple"
+    }
+  },
+  "editingInfo": {
+    "dataLastEditDate": 1790652047628,
+    "lastEditDate": 1790652047628,
+    "schemaLastEditDate": 1790652045686
+  },
+  "enableNullGeometry": false,
+  "extent": {
+    "spatialReference": {
+      "latestWkid": 28356,
+      "wkid": 28356
+    },
+    "xmax": 331817.2966360391,
+    "xmin": 331817.28336334747,
+    "ymax": 6253180.815063781,
+    "ymin": 6253180.564936553
+  },
+  "fields": [
+    {
+      "alias": "TBM",
+      "defaultValue": null,
+      "domain": null,
+      "editable": true,
+      "length": 17,
+      "name": "TBM",
+      "nullable": true,
+      "sqlType": "sqlTypeOther",
+      "type": "esriFieldTypeString"
+    },
+    {
+      "alias": "Timestamp",
+      "defaultValue": null,
+      "domain": null,
+      "editable": true,
+      "length": 8,
+      "name": "Timestamp",
+      "nullable": true,
+      "precision": 1,
+      "sqlType": "sqlTypeOther",
+      "type": "esriFieldTypeDate"
+    },
+    {
+      "alias": "Tunnel_Progress_m",
+      "defaultValue": null,
+      "domain": null,
+      "editable": true,
+      "name": "Tunnel_Progress_m",
+      "nullable": true,
+      "sqlType": "sqlTypeOther",
+      "type": "esriFieldTypeDouble"
+    },
+    {
+      "alias": "Ring_Number",
+      "defaultValue": null,
+      "domain": null,
+      "editable": true,
+      "name": "Ring_Number",
+      "nullable": true,
+      "sqlType": "sqlTypeOther",
+      "type": "esriFieldTypeInteger"
+    },
+    {
+      "alias": "OBJECTID",
+      "defaultValue": null,
+      "domain": null,
+      "editable": false,
+      "name": "OBJECTID",
+      "nullable": false,
+      "sqlType": "sqlTypeOther",
+      "type": "esriFieldTypeOID"
+    }
+  ],
+  "geometryType": "esriGeometryPoint",
+  "globalIdField": "",
+  "guidFormat": "",
+  "hasAttachments": false,
+  "hasContingentValuesDefinition": false,
+  "hasM": false,
+  "hasStaticData": false,
+  "hasZ": false,
+  "htmlPopupType": "esriServerHTMLPopupTypeNone",
+  "id": 0,
+  "indexes": [
+    {
+      "description": "clustered, unique, primary key",
+      "fields": "OBJECTID",
+      "indexType": "Attribute",
+      "isAscending": true,
+      "isUnique": true,
+      "name": "PK__P_AU_WHT__F4B70D8588F590AF"
+    },
+    {
+      "description": "Shape Index",
+      "fields": "Shape",
+      "indexType": "Spatial",
+      "isAscending": true,
+      "isUnique": false,
+      "name": "P_AU_WHTP2_TBM_BarangarooLocation_TBM_BARANGAROO_LOCATION_Shape_sidx"
+    }
+  ],
+  "infoInEstimates": [
+    "extent",
+    "count"
+  ],
+  "isDataVersioned": false,
+  "isUpdatableView": true,
+  "isView": true,
+  "maxIdsCount": 1000000,
+  "maxRecordCount": 1000,
+  "maxRecordCountFactor": 1,
+  "maxScale": 0,
+  "minScale": 0,
+  "name": "TBM Barangaroo Location",
+  "objectIdField": "OBJECTID",
+  "preferredTimeReference": null,
+  "queryBinsCapabilities": {
+    "supportedNormalizationTypes": [
+      "boxCox",
+      "field",
+      "inverse",
+      "log",
+      "naturalLog",
+      "percentOfTotal",
+      "squareRoot"
+    ],
+    "supportedStatisticTypes": [
+      "COUNT",
+      "SUM",
+      "AVG",
+      "VAR",
+      "STDDEV",
+      "MIN",
+      "MAX",
+      "PERCENTILE_CONT",
+      "PERCENTILE_DISC",
+      "APPROX_PERCENTILE_CONT",
+      "APPROX_PERCENTILE_DISC",
+      "CentroidAggregate",
+      "EnvelopeAggregate",
+      "ConvexHullAggregate"
+    ],
+    "supportsAsync": true,
+    "supportsAutoIntervalBin": true,
+    "supportsClassificationBin": true,
+    "supportsDateBin": true,
+    "supportsFirstDayOfWeek": true,
+    "supportsFixedBoundariesBin": true,
+    "supportsFixedIntervalBin": true,
+    "supportsNormalization": true,
+    "supportsReturnFullIntervalBin": true,
+    "supportsReturnStackValueRange": true,
+    "supportsSnapToData": true,
+    "supportsSplitBy": true,
+    "supportsStackBy": true
+  },
+  "relationships": [],
+  "serviceItemId": "6d9fff1f20fc47e1b1cdd6f840a9a36b",
+  "sourceSchemaChangesAllowed": true,
+  "spatialReference": {
+    "latestWkid": 28356,
+    "wkid": 28356
+  },
+  "standardMaxRecordCount": 16000,
+  "standardMaxRecordCountNoGeometry": 32000,
+  "supportedAppendFormats": "sqlite,geoPackage,shapefile,filegdb,featureCollection,geojson,csv,excel,jsonl,featureService,pbf",
+  "supportedAppendSourceFilterFormats": "sqlite,geoPackage,shapefile,filegdb,featureService",
+  "supportedContingentValuesFormats": "JSON, PBF",
+  "supportedConvertContentFormats": "LayerEditCollection,FeatureCollection",
+  "supportedConvertFileFormats": "JSON,PBF,Parquet",
+  "supportedExportFormats": "csv,shapefile,sqlite,geoPackage,filegdb,featureCollection,geojson,kml,excel,parquet",
+  "supportedOperationsWithCollation": "query,addField,updateField",
+  "supportedQueryFormats": "JSON, geoJSON, PBF",
+  "supportedSpatialRelationships": [
+    "esriSpatialRelIntersects",
+    "esriSpatialRelContains",
+    "esriSpatialRelCrosses",
+    "esriSpatialRelEnvelopeIntersects",
+    "esriSpatialRelIndexIntersects",
+    "esriSpatialRelOverlaps",
+    "esriSpatialRelTouches",
+    "esriSpatialRelWithin",
+    "esriSpatialRelDisjoint",
+    "esriSpatialRelRelation"
+  ],
+  "supportedSyncDataOptions": 260,
+  "supportsASyncCalculate": true,
+  "supportsAdvancedQueries": true,
+  "supportsAppend": true,
+  "supportsApplyEditsWithGlobalIds": false,
+  "supportsAttachmentsByUploadId": true,
+  "supportsAttachmentsResizing": true,
+  "supportsCalculate": true,
+  "supportsColumnStoreIndex": true,
+  "supportsContingentValues": true,
+  "supportsCoordinatesQuantization": true,
+  "supportsEditingContingentValues": true,
+  "supportsExceedsLimitStatistics": true,
+  "supportsFieldDescriptionProperty": true,
+  "supportsFieldGroups": true,
+  "supportsLayerOverrides": true,
+  "supportsQuantizationEditMode": true,
+  "supportsReturningQueryGeometry": true,
+  "supportsRollbackOnFailureParameter": true,
+  "supportsStatistics": true,
+  "supportsTilesAndBasicQueriesMode": true,
+  "supportsTruncate": false,
+  "supportsValidateSql": true,
+  "templates": [
+    {
+      "description": "",
+      "drawingTool": "esriFeatureEditToolPoint",
+      "name": "New Feature",
+      "prototype": {
+        "attributes": {
+          "Chainage": null,
+          "Easting": null,
+          "Elevation": null,
+          "Northing": null,
+          "Ring_Number": null,
+          "TBM": null,
+          "Timestamp": null,
+          "Tunnel_Progress_m": null
+        }
+      }
+    }
+  ],
+  "tileMaxRecordCount": 8000,
+  "type": "Feature Layer",
+  "typeIdField": "",
+  "types": [],
+  "uniqueIdField": {
+    "isSystemMaintained": true,
+    "name": "OBJECTID"
+  },
+  "useStandardizedQueries": true,
+  "viewSourceHasAttachments": false
+}

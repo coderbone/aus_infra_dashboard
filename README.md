@@ -39,7 +39,7 @@ docker compose down         # volumes survive
 Use `docker compose` (v2, space). The old python `docker-compose` v1 is broken
 against current Docker engines and will remove containers and then error out.
 
-The stack is on the `bone_monitoring` bridge network:
+The stack is on the `aus_infra_dashboard_monitoring` bridge network:
 
 | Service | Reachable at |
 | --- | --- |
@@ -78,10 +78,10 @@ The stack is on the `bone_monitoring` bridge network:
   reason, all written up in `NOTES.md` §7.
 - `prometheus-data` and `grafana-storage` are declared external, reusing the
   volumes `docker volume create` made for the pre-compose setup.
-- `name: bone` at the top of the compose file is pinned on purpose. Without it
-  the project name follows the directory name, so the move out of `~` would
-  rename the network and the project-prefixed `bone_exporter-cache` volume. See
-  `NOTES.md` section 2.
+- `name: aus_infra_dashboard` at the top of the compose file is pinned on
+  purpose, so the project name is the repo name rather than following the
+  directory (`monitoring`). It also keeps the network and the project-prefixed
+  `exporter-cache` volume stable across moves. See `NOTES.md` section 2.
 
 ## Configuration
 

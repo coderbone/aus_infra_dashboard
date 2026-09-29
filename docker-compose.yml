@@ -11,11 +11,14 @@
 # README.md and NOTES.md next to this file. Scraper internals and the upstream
 # ArcGIS item ids: scrapers/README.md and scrapers/NOTES.md.
 #
-# `name:` below is load-bearing. The project name would otherwise default to this
-# directory's name, which changed from `bone` to `monitoring` when the stack moved
-# out of ~. That rename would produce a new network and a new project-prefixed
-# `monitoring_exporter-cache` volume (losing the discovered layer config), while
-# the pinned container_name values below collide with the running stack.
+# `name:` below is load-bearing, and it is the compose *project* name - the
+# prefix Docker puts on the network and on any volume that is not `external`.
+# Unpinned it would follow this directory's name, `monitoring`, which is neither
+# what the stack is nor what the repo is called. It was `bone` until 2026-09-29,
+# inherited from when the stack lived directly in ~; renaming it to the repo name
+# is the same hazard the pin exists to prevent, so NOTES.md section 2 has the
+# order of operations for doing it again. Short version: `docker compose -p <old>
+# down` *before* editing, or the pinned container_names below collide.
 #
 # The exporter is a stdlib-only Python script, so it runs in the official python
 # image with the script bind-mounted from ./scrapers. It binds 0.0.0.0:9109 so
@@ -27,11 +30,12 @@
 # 9110). They are separate services rather than one container running both
 # because they have nothing to share: different upstreams, different retry and
 # health semantics, and separate failure isolation. Note the naming asymmetry -
-# the service is short (`tbm-exporter`) and the container carries the project
-# prefix (`wht-tbm-exporter`), because the containers are named in Docker, where
-# the project prefix is what keeps them unambiguous.
+# the service is short (`tbm-exporter`) and the container is spelled out
+# (`wht-tbm-exporter`). Both container_names are pinned outright, NOT derived
+# from the project name, which is why renaming the project leaves them alone and
+# why a second stack cannot run alongside this one under any name.
 
-name: bone
+name: aus_infra_dashboard
 
 services:
   tbm-exporter:

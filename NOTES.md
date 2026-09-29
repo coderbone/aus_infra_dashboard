@@ -6,7 +6,7 @@ Working notes for whoever picks this up next (including future me).
 
 ```
 ~/src/monitoring/                                    # this project
-~/src/monitoring/docker-compose.yml                  # 4 services, project name "bone"
+~/src/monitoring/docker-compose.yml                  # 4 services, project name "aus_infra_dashboard"
 ~/src/monitoring/prometheus.yml                      # scrape configs: tbm-exporter:9109, reservoir-exporter:9110
 ~/src/monitoring/grafana/provisioning/datasources/prometheus.yml
 ~/src/monitoring/scrapers/wht_tbm_exporter.py        # the WHT scraper (stdlib only, no image build)
@@ -27,8 +27,8 @@ Docker objects (not files, survive any file move):
 | Thing | Name |
 | --- | --- |
 | containers | `wht-tbm-exporter`, `snowy-tantangara-exporter`, `prometheus`, `grafana` |
-| compose project | `bone` (pinned via `name:` in the compose file) |
-| network | `bone_monitoring` (bridge) |
+| compose project | `aus_infra_dashboard` (pinned via `name:` in the compose file) |
+| network | `aus_infra_dashboard_monitoring` (bridge) |
 | volumes | `prometheus-data`, `grafana-storage` (external, pre-existing), `exporter-cache` |
 
 `exporter-cache` belongs to `tbm-exporter` alone — it holds that exporter's
@@ -55,9 +55,10 @@ Then fix, in this order:
    `./grafana/provisioning`.
 2. **The project name.** It defaults to the compose file's directory name, so
    moving the file changes the project name and the network name — and the
-   project-prefixed volume name (`bone_exporter-cache`). Either keep the
-   directory name, or pin it with `name:` in the compose file / `-p bone` on the
-   command line, and recreate: `docker compose up -d --force-recreate`.
+   project-prefixed volume name (`aus_infra_dashboard_exporter-cache`). Either
+   keep the directory name, or pin it with `name:` in the compose file /
+   `-p aus_infra_dashboard` on the command line, and recreate:
+   `docker compose up -d --force-recreate`.
 3. **Container names are pinned** in the compose file (`container_name:`), so a
    second project with different names will collide on `prometheus` /
    `grafana`. Remove the old ones first (`docker rm -f prometheus grafana`).
@@ -66,6 +67,36 @@ Then fix, in this order:
 
 Note that a `docker compose restart` reuses the *existing* container, so it keeps
 the old bind mounts. Only `up -d` recreates containers and picks up new paths.
+
+### Renaming the project
+
+The same hazard, deliberately invoked: changing the `name:` in the compose file
+renames the project, and with it the network and the project-prefixed
+`exporter-cache` volume. Nothing else in the stack refers to the project name —
+Prometheus and the Grafana datasource address the exporters by service name over
+the compose network, and `prometheus-data` / `grafana-storage` are external
+volumes with explicit names, so the TSDB and Grafana state are untouched.
+
+The trap is that after the edit, `docker compose down` resolves to the *new*
+project name and leaves the old one running, and the old containers still hold
+the pinned `container_name` values. Bring the old project down first, naming it
+explicitly:
+
+```bash
+docker compose -p <old-name> down       # before editing the file
+# edit name: in docker-compose.yml
+docker compose up -d
+docker volume rm <old-name>_exporter-cache
+```
+
+`down` takes the old network with it and leaves the old project-prefixed volume
+behind, since removing volumes is opt-in (`-v`). Nothing else is left over.
+
+The only thing actually lost is the exporter's cached ArcGIS layer config, and
+it re-discovers on the first cold scrape. That is worth a minute of upstream
+load but nothing more — unless ArcGIS is down at that moment, in which case the
+exporter starts with no config at all and has nothing to fall back to. Copy
+`config.json` out of the old volume first if that matters.
 
 ## 3. Problems hit, and their fixes
 
@@ -283,7 +314,9 @@ discovery step, so its cold start is a single ~190 KB fetch and lands around
 The stack was moved from `~` into `~/src/monitoring` and recreated there with
 `docker compose up -d`. All three containers now bind-mount from
 `~/src/monitoring`, the project name is still `bone` (pinned in the compose
-file), and the TSDB and Grafana state came through in the existing volumes.
+file), and the TSDB and Grafana state came through in the existing volumes. The
+pin is what made the move cheap: the network kept its name, so nothing had to be
+re-plumbed. Two days later the name itself was changed — see section 8.
 
 The first scrape after that restart took ~2m45s to land, which is the normal
 first-scrape jitter for a 5m interval — `/api/v1/targets` showed
@@ -988,3 +1021,46 @@ for p in d["panels"]:
 print("empty:", bad)
 PY
 ```
+
+## 8. Project renamed `bone` -> `aus_infra_dashboard` (2026-09-29)
+
+`name:` in the compose file was `bone`, inherited from the days when the stack
+lived directly in `~` and the project name defaulted to the home directory. It
+had outlived both: the stack moved to `~/src/monitoring` in section 6, and the
+repo is `aus_infra_dashboard`, which the name matched nowhere. Renamed to match
+the repo, using the procedure in section 2.
+
+What moved and what did not:
+
+| Object | Before | After |
+| --- | --- | --- |
+| project | `bone` | `aus_infra_dashboard` |
+| network | `bone_monitoring` | `aus_infra_dashboard_monitoring` |
+| exporter cache volume | `bone_exporter-cache` | `aus_infra_dashboard_exporter-cache` |
+| TSDB | `prometheus-data` (external) | unchanged |
+| Grafana state | `grafana-storage` (external) | unchanged |
+| containers | pinned via `container_name:` | unchanged names, new project labels |
+
+The only data at risk was the exporter's cached ArcGIS layer config, and it
+came back byte-identical: the re-discovery resolved the same dashboard item
+`973e08367a544c879edd7f345f9d6a15` and wrote a config differing only in
+`discovered_at`. Worth remembering that this outcome was luck as much as
+design — `config.json` is a fallback for when discovery fails, so a rename
+taken while ArcGIS is unreachable leaves the exporter with no config at all
+rather than a stale one. Copy the file out first if that matters.
+
+Downtime was one `up -d`, about 15s. Historical samples survived: a query at
+`now-2h` still returns `up{job="wht_tbm"} == 1` from before the rename.
+
+Two things that looked like faults and were not:
+
+- `/api/v1/targets` showed both jobs `health: unknown` with a zero `lastScrape`
+  for ~3m20s. That is the first-scrape jitter already described in section 6,
+  not a networking fault from the new project.
+- `snowy_tantangara` was still `unknown` when `wht_tbm` had already come up. Its
+  `scrape_interval` is 1h, so where its first scrape lands in that hour is
+  arbitrary; here it was ~2m15s after the 5m job's, which is pure jitter and
+  nothing to chase. The exporter itself was healthy the whole time.
+
+The old network was removed by `down` itself and the old volume by an explicit
+`docker volume rm`, which is the only cleanup step in the section 2 procedure.

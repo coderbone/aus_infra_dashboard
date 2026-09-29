@@ -1,4 +1,20 @@
-# WHTP2 TBM tracker Prometheus exporter
+# Prometheus exporters
+
+Two independent, stdlib-only exporters live here. Both are single files that
+`docker-compose.yml` bind-mounts into `python:3.12-alpine`; neither needs an
+image build.
+
+| Exporter | Upstream | Port | Metrics prefix |
+| --- | --- | --- | --- |
+| [`wht_tbm_exporter.py`](#whtp2-tbm-tracker-exporter) | Transport for NSW Western Harbour Tunnel TBM tracker (ArcGIS) | 9109 | `wht_tbm_` |
+| [`snowy_tantangara_exporter.py`](#snowy-hydro-reservoir-levels-exporter) | Snowy Hydro scheme reservoir levels (`getData.php`) | 9110 | `snowy_tantangara_` |
+
+They share the retry-with-time-budget approach, the `--once` mode, the
+`/metrics` + `/healthz` + index handler, and the "never serve a measurement
+from a cache" rule — but they are separate processes with separate upstreams and
+separate failure isolation. `NOTES.md` has the upstream details for both.
+
+## WHTP2 TBM tracker exporter
 
 `wht_tbm_exporter.py` publishes the tunnel boring machine (TBM) progress shown on
 the Transport for NSW Western Harbour Tunnel TBM tracker
@@ -117,7 +133,8 @@ python3 -m unittest discover -s scrapers -t scrapers -v
 ./scrapers/test_wht_tbm_exporter.py                         # equivalent
 ```
 
-136 tests, about 4 seconds, **no network access** — every upstream response is
+136 tests in this file (257 for both exporters), about 4 seconds, **no network
+access** — every upstream response is
 replayed from `scrapers/fixtures/`, captured verbatim from ArcGIS on
 2026-09-29. Verified offline by re-running with `socket.getaddrinfo` and every
 non-loopback `socket.connect` blocked; the suite still passes. Nothing in the
@@ -149,13 +166,174 @@ these has a dedicated regression test:
   so the authoritative desktop value overwrites the mobile one; reversing the
   tuple silently poisons every target with 1500.
 
+## Snowy Hydro reservoir levels exporter
+
+`snowy_tantangara_exporter.py` publishes Snowy Hydro scheme reservoir levels,
+focused on **Tantangara Reservoir** — the upper storage of the Snowy Hydro 2.0
+pumped scheme.
+
+> **This is water data, not construction progress.** Snowy Hydro 2.0 publishes no
+> machine-readable project status of any kind: no progress dashboard, no TBM
+> tracker, no progress layer. `NOTES.md` records the audit that established
+> this. Tantangara drawdown is the closest live proxy that exists for "is the 2.0
+> site active", because the 2.0 intake works are at the upper storage. Do not
+> describe these series as project progress, and do not add a
+> `snowy_tantangara_progress_*` metric on the strength of the name.
+
+### How it gets the numbers
+
+The chart on <https://www.snowyhydro.com.au/our-project/lake-levels/> is backed
+by a plain PHP include on the same origin:
+
+```
+https://www.snowyhydro.com.au/wp-content/themes/snowyhydro/inc/getData.php
+  ?yearA=<first year>&yearB=<last year>
+```
+
+One request returns the whole range as JSON, keyed
+`year → snowyhydro → level[]`, one row per day. Each row carries a `lake[]`
+array of `-name` / `-dataTimestamp` / `#text`, where **`#text` is percent of
+gross storage**. No auth, no `Referer`, no rendered-HTML scraping.
+
+The whole range is fetched in **one** request and reduced locally, so the 7-day
+change and the year-to-date extremes cost no extra round trip. Two years are
+requested by default because a single year cannot produce a 7-day delta for the
+first week of January, and a metric that goes `NaN` exactly when the year rolls
+over is a metric somebody pages about.
+
+Three of the feed's properties drive real design decisions, all detailed in
+`NOTES.md`:
+
+- **Errors are HTTP 400 with a plain-text body**, not JSON. `http_get` folds that
+  body into the exception message, so the two diagnostic strings
+  (`must be valid integers`, `must be between 1954 and 2026`) survive into the
+  log. This is the one place the exporter deliberately diverges from
+  `wht_tbm_exporter.py`, which reports only the status code.
+- **The year range is clamped server-side to `[1954, <current year>]`.** The year
+  is derived from the clock on every scrape, never pinned, and read in Sydney
+  time rather than UTC — otherwise 31 December afternoon UTC requests a year the
+  endpoint has not opened yet.
+- **`-dataTimestamp` is naive Sydney local time with no offset.** The exporter
+  pins UTC+10 rather than using `zoneinfo`, because `python:3.12-alpine` ships no
+  tzdata and `ZoneInfo("Australia/Sydney")` would raise there. The cost is at
+  most one hour of error during daylight saving, which is irrelevant for a
+  once-daily series whose timestamp exists only to feed
+  `time() - last_sample_timestamp_seconds`.
+
+### Metrics
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `snowy_tantangara_level_percent` | gauge | `reservoir` | Latest published level, **percent of gross storage** |
+| `snowy_tantangara_level_change_7d_percentage_points` | gauge | `reservoir` | Change over the last 7 days, in **percentage points** |
+| `snowy_tantangara_level_min_ytd_percent` | gauge | `reservoir` | Lowest level in the current calendar year |
+| `snowy_tantangara_level_max_ytd_percent` | gauge | `reservoir` | Highest level in the current calendar year |
+| `snowy_tantangara_last_sample_timestamp_seconds` | gauge | `reservoir` | Unix time of the observation behind the current reading |
+| `snowy_tantangara_scrape_success` | gauge | — | 1 only if *every* requested reservoir was read |
+| `snowy_tantangara_scrape_duration_seconds` | gauge | — | Wall time of the last scrape |
+| `snowy_tantangara_last_scrape_timestamp_seconds` | gauge | — | Unix time of the last scrape |
+
+Unknown values are exported as `NaN` — never `0`, because on a reservoir a zero
+reads as "the lake is empty", which is a claim about the water rather than about
+the scrape.
+
+**The units are the trap.** The feed publishes *percent*, and the 7-day change is
+a difference of two percents, i.e. *percentage points* — which is why the metric
+name says `percentage_points` rather than `percent`. The metric never reports
+metres: the upstream is percent only, no volume is published anywhere on this
+endpoint, and the "−2.73 m/week" figure in the project's own copy is the same
+2.73 read as percentage points.
+
+**Only Tantangara is exported by default.** The feed also carries Lake Jindabyne
+and Lake Eucumbene, which are pre-2.0 scheme infrastructure — scheme context, not
+project status. Exposing them by default would dress them up as 2.0 data. Use
+`--all-reservoirs` or a repeatable `--reservoir` to include them.
+
+**There is deliberately no `config_stale` metric and no persistent cache.** This
+exporter has no discovery step and no configuration to cache, so a
+`config_stale` gauge would have nothing to ever be `1`. The level gauges are
+never served from a stored copy either: a feed that cannot be read loses the
+series for that scrape, which is what makes the gap honest, and
+`snowy_tantangara_scrape_success` is `0` throughout. That is also why the compose
+service mounts no cache volume.
+
+### Running
+
+```bash
+# one-shot exposition on stdout (exit 1 if the upstream scrape failed)
+./snowy_tantangara_exporter.py --once
+
+# long-running exporter
+./snowy_tantangara_exporter.py --listen-address 127.0.0.1 --port 9110
+curl -s localhost:9110/metrics
+curl -s localhost:9110/healthz
+
+# the two non-2.0 lakes as well
+./snowy_tantangara_exporter.py --once --all-reservoirs
+```
+
+Options: `--data-url`, `--reservoir` (repeatable), `--all-reservoirs`,
+`--change-days` (default 7, the window in Snowy Hydro's own weekly phrasing;
+changing it renames the metric to match, so a `--change-days 14` run does not
+silently keep writing under the `7d` name), `--years-back` (default 1, i.e.
+current year plus the one before), `--listen-address`, `--port`,
+`--timeout`, `--cache-ttl` (default 900s), `--retries` (default 3),
+`--retry-budget` (default 6s), `--once`, `-v`.
+
+`--cache-ttl` defaults high compared with the WHT exporter's 60s because this
+feed publishes once a day. The TTL only guards against a burst of scrapes each
+refetching ~190 KB; it is not a freshness guarantee.
+
+Alert on `snowy_tantangara_scrape_success == 0` and on
+`time() - snowy_tantangara_last_sample_timestamp_seconds`.
+
+### Tests
+
+```bash
+python3 -m unittest discover -s scrapers -t scrapers    # both exporters, 257 tests
+./scrapers/test_snowy_tantangara_exporter.py            # 121 tests, this one only
+```
+
+**121 tests, about 4 seconds, no network access** — every upstream response is
+replayed from `scrapers/fixtures/`, sampled verbatim from `getData.php` on
+2026-09-29. Verified offline by re-running with `socket.getaddrinfo` and every
+non-loopback `socket.connect` blocked; the suite still passes.
+
+Each of these has a dedicated regression test, because each is a way for this
+endpoint to fail quietly:
+
+- **HTTP 400 carrying a plain-text body** — the message must keep
+  `must be between 1954 and 2026`, since that string is the entire diagnosis of a
+  year-range bug.
+- **Naive local timestamps not being shifted by the host timezone.** This was a
+  real bug, caught by the suite: `datetime.timestamp()` on a naive value reads
+  the *host's* local zone, so the same fixture produced a different instant on
+  the AEST dev host than in the UTC container. The test now shifts the process
+  timezone with `time.tzset()` and asserts the number does not move.
+- **Year-to-date extremes not leaking across New Year.** A 2025 low must not
+  become the 2026 minimum. The main fixture cannot catch this — its 2025 values
+  sit inside the 2026 range — so the test builds a series where a leak would
+  show.
+- **The 7-day delta using date arithmetic, not a row offset.** With a missing
+  day, an index-based delta would silently report a 6- or 8-day change as a
+  7-day one. The fallback takes the newest reading *at or before* the target
+  date, and `change_from` records which one was used.
+- **A `NaN` change, not `0`, when there is no prior reading** — a zero would
+  read as "the level has not moved", which is a claim about the reservoir.
+- **A malformed payload not escaping as `AttributeError`**, and reservoir
+  discovery failing without taking the exporter down.
+- **`--change-days 14` renaming the metric**, so a reconfigured window cannot
+  keep writing under the `7d` name.
+
 ## How it is deployed here
 
-In the normal setup this script is not run by hand: `../docker-compose.yml`
-bind-mounts it read-only into `python:3.12-alpine` and Prometheus scrapes the
-container over the compose network. See `../README.md` for that stack and
-`../NOTES.md` for its history. The invocation below is only for running the
+In the normal setup these scripts are not run by hand: `../docker-compose.yml`
+bind-mounts each read-only into `python:3.12-alpine` and Prometheus scrapes the
+containers over the compose network. See `../README.md` for that stack and
+`../NOTES.md` for its history. The invocations above are only for running an
 exporter outside compose.
+
+The WHT exporter's deployment is:
 
 ## Standalone alternatives
 

@@ -2,16 +2,17 @@
 
 Working notes for whoever picks this up next (including future me).
 
-## 1. Layout as of 2026-09-27
+## 1. Layout as of 2026-09-29
 
 ```
 ~/src/monitoring/                                    # this project
-~/src/monitoring/docker-compose.yml                  # 3 services, project name "bone"
-~/src/monitoring/prometheus.yml                      # scrape config, target: tbm-exporter:9109
+~/src/monitoring/docker-compose.yml                  # 4 services, project name "bone"
+~/src/monitoring/prometheus.yml                      # scrape configs: tbm-exporter:9109, reservoir-exporter:9110
 ~/src/monitoring/grafana/provisioning/datasources/prometheus.yml
-~/src/monitoring/scrapers/wht_tbm_exporter.py        # the scraper (stdlib only, no image build)
+~/src/monitoring/scrapers/wht_tbm_exporter.py        # the WHT scraper (stdlib only, no image build)
+~/src/monitoring/scrapers/snowy_tantangara_exporter.py  # the Snowy Hydro reservoir scraper
 ~/src/monitoring/scrapers/README.md                  # metrics + run instructions
-~/src/monitoring/scrapers/NOTES.md                   # upstream ArcGIS item ids
+~/src/monitoring/scrapers/NOTES.md                   # upstream endpoints
 ~/src/monitoring/scrapers/TASKS.md                   # original task list
 ~/.docker/cli-plugins/docker-compose                  # Compose v2 v5.5.1, installed by us
 ```
@@ -25,10 +26,15 @@ Docker objects (not files, survive any file move):
 
 | Thing | Name |
 | --- | --- |
-| containers | `wht-tbm-exporter`, `prometheus`, `grafana` |
+| containers | `wht-tbm-exporter`, `snowy-tantangara-exporter`, `prometheus`, `grafana` |
 | compose project | `bone` (pinned via `name:` in the compose file) |
 | network | `bone_monitoring` (bridge) |
 | volumes | `prometheus-data`, `grafana-storage` (external, pre-existing), `exporter-cache` |
+
+`exporter-cache` belongs to `tbm-exporter` alone — it holds that exporter's
+discovered ArcGIS layer config. `snowy-tantangara-exporter` deliberately mounts
+**no** volume: it has no discovery step, and a persistent cache of reservoir
+levels would be a way to serve a stale reading as a current one.
 
 ## 2. If files have moved
 
@@ -147,10 +153,12 @@ Each of these cost time; check they haven't regressed.
 ## 4. Verify the stack
 
 ```bash
-docker compose ps                                   # all three (healthy)
+docker compose ps                                   # all four (healthy)
 curl -s localhost:9090/api/v1/targets | grep -o '"health":"[a-z]*"'
 curl -s --get --data-urlencode 'query=up{job="wht_tbm"}' localhost:9090/api/v1/query
+curl -s --get --data-urlencode 'query=up{job="snowy_tantangara"}' localhost:9090/api/v1/query
 docker compose logs --tail 20 tbm-exporter          # upstream errors land here
+docker compose logs --tail 20 reservoir-exporter
 ```
 
 The exporter's own timing gauge is the quickest check that the DNS retry path is
@@ -174,6 +182,14 @@ WARNING transient failure (attempt 1 of 4) on https://...: [Errno -3] Try again;
 live 2026-09-28 06:30 UTC. Four clean scrapes right after the change is
 suggestive, not proof — the underlying `EAI_AGAIN` bursts are intermittent, so a
 short clean window proves nothing either way. A full day of data does.
+
+The `dns: [1.1.1.1, 9.9.9.9]` override is **not** WHT-specific — the fault is
+in Docker's embedded resolver, not in the destination host, so
+`snowy-tantangara-exporter` carries the same override for the same reason. The
+*measurement* quoted below was taken against `utility.arcgis.com` only, so the
+resolver comparison has not been re-run against `snowyhydro.com.au`. Worth doing
+if a failure window opens up there, but the transfer of the fix is not in doubt
+and the retry budget remains the backstop either way.
 
 ```bash
 # 1. failed scrapes in 24h. NOTE: must be == bool 0 + sum_over_time.
@@ -216,9 +232,11 @@ remaining failures are the retry budget giving up correctly — in which case th
 fix is to raise `--retry-budget` and `scrape_timeout` together, not to swap DNS
 again.
 
-First `/metrics` request after an exporter restart is cold: it does full
-discovery and takes ~5-9 s. `scrape_timeout` is 30 s, so that is fine, but
-don't panic if the first scrape is slow.
+First `/metrics` request after an exporter restart is cold: for `tbm-exporter` it
+does full discovery and takes ~5-9 s. `scrape_timeout` is 30 s, so that is fine,
+but don't panic if the first scrape is slow. `snowy-tantangara-exporter` has no
+discovery step, so its cold start is a single ~190 KB fetch and lands around
+0.3-1 s.
 
 ## 5. Not done / open
 
@@ -235,6 +253,15 @@ don't panic if the first scrape is slow.
   **Fixed** — see the exporter section below for what shipped and what the
   measurements ruled out.
 - `GRAFANA_ADMIN_PASSWORD` still unset.
+- **No Grafana dashboard for the Snowy reservoir series yet.** The
+  `snowy_tantangara` job is scraped and the metrics are documented, but the only
+  provisioned dashboard is `Western Harbour TBM`. The metrics that a panel would
+  want already exist: `snowy_tantangara_level_percent` (unit `percent`,
+  0–100), `snowy_tantangara_level_change_7d_percentage_points` (unit
+  `percentagepoint` — the level of care Grafana's unit handling needs, see
+  section 7), and
+  `time() - snowy_tantangara_last_sample_timestamp_seconds` as the staleness
+  panel.
 - No recording or alerting rules; `prometheus.yml` has scrape configs only.
 - The `Western Harbour TBM` dashboard is provisioned from
   `grafana/provisioning/dashboards/` (see section 7), but there is no

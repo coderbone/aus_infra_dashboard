@@ -1,0 +1,746 @@
+{
+ "2025": {
+  "snowyhydro": {
+   "level": [
+    {
+     "-date": "2025-12-18",
+     "lake": [
+      {
+       "-name": "Lake Eucumbene",
+       "-dataTimestamp": "2025-12-18T07:00:00",
+       "#text": "44.59"
+      },
+      {
+       "-name": "Lake Jindabyne",
+       "-dataTimestamp": "2025-12-18T07:00:00",
+       "#text": "77.35"
+      },
+      {
+       "-name": "Tantangara Reservoir",
+       "-dataTimestamp": "2025-12-18T07:00:00",
+       "#text": "10.04"
+      }
+     ]
+    },
+    {
+     "-date": "2025-12-19",
+     "lake": [
+      {
+       "-name": "Lake Eucumbene",
+       "-dataTimestamp": "2025-12-19T07:00:03",
+       "#text": "44.55"
+      },
+      {
+       "-name": "Lake Jindabyne",
+       "-dataTimestamp": "2025-12-19T07:00:03",
+       "#text": "77.25"
+      },
+      {
+       "-name": "Tantangara Reservoir",
+       "-dataTimestamp": "2025-12-19T07:00:03",
+       "#text": "9.99"
+      }
+     ]
+    },
+    {
+     "-date": "2025-12-20",
+     "lake": [
+      {
+       "-name": "Lake Eucumbene",
+       "-dataTimestamp": "2025-12-20T07:00:00",
+       "#text": "44.49"
+      },
+      {
+       "-name": "Lake Jindabyne",
+       "-dataTimestamp": "2025-12-20T07:00:00",
+       "#text": "77.31"
+      },
+      {
+       "-name": "Tantangara Reservoir",
+       "-dataTimestamp": "2025-12-20T07:00:00",
+       "#text": "9.95"
+      }
+     ]
+    },
+    {
+     "-date": "2025-12-21",
+     "lake": [
+      {
+       "-name": "Lake Eucumbene",
+       "-dataTimestamp": "2025-12-21T07:00:02",
+       "#text": "44.45"
+      },
+      {
+       "-name": "Lake Jindabyne",
+       "-dataTimestamp": "2025-12-21T07:00:02",
+       "#text": "77.22"
+      },
+      {
+       "-name": "Tantangara Reservoir",
+       "-dataTimestamp": "2025-12-21T07:00:02",
+       "#text": "9.90"
+      }
+     ]
+    },
+    {
+     "-date": "2025-12-22",
+     "lake": [
+      {
+       "-name": "Lake Eucumbene",
+       "-dataTimestamp": "2025-12-22T07:00:00",
+       "#text": "44.47"
+      },
+      {
+       "-name": "Lake Jindabyne",
+       "-dataTimestamp": "2025-12-22T07:00:00",
+       "#text": "77.27"
+      },
+      {
+       "-name": "Tantangara Reservoir",
+       "-dataTimestamp": "2025-12-22T07:00:00",
+       "#text": "9.94"
+      }
+     ]
+    },
+    {
+     "-date": "2025-12-23",
+     "lake": [
+      {
+       "-name": "Lake Eucumbene",
+       "-dataTimestamp": "2025-12-23T07:00:01",
+       "#text": "44.44"
+      },
+      {
+       "-name": "Lake Jindabyne",
+       "-dataTimestamp": "2025-12-23T07:00:01",
+       "#text": "77.20"
+      },
+      {
+       "-name": "Tantangara Reservoir",
+       "-dataTimestamp": "2025-12-23T07:00:01",
+       "#text": "10.09"
+      }
+     ]
+    },
+    {
+     "-date": "2025-12-24",
+     "lake": [
+      {
+       "-name": "Lake Eucumbene",
+       "-dataTimestamp": "2025-12-24T07:00:00",
+       "#text": "44.40"
+      },
+      {
+       "-name": "Lake Jindabyne",
+       "-dataTimestamp": "2025-12-24T07:00:00",
+       "#text": "77.01"
+      },
+      {
+       "-name": "Tantangara Reservoir",
+       "-dataTimestamp": "2025-12-24T07:00:00",
+       "#text": "10.07"
+      }
+     ]
+    },
+    {
+     "-date": "2025-12-25",
+     "lake": [
+      {
+       "-name": "Lake Eucumbene",
+       "-dataTimestamp": "2025-12-25T07:00:02",
+       "#text": "44.35"
+      },
+      {
+       "-name": "Lake Jindabyne",
+       "-dataTimestamp": "2025-12-25T07:00:02",
+       "#text": "76.94"
+      },
+      {
+       "-name": "Tantangara Reservoir",
+       "-dataTimestamp": "2025-12-25T07:00:02",
+       "#text": "10.04"
+      }
+     ]
+    },
+    {
+     "-date": "2025-12-26",
+     "lake": [
+      {
+       "-name": "Lake Eucumbene",
+       "-dataTimestamp": "2025-12-26T07:00:00",
+       "#text": "44.32"
+      },
+      {
+       "-name": "Lake Jindabyne",
+       "-dataTimestamp": "2025-12-26T07:00:00",
+       "#text": "76.84"
+      },
+      {
+       "-name": "Tantangara Reservoir",
+       "-dataTimestamp": "2025-12-26T07:00:00",
+       "#text": "9.99"
+      }
+     ]
+    },
+    {
+     "-date": "2025-12-27",
+     "lake": [
+      {
+       "-name": "Lake Eucumbene",
+       "-dataTimestamp": "2025-12-27T07:00:01",
+       "#text": "44.29"
+      },
+      {
+       "-name": "Lake Jindabyne",
+       "-dataTimestamp": "2025-12-27T07:00:01",
+       "#text": "76.83"
+      },
+      {
+       "-name": "Tantangara Reservoir",
+       "-dataTimestamp": "2025-12-27T07:00:01",
+       "#text": "9.95"
+      }
+     ]
+    },
+    {
+     "-date": "2025-12-28",
+     "lake": [
+      {
+       "-name": "Lake Eucumbene",
+       "-dataTimestamp": "2025-12-28T07:00:00",
+       "#text": "44.29"
+      },
+      {
+       "-name": "Lake Jindabyne",
+       "-dataTimestamp": "2025-12-28T07:00:00",
+       "#text": "76.81"
+      },
+      {
+       "-name": "Tantangara Reservoir",
+       "-dataTimestamp": "2025-12-28T07:00:00",
+       "#text": "9.89"
+      }
+     ]
+    },
+    {
+     "-date": "2025-12-29",
+     "lake": [
+      {
+       "-name": "Lake Eucumbene",
+       "-dataTimestamp": "2025-12-29T07:00:01",
+       "#text": "44.31"
+      },
+      {
+       "-name": "Lake Jindabyne",
+       "-dataTimestamp": "2025-12-29T07:00:01",
+       "#text": "76.79"
+      },
+      {
+       "-name": "Tantangara Reservoir",
+       "-dataTimestamp": "2025-12-29T07:00:01",
+       "#text": "9.86"
+      }
+     ]
+    },
+    {
+     "-date": "2025-12-30",
+     "lake": [
+      {
+       "-name": "Lake Eucumbene",
+       "-dataTimestamp": "2025-12-30T07:00:00",
+       "#text": "44.30"
+      },
+      {
+       "-name": "Lake Jindabyne",
+       "-dataTimestamp": "2025-12-30T07:00:00",
+       "#text": "76.88"
+      },
+      {
+       "-name": "Tantangara Reservoir",
+       "-dataTimestamp": "2025-12-30T07:00:00",
+       "#text": "9.80"
+      }
+     ]
+    },
+    {
+     "-date": "2025-12-31",
+     "lake": [
+      {
+       "-name": "Lake Eucumbene",
+       "-dataTimestamp": "2025-12-31T07:00:02",
+       "#text": "44.31"
+      },
+      {
+       "-name": "Lake Jindabyne",
+       "-dataTimestamp": "2025-12-31T07:00:02",
+       "#text": "76.98"
+      },
+      {
+       "-name": "Tantangara Reservoir",
+       "-dataTimestamp": "2025-12-31T07:00:02",
+       "#text": "9.74"
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "2026": {
+  "snowyhydro": {
+   "level": [
+    {
+     "-date": "2026-01-01",
+     "lake": [
+      {
+       "-name": "Lake Eucumbene",
+       "-dataTimestamp": "2026-01-01T07:00:00",
+       "#text": "44.33"
+      },
+      {
+       "-name": "Lake Jindabyne",
+       "-dataTimestamp": "2026-01-01T07:00:00",
+       "#text": "76.96"
+      },
+      {
+       "-name": "Tantangara Reservoir",
+       "-dataTimestamp": "2026-01-01T07:00:00",
+       "#text": "9.69"
+      }
+     ],
+     "snow": {
+      "-name": "Spencers Creek",
+      "-dataTimestamp": "2026-01-01T12:00:00",
+      "-quality": "G",
+      "#text": "0"
+     }
+    },
+    {
+     "-date": "2026-01-02",
+     "lake": [
+      {
+       "-name": "Lake Eucumbene",
+       "-dataTimestamp": "2026-01-02T07:00:01",
+       "#text": "44.33"
+      },
+      {
+       "-name": "Lake Jindabyne",
+       "-dataTimestamp": "2026-01-02T07:00:01",
+       "#text": "77.00"
+      },
+      {
+       "-name": "Tantangara Reservoir",
+       "-dataTimestamp": "2026-01-02T07:00:01",
+       "#text": "9.65"
+      }
+     ]
+    },
+    {
+     "-date": "2026-01-03",
+     "lake": [
+      {
+       "-name": "Lake Eucumbene",
+       "-dataTimestamp": "2026-01-03T07:00:00",
+       "#text": "44.34"
+      },
+      {
+       "-name": "Lake Jindabyne",
+       "-dataTimestamp": "2026-01-03T07:00:00",
+       "#text": "77.09"
+      },
+      {
+       "-name": "Tantangara Reservoir",
+       "-dataTimestamp": "2026-01-03T07:00:00",
+       "#text": "9.60"
+      }
+     ]
+    },
+    {
+     "-date": "2026-01-04",
+     "lake": [
+      {
+       "-name": "Lake Eucumbene",
+       "-dataTimestamp": "2026-01-04T07:00:02",
+       "#text": "44.36"
+      },
+      {
+       "-name": "Lake Jindabyne",
+       "-dataTimestamp": "2026-01-04T07:00:02",
+       "#text": "77.21"
+      },
+      {
+       "-name": "Tantangara Reservoir",
+       "-dataTimestamp": "2026-01-04T07:00:02",
+       "#text": "9.56"
+      }
+     ]
+    },
+    {
+     "-date": "2026-01-05",
+     "lake": [
+      {
+       "-name": "Lake Eucumbene",
+       "-dataTimestamp": "2026-01-05T07:00:00",
+       "#text": "44.38"
+      },
+      {
+       "-name": "Lake Jindabyne",
+       "-dataTimestamp": "2026-01-05T07:00:00",
+       "#text": "77.27"
+      },
+      {
+       "-name": "Tantangara Reservoir",
+       "-dataTimestamp": "2026-01-05T07:00:00",
+       "#text": "9.56"
+      }
+     ]
+    },
+    {
+     "-date": "2026-01-06",
+     "lake": [
+      {
+       "-name": "Lake Eucumbene",
+       "-dataTimestamp": "2026-01-06T07:00:01",
+       "#text": "44.39"
+      },
+      {
+       "-name": "Lake Jindabyne",
+       "-dataTimestamp": "2026-01-06T07:00:01",
+       "#text": "76.97"
+      },
+      {
+       "-name": "Tantangara Reservoir",
+       "-dataTimestamp": "2026-01-06T07:00:01",
+       "#text": "9.53"
+      }
+     ]
+    },
+    {
+     "-date": "2026-01-07",
+     "lake": [
+      {
+       "-name": "Lake Eucumbene",
+       "-dataTimestamp": "2026-01-07T07:00:00",
+       "#text": "44.39"
+      },
+      {
+       "-name": "Lake Jindabyne",
+       "-dataTimestamp": "2026-01-07T07:00:00",
+       "#text": "76.74"
+      },
+      {
+       "-name": "Tantangara Reservoir",
+       "-dataTimestamp": "2026-01-07T07:00:00",
+       "#text": "9.55"
+      }
+     ]
+    },
+    {
+     "-date": "2026-01-08",
+     "lake": [
+      {
+       "-name": "Lake Eucumbene",
+       "-dataTimestamp": "2026-01-08T07:00:02",
+       "#text": "44.41"
+      },
+      {
+       "-name": "Lake Jindabyne",
+       "-dataTimestamp": "2026-01-08T07:00:02",
+       "#text": "76.57"
+      },
+      {
+       "-name": "Tantangara Reservoir",
+       "-dataTimestamp": "2026-01-08T07:00:02",
+       "#text": "9.56"
+      }
+     ]
+    },
+    {
+     "-date": "2026-01-09",
+     "lake": [
+      {
+       "-name": "Lake Eucumbene",
+       "-dataTimestamp": "2026-01-09T07:00:00",
+       "#text": "44.36"
+      },
+      {
+       "-name": "Lake Jindabyne",
+       "-dataTimestamp": "2026-01-09T07:00:00",
+       "#text": "76.43"
+      },
+      {
+       "-name": "Tantangara Reservoir",
+       "-dataTimestamp": "2026-01-09T07:00:00",
+       "#text": "9.57"
+      }
+     ]
+    },
+    {
+     "-date": "2026-01-10",
+     "lake": [
+      {
+       "-name": "Lake Eucumbene",
+       "-dataTimestamp": "2026-01-10T07:00:01",
+       "#text": "44.34"
+      },
+      {
+       "-name": "Lake Jindabyne",
+       "-dataTimestamp": "2026-01-10T07:00:01",
+       "#text": "76.30"
+      },
+      {
+       "-name": "Tantangara Reservoir",
+       "-dataTimestamp": "2026-01-10T07:00:01",
+       "#text": "9.59"
+      }
+     ]
+    },
+    {
+     "-date": "2026-09-18",
+     "lake": [
+      {
+       "-name": "Lake Eucumbene",
+       "-dataTimestamp": "2026-09-18T07:00:01",
+       "#text": "41.22"
+      },
+      {
+       "-name": "Lake Jindabyne",
+       "-dataTimestamp": "2026-09-18T07:00:01",
+       "#text": "83.65"
+      },
+      {
+       "-name": "Tantangara Reservoir",
+       "-dataTimestamp": "2026-09-18T07:00:01",
+       "#text": "15.27"
+      }
+     ]
+    },
+    {
+     "-date": "2026-09-19",
+     "lake": [
+      {
+       "-name": "Lake Eucumbene",
+       "-dataTimestamp": "2026-09-19T07:00:01",
+       "#text": "41.35"
+      },
+      {
+       "-name": "Lake Jindabyne",
+       "-dataTimestamp": "2026-09-19T07:00:01",
+       "#text": "83.63"
+      },
+      {
+       "-name": "Tantangara Reservoir",
+       "-dataTimestamp": "2026-09-19T07:00:01",
+       "#text": "15.01"
+      }
+     ]
+    },
+    {
+     "-date": "2026-09-20",
+     "lake": [
+      {
+       "-name": "Lake Eucumbene",
+       "-dataTimestamp": "2026-09-20T07:00:00",
+       "#text": "41.42"
+      },
+      {
+       "-name": "Lake Jindabyne",
+       "-dataTimestamp": "2026-09-20T07:00:00",
+       "#text": "83.54"
+      },
+      {
+       "-name": "Tantangara Reservoir",
+       "-dataTimestamp": "2026-09-20T07:00:00",
+       "#text": "14.71"
+      }
+     ]
+    },
+    {
+     "-date": "2026-09-21",
+     "lake": [
+      {
+       "-name": "Lake Eucumbene",
+       "-dataTimestamp": "2026-09-21T07:00:01",
+       "#text": "41.50"
+      },
+      {
+       "-name": "Lake Jindabyne",
+       "-dataTimestamp": "2026-09-21T07:00:01",
+       "#text": "83.45"
+      },
+      {
+       "-name": "Tantangara Reservoir",
+       "-dataTimestamp": "2026-09-21T07:00:01",
+       "#text": "14.42"
+      }
+     ]
+    },
+    {
+     "-date": "2026-09-22",
+     "lake": [
+      {
+       "-name": "Lake Eucumbene",
+       "-dataTimestamp": "2026-09-22T07:00:00",
+       "#text": "41.58"
+      },
+      {
+       "-name": "Lake Jindabyne",
+       "-dataTimestamp": "2026-09-22T07:00:00",
+       "#text": "83.49"
+      },
+      {
+       "-name": "Tantangara Reservoir",
+       "-dataTimestamp": "2026-09-22T07:00:00",
+       "#text": "14.06"
+      }
+     ]
+    },
+    {
+     "-date": "2026-09-23",
+     "lake": [
+      {
+       "-name": "Lake Eucumbene",
+       "-dataTimestamp": "2026-09-23T07:00:01",
+       "#text": "41.63"
+      },
+      {
+       "-name": "Lake Jindabyne",
+       "-dataTimestamp": "2026-09-23T07:00:01",
+       "#text": "83.55"
+      },
+      {
+       "-name": "Tantangara Reservoir",
+       "-dataTimestamp": "2026-09-23T07:00:01",
+       "#text": "13.72"
+      }
+     ]
+    },
+    {
+     "-date": "2026-09-24",
+     "lake": [
+      {
+       "-name": "Lake Eucumbene",
+       "-dataTimestamp": "2026-09-24T07:00:00",
+       "#text": "41.65"
+      },
+      {
+       "-name": "Lake Jindabyne",
+       "-dataTimestamp": "2026-09-24T07:00:00",
+       "#text": "83.63"
+      },
+      {
+       "-name": "Tantangara Reservoir",
+       "-dataTimestamp": "2026-09-24T07:00:00",
+       "#text": "13.36"
+      }
+     ],
+     "snow": {
+      "-name": "Spencers Creek",
+      "-dataTimestamp": "2026-09-24T09:35:00",
+      "-quality": "G",
+      "#text": "0"
+     }
+    },
+    {
+     "-date": "2026-09-25",
+     "lake": [
+      {
+       "-name": "Lake Eucumbene",
+       "-dataTimestamp": "2026-09-25T07:00:00",
+       "#text": "41.66"
+      },
+      {
+       "-name": "Lake Jindabyne",
+       "-dataTimestamp": "2026-09-25T07:00:00",
+       "#text": "83.69"
+      },
+      {
+       "-name": "Tantangara Reservoir",
+       "-dataTimestamp": "2026-09-25T07:00:00",
+       "#text": "12.95"
+      }
+     ]
+    },
+    {
+     "-date": "2026-09-26",
+     "lake": [
+      {
+       "-name": "Lake Eucumbene",
+       "-dataTimestamp": "2026-09-26T07:00:01",
+       "#text": "41.66"
+      },
+      {
+       "-name": "Lake Jindabyne",
+       "-dataTimestamp": "2026-09-26T07:00:01",
+       "#text": "83.74"
+      },
+      {
+       "-name": "Tantangara Reservoir",
+       "-dataTimestamp": "2026-09-26T07:00:01",
+       "#text": "12.54"
+      }
+     ]
+    },
+    {
+     "-date": "2026-09-27",
+     "lake": [
+      {
+       "-name": "Lake Eucumbene",
+       "-dataTimestamp": "2026-09-27T07:00:00",
+       "#text": "41.66"
+      },
+      {
+       "-name": "Lake Jindabyne",
+       "-dataTimestamp": "2026-09-27T07:00:00",
+       "#text": "83.80"
+      },
+      {
+       "-name": "Tantangara Reservoir",
+       "-dataTimestamp": "2026-09-27T07:00:00",
+       "#text": "12.13"
+      }
+     ]
+    },
+    {
+     "-date": "2026-09-28",
+     "lake": [
+      {
+       "-name": "Lake Eucumbene",
+       "-dataTimestamp": "2026-09-28T07:00:01",
+       "#text": "41.67"
+      },
+      {
+       "-name": "Lake Jindabyne",
+       "-dataTimestamp": "2026-09-28T07:00:01",
+       "#text": "83.77"
+      },
+      {
+       "-name": "Tantangara Reservoir",
+       "-dataTimestamp": "2026-09-28T07:00:01",
+       "#text": "11.73"
+      }
+     ]
+    },
+    {
+     "-date": "2026-09-29",
+     "lake": [
+      {
+       "-name": "Lake Eucumbene",
+       "-dataTimestamp": "2026-09-29T07:00:00",
+       "#text": "41.69"
+      },
+      {
+       "-name": "Lake Jindabyne",
+       "-dataTimestamp": "2026-09-29T07:00:00",
+       "#text": "83.77"
+      },
+      {
+       "-name": "Tantangara Reservoir",
+       "-dataTimestamp": "2026-09-29T07:00:00",
+       "#text": "11.33"
+      }
+     ]
+    }
+   ]
+  }
+ }
+}

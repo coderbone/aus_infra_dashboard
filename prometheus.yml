@@ -12,3 +12,15 @@ scrape_configs:
     metrics_path: /metrics
     static_configs:
       - targets: ['tbm-exporter:9109']
+
+  - job_name: snowy_tantangara
+    # Snowy Hydro publishes these levels once a day, around 07:00 Sydney time,
+    # so there is nothing to gain from a short interval - 1h is 24 chances to
+    # see each new reading, and it keeps the ~190 KB two-year fetch to a
+    # negligible 4.5 MB/day. Still well under the first-scrape jitter concern
+    # that motivates the 5m above, which only bites at an hour or more.
+    scrape_interval: 1h
+    scrape_timeout: 30s
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['reservoir-exporter:9110']

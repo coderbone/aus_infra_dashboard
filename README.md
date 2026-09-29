@@ -1,14 +1,26 @@
 # monitoring
 
-Docker stack that exposes the Transport for NSW Western Harbour Tunnel TBM
-tracker as Prometheus metrics and charts it in Grafana.
+Docker stack that exposes two public project feeds as Prometheus metrics and
+charts them in Grafana:
 
-- `docker-compose.yml` — the three services (`tbm-exporter`, `prometheus`, `grafana`)
-- `prometheus.yml` — scrape config, target `tbm-exporter:9109`
+- the Transport for NSW **Western Harbour Tunnel TBM tracker** (tunnel boring
+  machine progress), and
+- **Snowy Hydro reservoir levels**, focused on Tantangara Reservoir — the upper
+  storage of the Snowy Hydro 2.0 pumped scheme.
+
+> The Snowy series are **water levels, not construction progress.** Snowy Hydro
+> 2.0 publishes no machine-readable project status of any kind; see
+> `scrapers/NOTES.md` for the audit. Tantangara drawdown is the closest live
+> signal that exists, because the 2.0 intake works are at the upper storage.
+
+- `docker-compose.yml` — the four services (`tbm-exporter`,
+  `reservoir-exporter`, `prometheus`, `grafana`)
+- `prometheus.yml` — scrape configs, targets `tbm-exporter:9109` and
+  `reservoir-exporter:9110`
 - `grafana/provisioning/` — Grafana datasource and dashboard provisioning
   (see `NOTES.md` §7 before changing the datasource uid)
-- `scrapers/` — the exporter itself; see `scrapers/README.md` for metrics and
-  `scrapers/NOTES.md` for the upstream ArcGIS item ids
+- `scrapers/` — the exporters themselves; see `scrapers/README.md` for metrics
+  and `scrapers/NOTES.md` for the upstream endpoints
 - `NOTES.md` — working notes: layout history, how to move the stack, a log of
   the problems hit here and their fixes, and what is still open
 
@@ -16,7 +28,7 @@ tracker as Prometheus metrics and charts it in Grafana.
 
 ```bash
 cd ~/src/monitoring
-docker compose up -d        # exporter -> prometheus -> grafana, gated on healthchecks
+docker compose up -d        # exporters -> prometheus -> grafana, gated on healthchecks
 docker compose ps
 docker compose logs -f tbm-exporter
 docker compose down         # volumes survive
@@ -30,18 +42,31 @@ The stack is on the `bone_monitoring` bridge network:
 | Service | Reachable at |
 | --- | --- |
 | `tbm-exporter` | not published — only Prometheus needs it |
+| `reservoir-exporter` | not published — only Prometheus needs it |
 | `prometheus` | `http://192.168.1.100:9090` |
 | `grafana` | `http://192.168.1.100:3000` |
 
 ## Design notes
 
-- The exporter is a stdlib-only Python script, so there is no image to build. It
-  runs in `python:3.12-alpine` with the script bind-mounted read-only from
-  `./scrapers`, and its layer config cache lives in the `exporter-cache` volume.
-- Prometheus scrapes `tbm-exporter:9109` over the compose network, so the
-  exporter is started with `--listen-address 0.0.0.0`. A `127.0.0.1` bind only
-  works while Prometheus shares the host network namespace.
-- 9109 is deliberately **not** published.
+- The exporters are stdlib-only Python scripts, so there is no image to build.
+  They run in `python:3.12-alpine` with each script bind-mounted read-only from
+  `./scrapers`. The WHT exporter's layer config cache lives in the
+  `exporter-cache` volume; the Snowy exporter mounts **no** volume, because it
+  has no discovered configuration to cache and its level gauges must never be
+  served from a stored copy.
+- They are two separate services rather than one container running both: they
+  have nothing to share — different upstreams, different retry and health
+  semantics, and separate failure isolation.
+- Prometheus scrapes them over the compose network, so each is started with
+  `--listen-address 0.0.0.0`. A `127.0.0.1` bind only works while Prometheus
+  shares the host network namespace.
+- 9109 and 9110 are deliberately **not** published.
+- Scrape intervals differ because the upstreams differ: 5m for the TBM tracker,
+  which publishes survey lines every few hours, and 1h for the reservoir levels,
+  which are published once a day around 07:00 Sydney time.
+- Both containers override `dns:` to public resolvers. The measured failure mode
+  is Docker's embedded resolver intermittently returning `EAI_AGAIN` after ~5s;
+  see `NOTES.md` §3.
 - Grafana's Prometheus datasource is provisioned from
   `grafana/provisioning/`, so no manual datasource setup is needed.
 - `prometheus-data` and `grafana-storage` are declared external, reusing the
@@ -59,12 +84,17 @@ file) before exposing 3000 beyond the LAN — it currently defaults to `admin`.
 ## Verify
 
 ```bash
-docker compose ps                                   # all three (healthy)
+docker compose ps                                   # all four (healthy)
 curl -s localhost:9090/api/v1/targets | grep -o '"health":"[a-z]*"'
 curl -s --get --data-urlencode 'query=up{job="wht_tbm"}' localhost:9090/api/v1/query
+curl -s --get --data-urlencode 'query=up{job="snowy_tantangara"}' localhost:9090/api/v1/query
 docker compose logs --tail 20 tbm-exporter          # upstream errors land here
+docker compose logs --tail 20 reservoir-exporter
 ```
 
-Alert on `wht_tbm_scrape_success == 0` and on
-`time() - wht_tbm_last_report_timestamp_seconds`. Full metric list in
-`scrapers/README.md`.
+Alert on `wht_tbm_scrape_success == 0`, on
+`time() - wht_tbm_last_report_timestamp_seconds`, on
+`snowy_tantangara_scrape_success == 0`, and on
+`time() - snowy_tantangara_last_sample_timestamp_seconds` (the feed publishes
+daily, so a threshold of ~36h catches a stopped feed without firing overnight).
+Full metric lists in `scrapers/README.md`.

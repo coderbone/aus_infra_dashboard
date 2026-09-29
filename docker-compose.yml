@@ -1,4 +1,4 @@
-# WHTP2 TBM tracker + Prometheus + Grafana.
+# WHTP2 TBM tracker + Snowy Hydro reservoir levels + Prometheus + Grafana.
 #
 #   docker compose up -d         start everything (first pull of python:3.12-alpine)
 #   docker compose logs -f tbm-exporter
@@ -21,6 +21,15 @@
 # image with the script bind-mounted from ./scrapers. It binds 0.0.0.0:9109 so
 # Prometheus can reach it over the compose network - do NOT put it back on
 # 127.0.0.1, that only works while Prometheus shares the host network namespace.
+#
+# There are now two exporters on the same pattern, `tbm-exporter` (Western
+# Harbour Tunnel, 9109) and `reservoir-exporter` (Snowy Hydro reservoir levels,
+# 9110). They are separate services rather than one container running both
+# because they have nothing to share: different upstreams, different retry and
+# health semantics, and separate failure isolation. Note the naming asymmetry -
+# the service is short (`tbm-exporter`) and the container carries the project
+# prefix (`wht-tbm-exporter`), because the containers are named in Docker, where
+# the project prefix is what keeps them unambiguous.
 
 name: bone
 
@@ -64,6 +73,48 @@ services:
       retries: 3
       start_period: 15s
 
+  reservoir-exporter:
+    image: python:3.12-alpine
+    container_name: snowy-tantangara-exporter
+    command:
+      - python
+      - /app/snowy_tantangara_exporter.py
+      - --listen-address=0.0.0.0
+      - --port=9110
+      - --cache-ttl=900
+      - --retries=3
+      - --retry-budget=6
+    # Same resolver override as tbm-exporter, for the same reason: Docker's
+    # embedded resolver intermittently gives up with EAI_AGAIN and burns ~5s
+    # doing it, which is what eats the retry budget. This one talks to
+    # snowyhydro.com.au rather than ArcGIS, so the measurement in the comment
+    # above was not taken against this host - but the fault is in the resolver,
+    # not the destination, so the fix transfers.
+    dns:
+      - 1.1.1.1
+      - 9.9.9.9
+    # Deliberately no cache volume, unlike tbm-exporter. That one caches its
+    # *discovered layer configuration*; this exporter has no discovery step and
+    # nothing to cache, and the level gauges must never be served from a stored
+    # copy - a cached level would be exported as if it were a current reading.
+    volumes:
+      - ./scrapers/snowy_tantangara_exporter.py:/app/snowy_tantangara_exporter.py:ro
+    networks: [monitoring]
+    restart: unless-stopped
+    # TCP probe only, same reasoning as tbm-exporter: /healthz triggers a real
+    # upstream fetch, and the feed publishes once a day, so there is nothing to
+    # learn from probing it every 30s.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import socket; socket.create_connection(('127.0.0.1', 9110), 3).close()"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
   prometheus:
     image: prom/prometheus
     container_name: prometheus
@@ -81,6 +132,8 @@ services:
     restart: unless-stopped
     depends_on:
       tbm-exporter:
+        condition: service_healthy
+      reservoir-exporter:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:9090/-/healthy"]

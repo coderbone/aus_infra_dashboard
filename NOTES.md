@@ -426,10 +426,11 @@ a percentage (`wht_tbm_progress_ratio`), and *Rings*
 the 0–1 ratio and the ring count do not share an axis sensibly.
 
 *Western Harbour TBMs* and *TBM progress* are 13 rows tall in a 24-column grid,
-*Rings* is 12 wide below the left one, and the two stats stack in the right-hand
-column. *Western Harbour TBMs* hides the two `<tbm> excavated` series via a
-`hideSeriesFrom` field override, so the excavated line is on its own axis
-scale from the remaining and target distances.
+*Rings* is 12 wide below the left one, and four stats stack in the right-hand
+column: *Report age* and *Last survey report* at y=13 and y=17, then *Advance
+rate* and *Estimated completion* at y=21 and y=25. *Western Harbour TBMs* hides
+the two `<tbm> excavated` series via a `hideSeriesFrom` field override, so the
+excavated line is on its own axis scale from the remaining and target distances.
 
 *Rings* uses `lineInterpolation: stepAfter`, because the metric is a step
 function: scraped every 5m but the ring only advances every few hours, so
@@ -473,6 +474,8 @@ local timezone:
 | --- | --- | --- |
 | *Last survey report* | `wht_tbm_last_report_timestamp_seconds * 1000` | `dateTimeAsIso` |
 | *Report age* | `time() - wht_tbm_last_report_timestamp_seconds` | `dtdhms` |
+| *Advance rate* | `delta(wht_tbm_distance_excavated_m[$__range_s]) * 3600 / $__range_s` | `suffix:m/h` |
+| *Estimated completion* | see below | `dateTimeAsIso` |
 
 **The two panels are formatted differently on purpose: one is an instant, one is
 a duration, and Grafana has a different unit family for each. Do not
@@ -571,6 +574,110 @@ Note the metric name is `..._last_report_timestamp_seconds` (not
 `..._timestamp`) — it is a gauge of epoch seconds, not a Prometheus timestamp
 type.
 
+#### Advance rate and estimated completion
+
+Two stats added 2026-09-29 at y=21 and y=25, continuing the right-hand column.
+Both measure over **the dashboard's current time range**, not a fixed window, so
+changing the time picker is how you ask for a different average. That is the
+whole point of them: there is no single correct advance rate for a TBM that has
+been up and down, and a fixed-window query would quietly pick one for you.
+
+```
+# Advance rate, metres per hour
+delta(wht_tbm_distance_excavated_m[$__range_s]) * 3600 / $__range_s
+
+# Estimated completion
+(time() + wht_tbm_remaining_distance_m
+          / (delta(wht_tbm_distance_excavated_m[$__range_s]) * 3600 / $__range_s)
+          * 3600) * 1000
+  and on(tbm) (delta(wht_tbm_distance_excavated_m[$__range_s]) * 3600 / $__range_s > 0)
+```
+
+Four things are load-bearing in that.
+
+**`delta()`, not `rate()` or `increase()`.** `wht_tbm_distance_excavated_m` is a
+gauge. `rate()`/`increase()` exist to turn a counter into a rate that survives
+resets, and they *assume* a series only ever increases: a decrease is read as a
+counter reset and the pre-dip value is added back into the total, so an upstream
+survey correction would come out as an inflated advance rather than the dip that
+actually happened. `delta()` is the function for "how much did this gauge move
+across this window" and applies no reset logic at all.
+
+**`$__range_s`, not `$__rate_interval`.** This is the inverse of the rule in the
+Snowy section below, and worth stating side by side: `$__rate_interval` is what
+Grafana derives from the panel's `Min interval` and the scrape interval, and the
+datasource's `timeInterval: 5m` would clamp it to `5m` — turning both queries
+into a constant 5-minute rate no matter what time range is selected. The range
+has to come from the time picker, so it is `$__range_s`, an integer number of
+seconds Grafana substitutes before the query is sent.
+
+**The `* 3600` on the ETA is not a units detail, it is the whole calculation.**
+`time()` is epoch **seconds**, while `remaining / rate` is in **hours**, because
+the rate is metres per *hour*. Adding them as-is produces a timestamp about an
+hour after now, which is a valid-looking date and completely wrong. Then the
+`* 1000` on the outside converts to milliseconds for the `dateTimeAsIso` unit,
+exactly as in *Last survey report* — same rule, same reason.
+
+**The `and on(tbm) (... > 0)` guard suppresses an infinite ETA.** If the TBM has
+not advanced inside the selected range the divisor is zero and the result is
+`+Inf` (verified directly against Prometheus). Inf milliseconds is
+`Invalid Date` in moment, so the panel would render that. Filtering on the rate
+being positive returns no series instead, and the panel reads **No data** —
+which is the truth: with no advance there is no rate to extrapolate from. `on(tbm)`
+is explicit rather than relying on both sides carrying the same
+`instance`/`job`/`tbm` labels, which they do.
+
+Measured across ranges on 2026-09-29, to show how much the window matters:
+
+| range | barangaroo rate | barangaroo ETA | patyegarang ETA |
+| --- | --- | --- | --- |
+| now-1h | 0.02 m/h | 2033-01-27 | 2026-12-15 |
+| now-6h | 0.41 m/h | 2027-02-10 | 2026-11-24 |
+| now-24h | 0.70 m/h | 2026-12-16 | 2026-12-13 |
+| now-7d | 0.14 m/h | 2027-10-17 | 2027-06-22 |
+
+That spread is the feature, not a bug, but it is why the panel description says
+the estimate is only as good as the window. The 7d row is also bounded by the
+data: Prometheus has only held this job for ~66 h, so `now-7d` and `now-30d` are
+effectively "everything we have". That will change as the TSDB fills.
+
+**A range shorter than the 5m scrape interval returns no data, not a zero.**
+`delta()` needs two samples in the window; at `[300]` and `[60]` the query comes
+back empty and the panel reads **No data**. That is the honest outcome — a real
+zero would claim the TBM has stopped. `clamp_min($__range_s, 600)` is not an
+option here, and neither is any other expression: a range selector duration has
+to be a literal, so Prometheus rejects it with
+`parse error: unexpected character in duration expression: 'c'` (the `c` of
+`clamp_min`).
+
+**`suffix:m/h` is a custom unit, not a built-in one, and it is worth knowing why
+it parses.** There is no metres-per-hour id in the Grafana unit catalogue, so
+`getValueFormat` falls through its index lookup to the custom-unit branch —
+verified in the shipped bundle, `valueFormats.ts` in the container's
+`grafana-data` source map:
+
+```js
+let idx = id.indexOf(':');
+if (idx > 0) {
+  const key = id.substring(0, idx);
+  const sub = id.substring(idx + 1);
+  if (key === 'prefix') { return toFixedUnit(sub, true); }
+  if (key === 'suffix') { return toFixedUnit(sub, false); }
+```
+
+The split is on the **first** colon and `sub` is everything after it, so the `/`
+in `m/h` is carried through untouched. `prefix:m/h` would be equally valid.
+
+Neither panel is coloured (`colorMode: "none"`, one neutral `text` threshold
+step), matching *Last survey report*. A rate is a measurement rather than a
+status, and the stall signal already has a home in *Report age*.
+
+They are **two panels, one query each**, for the same reason *Last survey report*
+and *Report age* are not merged: a rate in `suffix:m/h` and a Date & time value
+would need different unit families on one panel, and that is the override that
+cannot be made to work reliably (see the two-frames-both-called-`Time` note
+above).
+
 The dashboard has `"refresh": "5m"`, so these panels re-query on that interval
 rather than only on load. A 5 m refresh against a 5 m `scrape_interval` is fine
 here — the report times only move when the tracker publishes. Note that refresh
@@ -594,6 +701,58 @@ curl -s --get --data-urlencode \
   'query=time() - wht_tbm_last_report_timestamp_seconds' \
   localhost:9090/api/v1/query
 ```
+
+**The two range-dependent queries cannot be checked that way, because
+`$__range_s` is a Grafana variable and Prometheus rejects it** — so the file has
+to be read, the variable substituted by hand, and the result run through
+Grafana's own proxy (which is also the only way to prove the datasource path
+works, and to prove the *No data* cases above are reachable rather than
+hypothetical):
+
+```bash
+python3 - <<'PY'
+import json, math, time, urllib.request, datetime
+
+d = json.load(open("grafana/provisioning/dashboards/western-harbour-tbm.json"))
+ds = {"type": "prometheus", "uid": "PBFA97CFB590B2093"}
+for panel in d["panels"]:
+    if panel["id"] not in (6, 7):
+        continue
+    print("\n=== %s  (unit %s) ===" % (panel["title"],
+          panel["fieldConfig"]["defaults"]["unit"]))
+    for secs in (300, 3600, 21600, 86400, 604800):
+        expr = panel["targets"][0]["expr"].replace("$__range_s", str(secs))
+        body = json.dumps({
+            "from": str(int((time.time() - secs) * 1000)),
+            "to": str(int(time.time() * 1000)),
+            "queries": [{"refId": "A", "datasource": ds, "instant": True,
+                         "range": False, "format": "time_series",
+                         "legendFormat": "{{tbm}}", "expr": expr}]}).encode()
+        req = urllib.request.Request(
+            "http://localhost:3000/api/ds/query", data=body,
+            headers={"Content-Type": "application/json",
+                     "Authorization": "Basic YWRtaW46YWRtaW4="})
+        res = json.load(urllib.request.urlopen(req))
+        # An empty result still comes back as one frame, with no fields.
+        frames = [f for f in (res["results"]["A"].get("frames") or [])
+                  if f["schema"]["fields"]]
+        if not frames:
+            print("  %-8s NO DATA" % secs); continue
+        for f in frames:
+            tbm = f["schema"]["fields"][1]["labels"]["tbm"]
+            v = float(f["data"]["values"][1][0])
+            if math.isinf(v) or math.isnan(v):
+                out = str(v) + "   <-- would render as an invalid date"
+            elif v > 1e9:
+                out = datetime.datetime.fromtimestamp(v / 1000, datetime.UTC).isoformat()
+            else:
+                out = "%.3f m/h" % v
+            print("  %-8d %-12s %s" % (secs, tbm, out))
+PY
+```
+
+If that ever prints `+Inf`, the `and on(tbm) (... > 0)` guard has been dropped
+from panel 7 and the panel will show **Invalid Date** in the browser.
 
 ### The `Snowy Hydro reservoir levels` dashboard
 

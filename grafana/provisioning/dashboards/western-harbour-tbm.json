@@ -502,6 +502,138 @@
       ],
       "title": "Last survey report",
       "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "Mean advance over the dashboard's current time range, recomputed whenever you zoom, so widening the range is how you ask for a longer-run average. delta() is the right function here because wht_tbm_distance_excavated_m is a gauge, not a counter - rate() and increase() carry counter-reset handling that means nothing here. 0 m/h means the TBM has not moved inside the range, not that it has finished, and a range shorter than the 5m scrape interval returns no data at all rather than a misleading 0.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "suffix:m/h"
+        }
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 12,
+        "x": 12,
+        "y": 21
+      },
+      "id": 6,
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "horizontal",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "value_and_name",
+        "wideLayout": true
+      },
+      "pluginVersion": "13.2.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "delta(wht_tbm_distance_excavated_m[$__range_s]) * 3600 / $__range_s",
+          "instant": true,
+          "legendFormat": "{{tbm}}",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Advance rate",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "Estimated completion: remaining distance divided by the advance rate over the current time range, added to now. The estimate is only as good as the window it is measured over - the same TBM gave 2026-12-16 on a 24h range and 2027-10-17 on a 7d range when this was written. Reads No data when a TBM has not advanced inside the range, because the division is undefined there and an infinite ETA is suppressed rather than rendered as a nonsense date.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "dateTimeAsIso"
+        }
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 12,
+        "x": 12,
+        "y": 25
+      },
+      "id": 7,
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "horizontal",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "value_and_name",
+        "wideLayout": true
+      },
+      "pluginVersion": "13.2.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "(time() + wht_tbm_remaining_distance_m / (delta(wht_tbm_distance_excavated_m[$__range_s]) * 3600 / $__range_s) * 3600) * 1000 and on(tbm) (delta(wht_tbm_distance_excavated_m[$__range_s]) * 3600 / $__range_s > 0)",
+          "instant": true,
+          "legendFormat": "{{tbm}}",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Estimated completion",
+      "type": "stat"
     }
   ],
   "preload": false,

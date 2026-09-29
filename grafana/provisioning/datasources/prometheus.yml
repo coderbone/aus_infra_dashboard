@@ -20,8 +20,11 @@ datasources:
       #
       # That mismatch is harmless for these dashboards: no query here uses a
       # rate() or an irate(), so $__rate_interval never appears and a plain
-      # selector does not care what the step is. The one place it could bite is
-      # $__interval on a range query over the hourly job, which would ask for
-      # 5m resolution against 1h data. Keep this at 5m and leave range queries
-      # on the reservoir series with an explicit range, as they are.
+      # selector does not care what the step is. It is also why the TBM
+      # dashboard's advance-rate and ETA panels use $__range_s rather than
+      # $__rate_interval: the latter is clamped to this 5m and would make both
+      # a constant 5-minute rate. See NOTES.md section 7. The one place it could
+      # bite is $__interval on a range query over the hourly job, which would
+      # ask for 5m resolution against 1h data. Keep this at 5m and leave range
+      # queries on the reservoir series with an explicit range, as they are.
       timeInterval: 5m

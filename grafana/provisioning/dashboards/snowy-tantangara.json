@@ -1,0 +1,841 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Snowy Hydro scheme reservoir levels, focused on Tantangara Reservoir. Water data, not Snowy Hydro 2.0 construction progress.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "liveNow": false,
+  "panels": [
+    {
+      "gridPos": {
+        "h": 5,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "options": {
+        "code": {
+          "language": "plaintext",
+          "showLineNumbers": false,
+          "showMiniMap": false
+        },
+        "content": "### Snowy Hydro \u2014 Tantangara Reservoir\n\n**These are water levels, not construction progress.** Snowy Hydro 2.0 publishes no machine-readable project status of any kind \u2014 no progress dashboard, no TBM tracker. Tantangara drawdown is the closest live 2.0 signal that exists, because the 2.0 intake works are at the upper storage. See `scrapers/NOTES.md` for the audit that established this.\n\nPublished **once a day**, around 07:00 Sydney time. This is not a live feed, and the flat stretches in the charts are that, not a fault.\n\nUnits: level is **percent of gross storage** (0\u2013100); the 7-day change is **percentage points**. Never metres \u2014 the upstream publishes no volume.",
+        "mode": "markdown"
+      },
+      "pluginVersion": "13.2.2",
+      "targets": [],
+      "title": "About these metrics",
+      "type": "text"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "Latest published level, percent of gross storage. 11.33 means the reservoir is 11.33% of full \u2014 not 11.33% of *its* capacity, and not 11.33 ML. A 0 or NaN here is a scrape problem, never an empty lake: the exporter writes NaN for a reading it could not take.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "percent"
+        }
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 5
+      },
+      "id": 2,
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "horizontal",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "value_and_name",
+        "wideLayout": true
+      },
+      "pluginVersion": "13.2.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "last_over_time(snowy_tantangara_level_percent{reservoir=\"$reservoir\"}[2h])",
+          "instant": true,
+          "legendFormat": "{{reservoir}}",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Tantangara level",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "Difference between the newest reading and the one seven days earlier, in **percentage points**. Snowy Hydro's own copy quotes the same figure as \"-2.73 m/week\"; the endpoint publishes no volume at all, so it is percentage points, not metres. Negative is drawdown, which is what the 2.0 intake works cause.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "percentagepoint"
+        }
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 5
+      },
+      "id": 3,
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "horizontal",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "value_and_name",
+        "wideLayout": true
+      },
+      "pluginVersion": "13.2.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "last_over_time(snowy_tantangara_level_change_7d_percentage_points{reservoir=\"$reservoir\"}[2h])",
+          "instant": true,
+          "legendFormat": "{{reservoir}}",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Change, last 7 days",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "Lowest and highest published levels in the current calendar year. Two queries in one panel is safe here *only* because both are percentages. The *Last reading* and *Reading age* panels must stay separate for the same reason they are separate on the TBM dashboard: a date unit and a duration unit cannot share a panel, and the override that would be needed cannot be matched reliably. See NOTES.md section 7.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "percent"
+        }
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 5
+      },
+      "id": 4,
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "horizontal",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "value_and_name",
+        "wideLayout": true
+      },
+      "pluginVersion": "13.2.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "last_over_time(snowy_tantangara_level_min_ytd_percent{reservoir=\"$reservoir\"}[2h])",
+          "instant": true,
+          "legendFormat": "YTD low",
+          "range": false,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "last_over_time(snowy_tantangara_level_max_ytd_percent{reservoir=\"$reservoir\"}[2h])",
+          "instant": true,
+          "legendFormat": "YTD high",
+          "range": false,
+          "refId": "B"
+        }
+      ],
+      "title": "YTD range",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "0 if **any** scrape in the last 2 h failed, and empty if the exporter has vanished entirely. That is `min_over_time`, not the last value: the level gauges are dropped rather than repeated on a failure, so this is the one place a dead exporter shows up. A plain `last_over_time` here would keep showing a stale 1 for up to 2 h after the target died.\n\nThe window exists because a 1 h `scrape_interval` against Prometheus's **5-minute** instant-query lookback would otherwise leave every stat panel on this dashboard empty for 55 minutes of every hour.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": 0
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "none"
+        }
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 5
+      },
+      "id": 5,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "horizontal",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "value",
+        "wideLayout": true
+      },
+      "pluginVersion": "13.2.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "min_over_time(snowy_tantangara_scrape_success[2h])",
+          "instant": true,
+          "legendFormat": "scrape",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Exporter scrape OK",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "Level over time, with the year's own extremes as grey reference lines. `stepAfter` because this is a step function: a reading is taken once a day and then held, so a straight line between points would invent intermediate levels that were never published. Gaps are real \u2014 `spanNulls` is off, so a failed scrape breaks the line instead of being quietly bridged. Prometheus only holds what it has scraped, and this job started on 2026-09-29. There is no history further back than that, however far the upstream feed goes \u2014 the feed itself goes back to 1954.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "% full",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "percent"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": [
+                "B",
+                "C"
+              ]
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "text",
+                  "mode": "fixed"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 1
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 11,
+        "w": 24,
+        "x": 0,
+        "y": 9
+      },
+      "id": 6,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "13.2.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "last_over_time(snowy_tantangara_level_percent{reservoir=\"$reservoir\"}[2h])",
+          "instant": false,
+          "legendFormat": "{{reservoir}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "last_over_time(snowy_tantangara_level_min_ytd_percent{reservoir=\"$reservoir\"}[2h])",
+          "instant": false,
+          "legendFormat": "YTD low",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "last_over_time(snowy_tantangara_level_max_ytd_percent{reservoir=\"$reservoir\"}[2h])",
+          "instant": false,
+          "legendFormat": "YTD high",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Tantangara level",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "When the newest published reading was taken, in the viewer's local timezone. This is an **instant**, so the query is scaled to milliseconds and the unit is a Date & time one \u2014 every Grafana date formatter bottoms out in `moment().utc(value)`, which takes ms. The `* 1000` is not optional.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "dateTimeAsIso"
+        }
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 8,
+        "x": 0,
+        "y": 20
+      },
+      "id": 7,
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "horizontal",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "value_and_name",
+        "wideLayout": true
+      },
+      "pluginVersion": "13.2.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "last_over_time(snowy_tantangara_last_sample_timestamp_seconds{reservoir=\"$reservoir\"}[2h]) * 1000",
+          "instant": true,
+          "legendFormat": "{{reservoir}}",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Last reading",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "How long ago that reading was. This is a **duration**, so the query is left in seconds and the unit is a duration one \u2014 the opposite of *Last reading*, on purpose. Never `dateTimeFromNow` here: it is a Date & time unit, so it reinterprets the number as an absolute instant, and an age over ~1 day then renders as months or years.\n\nThe 7 d window is deliberate and is **not** the 2 h the other panels use. This is the panel that has to keep reporting when the feed goes quiet: the exporter drops the timestamp gauge on a failure, so a short window would make this panel go blank exactly when its answer matters. With 7 d it keeps counting up and crosses the thresholds instead.\n\nBecause the feed publishes daily this panel oscillates between roughly 0.5h and 31.5h, which is why the thresholds are 36h and 48h rather than hours.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "orange",
+                "value": 129600
+              },
+              {
+                "color": "red",
+                "value": 172800
+              }
+            ]
+          },
+          "unit": "dtdhms"
+        }
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 8,
+        "x": 8,
+        "y": 20
+      },
+      "id": 8,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "horizontal",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "value_and_name",
+        "wideLayout": true
+      },
+      "pluginVersion": "13.2.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "time() - last_over_time(snowy_tantangara_last_sample_timestamp_seconds{reservoir=\"$reservoir\"}[7d])",
+          "instant": true,
+          "legendFormat": "{{reservoir}}",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Reading age",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "Wall time of the last upstream fetch. `scrape_timeout` is 30s, so a durable value approaching that means `--retry-budget` is too generous for the timeout \u2014 a symptom of the DNS resolver stalling, not of Snowy Hydro being slow.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "s"
+        }
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 8,
+        "x": 16,
+        "y": 20
+      },
+      "id": 9,
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "horizontal",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "value",
+        "wideLayout": true
+      },
+      "pluginVersion": "13.2.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "last_over_time(snowy_tantangara_scrape_duration_seconds[2h])",
+          "instant": true,
+          "legendFormat": "scrape",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Scrape duration",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "The 7-day change as of each scrape, in percentage points. Flat stretches are the daily publication, not a stalled exporter. Negative through 2026 is drawdown for the 2.0 intake works.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "pp / 7 days",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "percentagepoint"
+        }
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 24
+      },
+      "id": 10,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "13.2.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "last_over_time(snowy_tantangara_level_change_7d_percentage_points{reservoir=\"$reservoir\"}[2h])",
+          "instant": false,
+          "legendFormat": "{{reservoir}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Weekly change",
+      "type": "timeseries"
+    }
+  ],
+  "preload": false,
+  "refresh": "1h",
+  "schemaVersion": 42,
+  "tags": [
+    "snowy-hydro",
+    "reservoir"
+  ],
+  "templating": {
+    "list": [
+      {
+        "allowCustomValue": true,
+        "current": {
+          "text": "Tantangara Reservoir",
+          "value": "Tantangara Reservoir"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        },
+        "definition": "label_values(snowy_tantangara_level_percent, reservoir)",
+        "hide": 0,
+        "includeAll": false,
+        "label": "Reservoir",
+        "multi": false,
+        "name": "reservoir",
+        "options": [],
+        "query": {
+          "query": "label_values(snowy_tantangara_level_percent, reservoir)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 1,
+        "regex": "",
+        "regexApplyTo": "value",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-7d",
+    "to": "now"
+  },
+  "timepicker": {
+    "refresh_intervals": [
+      "5s",
+      "10s",
+      "30s",
+      "1m",
+      "5m",
+      "15m",
+      "30m",
+      "1h",
+      "2h",
+      "1d"
+    ]
+  },
+  "timezone": "browser",
+  "title": "Snowy Hydro reservoir levels",
+  "uid": "snowy-tantangara"
+}

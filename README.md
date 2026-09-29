@@ -17,8 +17,10 @@ charts them in Grafana:
   `reservoir-exporter`, `prometheus`, `grafana`)
 - `prometheus.yml` — scrape configs, targets `tbm-exporter:9109` and
   `reservoir-exporter:9110`
-- `grafana/provisioning/` — Grafana datasource and dashboard provisioning
-  (see `NOTES.md` §7 before changing the datasource uid)
+- `grafana/provisioning/` — Grafana datasource and dashboard provisioning.
+  Two dashboards, both loaded from files at boot: `Western Harbour TBM`
+  (`adr468z`) and `Snowy Hydro reservoir levels` (`snowy-tantangara`). See
+  `NOTES.md` §7 before changing the datasource uid or either dashboard uid.
 - `scrapers/` — the exporters themselves; see `scrapers/README.md` for metrics
   and `scrapers/NOTES.md` for the upstream endpoints
 - `NOTES.md` — working notes: layout history, how to move the stack, a log of
@@ -69,6 +71,11 @@ The stack is on the `bone_monitoring` bridge network:
   see `NOTES.md` §3.
 - Grafana's Prometheus datasource is provisioned from
   `grafana/provisioning/`, so no manual datasource setup is needed.
+- Each dashboard gets its own refresh interval, matched to its upstream: 5m for
+  the TBM tracker, 1h for the reservoir levels, which publish once a day. Grafana
+  panels here are deliberately not generic: date-versus-duration units, percent
+  versus `percentunit`, and step-versus-linear interpolation each have a specific
+  reason, all written up in `NOTES.md` §7.
 - `prometheus-data` and `grafana-storage` are declared external, reusing the
   volumes `docker volume create` made for the pre-compose setup.
 - `name: bone` at the top of the compose file is pinned on purpose. Without it
@@ -87,7 +94,12 @@ file) before exposing 3000 beyond the LAN — it currently defaults to `admin`.
 docker compose ps                                   # all four (healthy)
 curl -s localhost:9090/api/v1/targets | grep -o '"health":"[a-z]*"'
 curl -s --get --data-urlencode 'query=up{job="wht_tbm"}' localhost:9090/api/v1/query
-curl -s --get --data-urlencode 'query=up{job="snowy_tantangara"}' localhost:9090/api/v1/query
+# snowy_tantangara is scraped hourly but an instant query only looks back 5
+# minutes, so a bare `up{job="snowy_tantangara"}` is empty for most of the hour.
+# Wrap it, or read the lookback-independent /api/v1/targets above.
+curl -s --get --data-urlencode 'query=last_over_time(up{job="snowy_tantangara"}[2h])' \
+  localhost:9090/api/v1/query
+curl -s -u admin:admin 'localhost:3000/api/search?type=dash-db'   # both dashboards
 docker compose logs --tail 20 tbm-exporter          # upstream errors land here
 docker compose logs --tail 20 reservoir-exporter
 ```

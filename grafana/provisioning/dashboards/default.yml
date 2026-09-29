@@ -10,6 +10,16 @@
 # overwrites the UI copy. A UI save made while the file is unchanged survives,
 # so edit in whichever place suits you; see NOTES.md section 7 for pulling a
 # UI-edited dashboard back into git.
+#
+# Dashboards here, and the uids that identify them. The uid is how provisioning
+# matches a file to an existing dashboard, so a changed uid creates a duplicate
+# rather than updating in place:
+#
+#   western-harbour-tbm.json  adr468z          WHT TBM progress
+#   snowy-tantangara.json     snowy-tantangara Snowy reservoir levels
+#
+# Both are generated/edited with indent=2, sort_keys=True to match the committed
+# files; see NOTES.md section 7.
 apiVersion: 1
 
 providers:

@@ -156,7 +156,9 @@ Each of these cost time; check they haven't regressed.
 docker compose ps                                   # all four (healthy)
 curl -s localhost:9090/api/v1/targets | grep -o '"health":"[a-z]*"'
 curl -s --get --data-urlencode 'query=up{job="wht_tbm"}' localhost:9090/api/v1/query
-curl -s --get --data-urlencode 'query=up{job="snowy_tantangara"}' localhost:9090/api/v1/query
+# Lookback-safe: snowy_tantangara is hourly, an instant query only looks back 5m.
+curl -s --get --data-urlencode 'query=last_over_time(up{job="snowy_tantangara"}[2h])' \
+  localhost:9090/api/v1/query
 docker compose logs --tail 20 tbm-exporter          # upstream errors land here
 docker compose logs --tail 20 reservoir-exporter
 ```
@@ -253,21 +255,17 @@ discovery step, so its cold start is a single ~190 KB fetch and lands around
   **Fixed** — see the exporter section below for what shipped and what the
   measurements ruled out.
 - `GRAFANA_ADMIN_PASSWORD` still unset.
-- **No Grafana dashboard for the Snowy reservoir series yet.** The
-  `snowy_tantangara` job is scraped and the metrics are documented, but the only
-  provisioned dashboard is `Western Harbour TBM`. The metrics that a panel would
-  want already exist: `snowy_tantangara_level_percent` (unit `percent`,
-  0–100), `snowy_tantangara_level_change_7d_percentage_points` (unit
-  `percentagepoint` — the level of care Grafana's unit handling needs, see
-  section 7), and
-  `time() - snowy_tantangara_last_sample_timestamp_seconds` as the staleness
-  panel.
 - No recording or alerting rules; `prometheus.yml` has scrape configs only.
-- The `Western Harbour TBM` dashboard is provisioned from
-  `grafana/provisioning/dashboards/` (see section 7), but there is no
-  provisioning of Grafana *users* or folders.
-- The exporter has a `web.enable-lifecycle`-style reload nowhere; changing
-  `prometheus.yml` needs `docker compose restart prometheus`.
+- The dashboards are provisioned from `grafana/provisioning/dashboards/` (see
+  section 7), but there is no provisioning of Grafana *users* or folders.
+- **Editing `prometheus.yml` needs `curl -XPOST localhost:9090/-/reload`, not a
+  container restart.** `--web.enable-lifecycle` is in the Prometheus command in
+  `docker-compose.yml` and the endpoint answers 200. This note previously said
+  the reload endpoint did not exist here; that was wrong, and it mattered:
+  Prometheus was found still running the old config with only the `wht_tbm` job
+  loaded, minutes after a new job had been added to the bind-mounted file. If
+  `/-/reload` ever stops answering, fall back to `docker compose restart
+  prometheus`, and expect the first scrape after any restart to be offset.
 - Host is not 24/7-managed: nothing restarts Docker or the stack on reboot
   beyond `restart: unless-stopped`. No systemd unit for the stack.
 - **`patyegarang` has not published a survey report since 2026-09-25**, ~44 h at
@@ -308,7 +306,8 @@ from the host and applied on every boot:
 ```
 grafana/provisioning/datasources/prometheus.yml            # the Prometheus datasource
 grafana/provisioning/dashboards/default.yml                # the dashboard file provider
-grafana/provisioning/dashboards/western-harbour-tbm.json   # the dashboard itself
+grafana/provisioning/dashboards/western-harbour-tbm.json   # WHT TBM progress dashboard
+grafana/provisioning/dashboards/snowy-tantangara.json      # Snowy reservoir levels dashboard
 ```
 
 **The datasource URL is `http://prometheus:9090`, not
@@ -328,7 +327,11 @@ let provisioning recreate it.
 
 **The dashboard uid `adr468z` must stay stable too.** Provisioning matches an
 existing dashboard by uid, so keeping it updates the dashboard in place;
-changing it creates a second copy of the same dashboard.
+changing it creates a second copy of the same dashboard. This applies to every
+dashboard, and there are now two: `adr468z` for the TBM dashboard and
+`snowy-tantangara` for the reservoir one. Neither uid may be reused for a
+different dashboard either — `snowy-tantangara` is spelled out in full rather
+than using a Grafana-style random uid precisely so it reads as what it is.
 
 `allowUiUpdates: true` lets a dashboard be saved from the UI. **The file only
 wins once the file changes** — provisioning pushes the file into the database
@@ -590,4 +593,239 @@ curl -s --get --data-urlencode \
 curl -s --get --data-urlencode \
   'query=time() - wht_tbm_last_report_timestamp_seconds' \
   localhost:9090/api/v1/query
+```
+
+### The `Snowy Hydro reservoir levels` dashboard
+
+`grafana/provisioning/dashboards/snowy-tantangara.json`, uid `snowy-tantangara`,
+tags `snowy-hydro`/`reservoir`. Second dashboard in this stack; the first was
+hand-built in the UI and pulled back, this one was generated.
+
+Its headline is the one thing a reader must not get wrong, so it is a `text`
+panel in the top-left, above the data: **these are water levels, not Snowy Hydro
+2.0 construction progress.** No 2.0 machine-readable status exists at all
+(section 5, and the audit in `scrapers/NOTES.md`). It also states that the feed
+publishes **once a day at about 07:00 Sydney**, which is what explains the flat
+stretches in both charts.
+
+Ten panels in a 24-column grid: a 5-row text header, a row of four 6-wide stats,
+a full-width 11-row level chart, a row of three 8-wide stats, and a full-width
+9-row weekly-change chart.
+
+| Panel | Query | Unit |
+| --- | --- | --- |
+| *Tantangara level* (stat and chart) | `snowy_tantangara_level_percent` | `percent` |
+| *Change, last 7 days* / *Weekly change* | `snowy_tantangara_level_change_7d_percentage_points` | `percentagepoint` |
+| *YTD range* (2 queries, 1 panel) | `..._level_min_ytd_percent`, `..._level_max_ytd_percent` | `percent` |
+| *Exporter scrape OK* | `snowy_tantangara_scrape_success` | `none` |
+| *Last reading* | `snowy_tantangara_last_sample_timestamp_seconds * 1000` | `dateTimeAsIso` |
+| *Reading age* | `time() - snowy_tantangara_last_sample_timestamp_seconds` | `dtdhms` |
+| *Scrape duration* | `snowy_tantangara_scrape_duration_seconds` | `s` |
+
+Unit notes, all of which cost something to get wrong:
+
+- **`percent`, not `percentunit`.** These gauges are 0–100 already, and
+  `percentunit` is the unit for a 0–1 ratio, which would render 11.33 as
+  1133%. The TBM dashboard's *TBM progress* panel is the 0–1 case and uses
+  `percentunit`; these are not.
+- **`percentagepoint` for the weekly change**, and the axis label says
+  `pp / 7 days`. Snowy's own copy quotes this figure as "-2.73 m/week", but the
+  endpoint publishes no volume, so it is percentage points and **not metres**. The
+  panel description repeats that, because the upstream wording invites the wrong
+  reading.
+- ***Last reading* and *Reading age* are separate panels** for exactly the reason
+  set out above for *Last survey report* and *Report age*: one is an instant
+  (Date & time unit, `* 1000`) and one is a duration (`dtdhms`, seconds). Same
+  trap, same fix. `dateTimeFromNow` is not used anywhere on this dashboard.
+- *YTD range* **is** two queries in one panel, and it is safe only because both
+  series are percentages. The seconds-vs-milliseconds case above is the one that
+  cannot be overridden, since `legendFormat` is applied in the frontend and both
+  frames come back as an indistinguishable field named `Time`.
+
+Both charts use `lineInterpolation: stepAfter`, for the same reason *Rings* does:
+the level is a step function, taken once a day and then held, so a straight line
+between points would draw intermediate levels that were never published.
+
+Both charts set `spanNulls: true`, so a line is drawn across a missing sample.
+This was **changed in the UI on 2026-09-29 and adopted into the file**; it was
+originally written as `false` here on the argument that a gap *is* the signal,
+since the exporter drops the gauges rather than serving a stale value, so a break
+in the line means a failed scrape. That reasoning still holds, so be deliberate
+about which you want: with `spanNulls: true` a failed scrape is bridged and the
+line looks continuous, and the *Exporter scrape OK* stat becomes the only place
+that failure is visible. With `false` the break is self-evident. The TBM
+dashboard has always used `true`, so `true` here is at least consistent across
+the two.
+
+**Every query on this dashboard is wrapped in an `over_time` function, and that is
+load-bearing, not decoration. Do not unwrap them.** Prometheus's instant-query
+**lookback delta is 5 minutes**, and that 5 minutes applies *per evaluation step*
+of a range query too — not just to instant queries. This job is scraped hourly,
+so its samples are ~60 minutes apart, which is 12× the lookback. Measured on the
+real data, bare selectors over the dashboard's default `now-7d` range:
+
+| step | bare selector | `last_over_time(...[2h])` |
+| --- | --- | --- |
+| 300s | 5 points | 51 points |
+| 600s | 5 points | 26 points |
+| 1800s | **0 points** | 9 points |
+| 3600s | **0 points** | 5 points |
+| 7200s | **0 points** | 3 points |
+
+The bare selector goes empty as soon as the step exceeds the lookback, because no
+step window `[t-5m, t]` happens to contain a sample. Grafana picks the step from
+the panel width and the range, so over `now-7d` it is comfortably over 600s and
+**both charts rendered completely empty** until this was fixed. The stat panels
+had the same defect for a different reason — an instant query with a 1 h
+`scrape_interval` finds nothing unless it runs within 5 minutes of a scrape, so
+all seven of them were blank for ~55 minutes of every hour.
+
+This was nearly missed because the first verification happened to run *seconds*
+after a scrape landed, which is the one moment a bare hourly selector does return
+data. A one-off check right after provisioning is not evidence for an hourly job.
+
+The wrappers are not all the same, deliberately:
+
+- `last_over_time(...[2h])` for the level, change, YTD, scrape duration, last
+  reading, and both charts. 2 h clears the 1 h interval plus its offset jitter.
+  On the charts this also has the side benefit of drawing the reading as a held
+  step across the gaps between hourly scrapes, which is what the value actually
+  is. Staleness still shows: the exporter drops the gauges on a failure, so the
+  line ends ~2 h after the feed stops rather than flatlining.
+- `min_over_time(snowy_tantangara_scrape_success[2h])` for *Exporter scrape OK*.
+  `min` rather than `last`, so **any** failed scrape in the window turns it red,
+  and it goes empty if the target disappears altogether — a plain
+  `last_over_time` would keep showing a stale `1` for 2 h after the exporter
+  died, which is the one case that panel exists to catch.
+- `time() - last_over_time(...[7d])` for *Reading age*, and **not** the 2 h the
+  rest use. This panel has to keep answering when the feed goes quiet. The
+  timestamp gauge is dropped on failure like the others, so a 2 h window would
+  make it go blank exactly when its answer matters; 7 d lets the age keep
+  counting up and cross the 36 h / 48 h thresholds.
+
+If you ever add a metric here, wrap it on that basis. The general rule is
+**scrape_interval > 5m needs the wrapper, scrape_interval ≤ 5m does not** — the
+`wht_tbm` job is scraped every 5m, so a sample falls inside every 5m step window
+and its bare selectors are fine at any step (verified at 300s through 3600s over
+24h). That job's dashboard is deliberately left unwrapped. If you ever drop a
+job's scrape interval below its publication frequency, this is what changes. If you want staleness
+expressed as *line geometry* rather than a number — a threshold keyed to the
+sampling frequency, so the line breaks only across genuinely long gaps — that is
+expressible in PromQL and was verified: `last_over_time(level[2h]) and (time() -
+last_over_time(ts[2h]) < 0)` returns **empty**, so `and` with a freshness
+condition does suppress the series, and a recording rule would turn that into
+real gaps in the TSDB. It is not used, because it needs recording rules (this
+stack has none, section 5) and a blank line cannot distinguish "feed late" from
+"exporter dead" from "no data yet", whereas the *Reading age* number is
+unambiguous. Grafana has no distance-aware null handling of its own: `spanNulls`
+is a boolean, Off or On, with no threshold to set.
+
+**Every stat panel carries an explicit `{"mode": "absolute", "steps": [...]}`
+thresholds object.** Writing `defaults["thresholds"] = steps` instead of
+`{"mode": "absolute", "steps": steps}` — a natural thing to write — is accepted
+by Grafana with **no error at all**. Tested on a throwaway instance: the save
+returns `status: success` and the list is stored back verbatim, not normalised
+into the object shape. The trap is that the stored model then *looks* correct,
+because the colours and values are all there in the diff; it is only the missing
+`{"mode", "steps"}` wrapper that gives the threshold logic nothing to read, so
+the panel quietly loses its colouring. Everywhere else thresholds appear is that
+object, including every panel of the TBM dashboard. The generator this dashboard
+was built with made exactly this mistake first.
+
+Only two panels have thresholds that mean anything:
+
+- *Exporter scrape OK* — red below 1, green at 1 and above, `colorMode: value`.
+- *Reading age* — green, orange at 36 h, red at 48 h. The feed is **daily**, so
+  this value oscillates between roughly 0.5 h and 31.5 h by design. The TBM
+  dashboard's thresholds are 1 h and 6 h and would go red every night.
+
+The rest get a single neutral step (`{"color": "text", "value": null}`) with
+`colorMode: none`, so no colour chip is drawn. This is not cosmetic: the
+materialised defaults copied from the TBM dashboard carry **0 / 3600 / 21600**
+steps, which are *seconds of report age*. Left in place they would sit on a
+percent, on a date, and on a sub-30 s duration, where they can never fire —
+harmless in the UI, and actively misleading to anyone reading the file.
+
+`"refresh": "1h"`, not the TBM dashboard's `5m`. The upstream publishes once a
+day, so a 5 m refresh only re-runs identical queries and invites the reader to
+watch a number that is not moving. The default range is `now-7d`, which is about
+seven data points on the level chart — the Prometheus history for this job only
+begins 2026-09-29 even though the upstream feed itself goes back to 1954, and
+that ceiling is stated in the chart's own description rather than left to be
+discovered.
+
+The `reservoir` template variable is
+`label_values(snowy_tantangara_level_percent, reservoir)` and **every per-reservoir
+query filters on `{reservoir="$reservoir"}`.** The exporter defaults to
+Tantangara alone but supports `--all-reservoirs`, so a variable that filtered
+nothing would silently show the first reservoir if that flag were ever set.
+
+**The `timeInterval: 5m` on the datasource does not match this job's 1 h
+`scrape_interval`,** and that is fine here: no query on this dashboard uses
+`rate()` or `irate()`, so `$__rate_interval` never appears, and a plain selector
+does not care about the step. The one place it would matter is `$__interval` on a
+range query, which would ask for 5 m resolution against 1 h data. The range
+queries therefore carry an explicit range. This is commented at the setting.
+
+**The committed JSON is the source of truth; the generator is not kept.** It was
+a throwaway script, and it only existed because Grafana materialises several
+hundred default keys per panel, which are near-impossible to hand-write
+correctly. It worked by deep-copying `fieldConfig.defaults`, `options` and the
+annotation list out of `western-harbour-tbm.json` and overriding only what
+differs, so the two dashboards stay structurally identical. Editing in the UI
+and pulling back through the round trip above is the supported path from here.
+
+**This file has since been round-tripped from the UI, so it is in the same
+materialised form as `western-harbour-tbm.json` and should stay that way.** A
+round trip on 2026-09-29 brought in Grafana's own keys: `showMiniMap` on the text
+panel, an empty `targets` on it, `allowCustomValue` and `regexApplyTo` on the
+variable, the variable's `current.selected` removed now it is resolved, empty
+`overrides` pruned, and every first threshold step rewritten `null` → `0`. None
+of that is a manual edit, and all of it is what Grafana writes on any save — so
+writing the clean generated form instead would just guarantee the next UI save
+produced a confusing diff. The `null` → `0` rewrite lands on the **first** step
+only, which is harmless: a first step's `value` is the implicit base of the scale
+and is never read, so `[{"color": "red", "value": 0}, {"color": "green",
+"value": 1}]` means the same as the `null` it replaced. No later step in this
+dashboard carries a `null`, and if one ever did, that would be the meaningful red
+"below" bound and must be left alone.
+
+The API reports `meta.provisioned: false` for **both** dashboards while
+`meta.provisionedExternalId` is set to the filename. That is a quirk of this
+Grafana version, not a sign the file was not provisioned — check
+`provisionedExternalId`, not `provisioned`. Provisioning picked the file up with
+no restart, inside the 30 s `updateIntervalSeconds` window, as intended.
+
+Verify without a browser:
+
+```bash
+curl -s -u admin:admin localhost:3000/api/dashboards/uid/snowy-tantangara \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["meta"]["provisionedExternalId"], len(d["dashboard"]["panels"]))'
+# Every expr in the file, run the way the panel runs it: stats as instant
+# queries, charts as range queries over now-7d, and with $reservoir substituted.
+# This prints OK/EMPTY, which is the check that would have caught the lookback
+# bug -- a bare `status: success` proves nothing, since an empty result is also
+# success.
+python3 - <<'PY'
+import json, pathlib, time, urllib.parse, urllib.request
+
+d = json.loads(pathlib.Path("grafana/provisioning/dashboards/snowy-tantangara.json").read_text())
+now = time.time()
+bad = 0
+for p in d["panels"]:
+    for t in p.get("targets", []):
+        q = t["expr"].replace("$reservoir", "Tantangara Reservoir")
+        if p["type"] == "stat":
+            url = "http://localhost:9090/api/v1/query?" + urllib.parse.urlencode({"query": q})
+        else:
+            url = "http://localhost:9090/api/v1/query_range?" + urllib.parse.urlencode(
+                {"query": q, "start": now - 7*86400, "end": now, "step": 1800})
+        res = json.load(urllib.request.urlopen(url))
+        r = res["data"]["result"]
+        # An instant query returns "value" (singular); a range query "values".
+        n = (1 if r and "value" in r[0] else len(r[0].get("values", []))) if r else 0
+        bad += not n
+        print("%-6s %-5s %s" % ("OK" if n else "EMPTY", p["type"][:5], t["expr"]))
+print("empty:", bad)
+PY
 ```

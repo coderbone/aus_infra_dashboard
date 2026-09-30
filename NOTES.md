@@ -8,6 +8,8 @@ Working notes for whoever picks this up next (including future me).
 ~/src/monitoring/                                    # this project
 ~/src/monitoring/docker-compose.yml                  # 4 services, project name "aus_infra_dashboard"
 ~/src/monitoring/prometheus.yml                      # scrape configs: tbm-exporter:9109, reservoir-exporter:9110
+~/src/monitoring/.env.example                        # tracked template for the secrets below
+~/src/monitoring/.env                                # UNTRACKED, mode 600, holds GRAFANA_ADMIN_PASSWORD + OPENEA_API_KEY
 ~/src/monitoring/grafana/provisioning/datasources/prometheus.yml
 ~/src/monitoring/scrapers/wht_tbm_exporter.py        # the WHT scraper (stdlib only, no image build)
 ~/src/monitoring/scrapers/snowy_tantangara_exporter.py  # the Snowy Hydro reservoir scraper
@@ -180,6 +182,53 @@ Each of these cost time; check they haven't regressed.
 - **Grafana default password.** `GF_SECURITY_ADMIN_PASSWORD` is wired to
   `${GRAFANA_ADMIN_PASSWORD:-admin}` and **still defaults to `admin`** on a
   port published to the LAN. Set it in a `.env` next to the compose file.
+- **An API key was parked in a loose `keys.txt` in the repo root.** On
+  2026-09-30, having signed up for the free OpenElectricity Community plan, the
+  `oe_…` key was dropped into `keys.txt` — untracked, but unignored, so one
+  `git add .` away from being published. Fixed properly rather than by adding
+  one ignore line:
+
+  - moved the value into `.env` (gitignored, created with `O_CREAT` at mode
+    `0600` rather than `chmod`ed afterwards, so there is no window in which the
+    file is world-readable) and deleted `keys.txt`;
+  - added `.env`, `.env.*` and a **negated** `!.env.example` to `.gitignore`.
+    Order matters — `.env.*` matches `.env.example`, so the negation has to come
+    after it or the template is ignored too and a cloner gets nothing;
+  - added `.env.example`, the tracked half of the pair, so a cloner is told
+    which variables to set without anyone shipping a real value;
+  - **no rotation was needed.** `git log --all -- keys.txt` was empty and
+    `git ls-files keys.txt` errored, so the key was never in an object. Check
+    that *before* assuming a secret is burned — rewriting history to remove a
+    key that was never committed is wasted work that loses history. Confirmed
+    afterwards by searching the key against every object on every ref (115
+    objects, 11 commits) and the 3 dangling blobs: no match.
+
+  Two things that were over-engineered and have been removed rather than left
+  to rot. An ignore rule for `keys.txt` by name: the file is gone, and
+  ignoring a name that no longer exists only invites someone to wonder where it
+  went. And a `secrets/` entry, added on the strength of a Compose `secrets:`
+  mention that turned out to be an option being considered, not one that had
+  been chosen — there is no such directory. Both were guesses dressed up as
+  precautions. If a `.env`-based mechanism ever does turn out to be the wrong
+  one, the correct time to add an ignore rule for the replacement is when the
+  replacement exists, not in anticipation of it.
+
+  The trap to remember: **`docker compose config` prints secrets in the clear.**
+  Compose interpolates `.env` into the rendered model, so with
+  `GRAFANA_ADMIN_PASSWORD` set that command emits
+  `GF_SECURITY_ADMIN_PASSWORD: <value>` (verified on this host). Anything a
+  service consumes through `environment:` is exposed by it. `OPENEA_API_KEY` is
+  currently *not*, and the reason is not safety — it is simply that no service
+  references it yet. The day one does, that exemption is gone. Same for anything
+  that logs the rendered config; do not paste it into an issue.
+
+  Not fixed, and the reason it is worth writing down: the key is a *personal*
+  credential on a *shared-quota* free plan. Anyone who clones this repo has to
+  bring their own, which is what `.env.example` is for, but nothing stops a
+  future change from hardcoding a key in `docker-compose.yml` where it would be
+  committed for real. If the NEM exporter is ever wired up, pass it through
+  `environment:` from `.env`, or use a Compose `secrets:` entry read from a
+  gitignored file — a bind-mounted secret never appears in `docker inspect`.
 
 ## 4. Verify the stack
 
@@ -285,7 +334,19 @@ discovery step, so its cold start is a single ~190 KB fetch and lands around
   real holes, which breaks any PromQL that needs "the previous sample".
   **Fixed** — see the exporter section below for what shipped and what the
   measurements ruled out.
-- `GRAFANA_ADMIN_PASSWORD` still unset.
+- `GRAFANA_ADMIN_PASSWORD` still unset. `.env` now exists to hold it (see
+  section 3) but the variable is still blank in it, so Grafana is **still on the
+  `admin`/`admin` default** on a LAN-published port. The one-line fix, and the
+  reason it has stayed open for days is that it was never written down as a
+  task.
+- **No NEM exporter.** The stack's two exporters both scrape unauthenticated
+  public feeds. An OpenElectricity exporter — the obvious third, for NEM
+  generation, price or emissions — needs a bearer token and so needs the
+  `OPENEA_API_KEY` plumbing in section 3. Nothing reads that variable yet. Two
+  things to settle when it is written: the **Community plan is non-commercial**
+  and caps at 500 requests/day, so the scrape interval has to be minutes-or-
+  worse, not the 5m this stack uses elsewhere; and the host is
+  `api.openelectricity.org.au`, not the dead `opennem.com.au`.
 - No recording or alerting rules; `prometheus.yml` has scrape configs only.
 - The dashboards are provisioned from `grafana/provisioning/dashboards/` (see
   section 7), but there is no provisioning of Grafana *users* or folders.

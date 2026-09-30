@@ -85,8 +85,50 @@ The stack is on the `aus_infra_dashboard_monitoring` bridge network:
 
 ## Configuration
 
-Set `GRAFANA_ADMIN_PASSWORD` in the environment (or a `.env` next to the compose
-file) before exposing 3000 beyond the LAN — it currently defaults to `admin`.
+Secrets live in a `.env` next to the compose file, which is gitignored.
+`.env.example` is the tracked template — it lists every variable the stack
+wants and never holds a real value. Clone and run:
+
+```bash
+cp .env.example .env && chmod 600 .env
+$EDITOR .env
+```
+
+Compose reads `.env` from the compose file's directory automatically, so no
+`--env-file` flag and no `export` is needed. The `chmod 600` is worth doing:
+the file is created by `cp` at whatever your umask allows, which on this host
+was `664` — group- and world-readable.
+
+| Variable | Used by | Notes |
+| --- | --- | --- |
+| `GRAFANA_ADMIN_PASSWORD` | `grafana` service | Defaults to `admin` if unset, and 3000 is published to the LAN. Set it. |
+| `OPENEA_API_KEY` | nothing yet | OpenElectricity bearer token. The NEM exporter that needs it has not been written — see below. |
+
+Do not commit `.env`, and do not paste its contents into an issue or a commit
+message. Note also that **`docker compose config` prints interpolated secrets
+in the clear** — verified here: with `GRAFANA_ADMIN_PASSWORD` set, that command
+emits `GF_SECURITY_ADMIN_PASSWORD: <value>` in its rendered output. Anything
+consumed by a service's `environment:` is fair game for it. `OPENEA_API_KEY` is
+safe from this *only* because no service references it yet; the day one does,
+it becomes exposed here too, along with anywhere the rendered config is logged.
+
+### The OpenElectricity key
+
+The NEM data comes from **OpenElectricity**, which was renamed from OpenNEM.
+`opennem.com.au` and `api.opennem.com.au` are dead; the API is
+`api.openelectricity.org.au`. Register at
+`platform.openelectricity.org.au`, which issues a key shaped `oe_…`.
+
+There is **no anonymous access** — `/data/network/NEM`, `/facilities` and
+`/market/*` all return 401 without a bearer token, and only `/v1/plans` and
+`/v4/social` are open. The free **Community** plan is 500 requests/day, 2/s
+burst, 2 years of history, 1 key, non-commercial use. **Academic** (full
+history, 2000/day, 5 keys) is also free but wants an accredited institution's
+email domain.
+
+Because a personal key is tied to one person's quota and account, a stack meant
+to be cloned should read its own key from the cloner. That is what
+`.env.example` is for. If you share this stack, do not ship your `.env`.
 
 ## Verify
 

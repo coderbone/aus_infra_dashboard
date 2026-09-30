@@ -25,13 +25,14 @@
 # Prometheus can reach it over the compose network - do NOT put it back on
 # 127.0.0.1, that only works while Prometheus shares the host network namespace.
 #
-# There are now two exporters on the same pattern, `tbm-exporter` (Western
-# Harbour Tunnel, 9109) and `reservoir-exporter` (Snowy Hydro reservoir levels,
-# 9110). They are separate services rather than one container running both
-# because they have nothing to share: different upstreams, different retry and
-# health semantics, and separate failure isolation. Note the naming asymmetry -
-# the service is short (`tbm-exporter`) and the container is spelled out
-# (`wht-tbm-exporter`). Both container_names are pinned outright, NOT derived
+# There are now three exporters on the same pattern, `tbm-exporter` (Western
+# Harbour Tunnel, 9109), `reservoir-exporter` (Snowy Hydro reservoir levels,
+# 9110) and `battery-exporter` (OpenElectricity NEM battery state of charge,
+# 9111). They are separate services rather than one container running all of
+# them because they have nothing to share: different upstreams, different retry
+# and health semantics, and separate failure isolation. Note the naming
+# asymmetry - the service is short (`tbm-exporter`) and the container is spelled
+# out (`wht-tbm-exporter`). All container_names are pinned outright, NOT derived
 # from the project name, which is why renaming the project leaves them alone and
 # why a second stack cannot run alongside this one under any name.
 
@@ -119,6 +120,66 @@ services:
       retries: 3
       start_period: 15s
 
+  battery-exporter:
+    image: python:3.12-alpine
+    container_name: openelectricity-battery-exporter
+    command:
+      - python
+      - /app/oe_battery_exporter.py
+      - --listen-address=0.0.0.0
+      - --port=9111
+      # Hourly. 10 batteries = 10 data + 1 credit check = 11 requests/cycle
+      # (12 on the once-daily cycle that also refreshes the fleet metadata), so
+      # 265/day, inside the API's
+      # 366 requests/day bucket. Do NOT shorten this to match the Prometheus
+      # scrape interval: the exporter answers every scrape from its last
+      # completed cycle, so a 5m scrape of an hourly poll costs the upstream
+      # nothing and buys no new data. See scrapers/oe_battery_exporter.py for
+      # the budget arithmetic and NOTES.md section 9.
+      - --poll-interval=3600
+      # 12 in scope + 1 /me per hourly cycle, +1 for the daily fleet refresh
+      # = 313 requests/day against the plan's 366/day bucket. 2/s burst is held
+      # by --request-interval. Being checked against the real dashboard.
+      - --top=12
+      - --fleet-cache-file=/cache/fleet.json
+      # Persisted so a restart does not reset the 36h idle clock. Without it,
+      # every unreadable battery gets a fresh reprieve on each deploy and the
+      # rotation never converges. Liveness only - readings are never cached.
+      - --liveness-file=/cache/liveness.json
+    environment:
+      # Read from the environment by the exporter, never from argv, so the key
+      # cannot show up in the process table or in a `docker inspect` command
+      # line. It does land in the container's environment, which is why .env is
+      # gitignored and .env.example is the tracked template.
+      OPENEA_API_KEY: "${OPENEA_API_KEY:?set OPENEA_API_KEY in .env - see .env.example}"
+    dns:
+      - 1.1.1.1
+      - 9.9.9.9
+    volumes:
+      - ./scrapers/oe_battery_exporter.py:/app/oe_battery_exporter.py:ro
+      # A fleet-metadata cache and nothing else. Deliberately NOT the same
+      # volume as tbm-exporter's: that one holds discovered ArcGIS layer
+      # configuration, and two exporters sharing a volume means one of them
+      # clobbering the other's file.
+      - battery-fleet-cache:/cache
+    networks: [monitoring]
+    restart: unless-stopped
+    # TCP probe, like the other two. /healthz on this exporter answers from the
+    # last completed cycle and does not touch the API, but the health signal
+    # here is deliberately about the process, not the upstream: this exporter
+    # is *meant* to keep serving its last good reading through a transient API
+    # failure, and a probe that went red on the upstream would fight that.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import socket; socket.create_connection(('127.0.0.1', 9111), 3).close()"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
   prometheus:
     image: prom/prometheus
     container_name: prometheus
@@ -138,6 +199,8 @@ services:
       tbm-exporter:
         condition: service_healthy
       reservoir-exporter:
+        condition: service_healthy
+      battery-exporter:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:9090/-/healthy"]
@@ -184,3 +247,7 @@ volumes:
     name: grafana-storage
     external: true
   exporter-cache:
+  # Created by compose rather than by hand, unlike the two external ones above:
+  # this holds a cache that is rebuilt from the API on the first poll anyway, so
+  # there is nothing in it worth preserving by hand.
+  battery-fleet-cache:

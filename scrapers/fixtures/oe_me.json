@@ -1,0 +1,17 @@
+{
+ "created_at": "2026-09-30T14:28:22+10:00",
+ "data": {
+  "credits": {
+   "remaining": 498
+  },
+  "email": "redacted@example.invalid",
+  "full_name": "REDACTED",
+  "id": "key_REDACTED",
+  "plan": "COMMUNITY",
+  "roles": [
+   "anonymous"
+  ]
+ },
+ "success": true,
+ "version": "4.5.15"
+}

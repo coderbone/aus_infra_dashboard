@@ -297,3 +297,187 @@ times a year. That is a note in a notebook, not an exporter.
   Do not add one to "match" the WHT exporter, and do not add a persistent cache
   of past readings: a cached level served as a current one is exactly the
   dishonest failure mode the WHT exporter also refuses.
+
+## OpenElectricity NEM batteries — audited 2026-09-30
+
+Source: <https://api.openelectricity.org.au> (the successor to OpenNEM;
+`opennem.com.au` and `api.opennem.com.au` are dead). Platform at
+<https://platform.openelectricity.org.au>, keys shaped `oe_…`. There is **no
+anonymous access**: `/data/*`, `/facilities/`, `/market/*` and `/me` all need a
+bearer token; only `/v1/plans` and `/v4/social` are open.
+
+`oe_battery_exporter.py` is built on this. Metrics and options are in
+`README.md` in this directory; the things below are the upstream facts that
+forced the design, and the traps that are still live.
+
+### There is no state of charge. Anywhere.
+
+The single most important fact, because everything else follows from it. The
+data model publishes:
+
+- `storage_battery` — stored energy in MWh, the actual measurement
+- `capacity_storage` — registered capacity in MWh, on the **unit** in
+  `/facilities/`
+- `capacity_registered` — registered *power* in MW. Not energy. Using it as a SOC
+  denominator silently produces a dimensionally wrong number that still looks
+  plausible, because both are "capacity" and both are numbers near 1000.
+
+There is no percentage, no full-charge flag, no `soc` field, no
+`energy_full`/`energy_discharged` pair. So `oe_battery_soc_ratio` is
+`energy / capacity` computed in the exporter, and any statement of the form
+"OpenElectricity reports X% state of charge" is false. The derivation inherits
+both series' error: if the metadata capacity is corrected, every historical SOC
+reading the dashboard has already stored shifts with it.
+
+### Traps
+
+- **A facility returns three series and only one has capacity.** Eraring returns
+  `storage_battery_ERB01`, `_ERBG1` and `_ERBL1`. Only `ERB01` appears in the
+  metadata with a `capacity_storage`, because G1 and L1 are the metering points
+  and the battery itself is `1`. Summing the three reports Eraring as holding
+  1,686 MWh instead of 334 and inflates the monitored fleet by roughly 3x. The
+  other two are counted in `oe_battery_series_without_capacity` (9 for the
+  default top 10, not 0) and dropped.
+- **`capacity_storage` is on the *unit*, not the facility.** It lives at
+  `data[i].units[j].capacity_storage`, so the denominator has to be looked up per
+  unit code. Read off the facility it is simply absent, and every SOC vanishes
+  with no error anywhere.
+- **The largest batteries in the country have never dispatched.** Ranking the
+  top 10 by capacity over all 119 capacity-bearing units gives: Richmond Valley
+  2200 (the largest in Australia), Tomago 2000, Baranduda 1886, Wooreen 1400,
+  Elaine 1244, Western Downs 3 1220, Supernode 3 1217 — seven `committed`
+  projects that 404 or return empty series, and not one of Eraring (1997),
+  Waratah (1680), Orana (1660) or Collie 2 (1363), which are the batteries that
+  actually have curves. The top-N is taken over units with a `data_last_seen`,
+  which is 74 of 119. Note that `commissioning` is **kept** — Eraring 2 and
+  Collie 2 are commissioning and both publish real data — so this is a data
+  filter, not a `status_id` filter, and it will need revisiting if unbuilt
+  batteries start publishing metadata before they dispatch.
+- **WEM facilities 404 under NEM.** Ten of the battery facilities are `WEM`
+  (Collie, Kwinana, Synergy). `GET /data/facilities/NEM?facility_code=COLLIE_BESS2`
+  returns `404 No data available`, which is byte-identical to what a genuinely
+  empty battery returns. That 404 was masking a routing bug during development
+  and looked like a data problem for a while; the network is now carried per row
+  from `network_id` and 404 is not retried.
+- **The aggregate form is useless.** `GET /data/facilities/NEM?metrics=storage_battery`
+  with no `facility_code` returns one flat array of timestamps with no series
+  names — repeated timestamps, no attribution, nothing to join on. One request
+  per facility is the only correct form, which is also what makes the request
+  budget the interesting problem.
+- **The feed is sparse, and that is not a fault.** As of 2026-09-30 values exist
+  only for roughly 18:00–04:00 Sydney time and are null for the rest of the day.
+  A 14:00 scrape correctly finds nothing new. Hence: newest non-null sample in
+  the window, exported with its real timestamp and age, dropped only past 36h.
+  A daytime reading being 10h old is the expected state, not staleness.
+- **A null newest sample is not a zero.** If the last value in a series is null,
+  that is no reading. The exporter omits the SOC series entirely rather than
+  exporting 0, because on a battery a zero reads as "flat and empty".
+- **The API 403s the default User-Agent.** `Python-urllib/3.12` → `403 Forbidden`
+  with no body; `curl/8.5.0` → 200; `python-requests/2.31` → 200; any custom UA →
+  200. It is a bot rule keyed on that exact string. `USER_AGENT` in the exporter
+  is explicit for this reason and must not be "tidied" back to the default.
+
+### The budget, and why the poll loop is not the scrape handler
+
+`GET /v1/plans` (open) for the free Community plan: 500 credits/day, 2 req/s
+burst, 2 years of history, 1 key, non-commercial. Academic is also free (2000/day,
+5 keys) but needs an accredited institution's domain. The part that is easy to
+miss is that the plan also carries **rate buckets: 8 requests / 5 min, 32 / 1 h,
+366 / 1 day** — and 366/day is the binding constraint, not the 500 credits.
+
+| Poll pattern | Requests/day | Verdict |
+| --- | --- | --- |
+| Scrape-driven, 5m, top 5 | 2880 | 8x over the daily bucket |
+| Scrape-driven, 1h, top 10 | 240 | works, but ties the upstream to the scrape |
+| Own loop, 1h, top 10 | 240 | works, and the scrape interval becomes free |
+| Own loop, 1h, top 20 | 504 | over the daily bucket |
+| Own loop, 2h, top 10 | 132 | works, at 12h of feed latency at worst |
+
+So the exporter polls on its own schedule and serves the last completed cycle to
+Prometheus. Scraping it every 5 minutes costs the API nothing; that is the whole
+trick, and it is why `scrape_interval: 5m` in `../prometheus.yml` and
+`--poll-interval=3600` in `../docker-compose.yml` are not a contradiction. The
+cost of that design is that a stopped poll loop is invisible in the SOC panels,
+which show the last reading forever — hence `oe_last_poll_timestamp_seconds` and
+the `Since last poll` panel on the dashboard.
+
+Credits themselves measured anywhere from 0 to 1 per narrow call, with a
+five-request cycle moving the balance 494 → 491 and a twelve-request cycle
+494 → 494 in an earlier run. Treat the credit gauge as a smoke alarm rather than
+as a precise meter, and use `oe_api_requests_total` to reason about the rate
+buckets. `/me` on its own is free, which is what makes the gauge affordable.
+
+### The fleet as of 2026-09-30
+
+119 capacity-bearing battery units, 74 of them with any upstream observation,
+32,085.47 MWh total. 109 units NEM, 10 WEM. By status across all 119:
+47 `committed`, 64 `operating`, 8 `commissioning`. The top of the observed list:
+
+| Facility | Unit | MWh | Network | Status |
+| --- | --- | --- | --- | --- |
+| ERB | ERB01 | 1997 | NEM | operating |
+| WTAHB | WTAHB1 | 1680 | NEM | operating |
+| ORABESS | ORABESS1 | 1660 | NEM | operating |
+| ERB2 | ERB02 | 1390 | NEM | commissioning |
+| COLLIE_BESS2 | COLLIE_BESS2 | 1363 | WEM | commissioning |
+| COLLIE_ESR4 | COLLIE_ESR4 | 1200 | WEM | operating |
+| COLLIE_ESR5 | COLLIE_ESR5 | 1200 | WEM | operating |
+| STABESS | STABESS1 | 1200 | NEM | commissioning |
+| SNB02 | SNB02 | 1090 | NEM | operating |
+| LDBESS | LDBESS1 | 1086.2 | NEM | operating |
+
+The three Collie units are in scope at the default `--top 10` and publish
+**nothing** — no non-null value in a 30-day window. So a strict top-10 yields only
+7 monitored batteries, and `oe_batteries_monitored` sitting below
+`oe_batteries_in_scope` is not a fault. The idle rotation is the fix rather than
+raising `--top`: after 36h each Collie slot goes to the next-largest candidate,
+costs no extra request, and the scope stays full. Checked WEM candidates
+(`KWINANA_ESR2`, `COLLIE_ESR1`) are *also* all-null, while the NEM candidates
+(`MREHA3`, `MLB01`, `TARBESS1`, `WOOLES1`, `SNB01`) all publish — so the rotation
+walks past the WEM units rather than into them.
+
+Note that `data_last_seen` does not distinguish these: all three Collie units
+report a current `data_last_seen` and still return 1151 null points. Liveness has
+to be learned by polling — and once learned it has to be *persisted*, or the
+first sight of an unreadable unit stamps it as fresh on every start and a
+container that restarts more often than the 36h window never demotes anything.
+`liveness.json` in the cache volume is the fix, and it is liveness only: no
+reading or SOC value is ever written to it, so a restart still cannot serve a
+stale SOC as current.
+
+Verified across a real `docker compose up --force-recreate`: the three Collie
+units' `oe_battery_idle_seconds` continued from 36.8s to 78.3s instead of
+returning to ~0.
+
+### `oe_battery_exporter.py`
+
+- **Do not hold the scraper lock across the network work.** `/metrics` has to
+  stay answerable while a cycle of N requests is in flight, and `load_fleet()`
+  takes the same lock — so a plain `threading.Lock` held across the poll
+  deadlocks on the second cycle. The lock is only for publishing state. This was
+  a real bug, caught by hand before the tests existed; `threading.Lock` is not
+  reentrant and `RLock` would paper over it rather than fix the intent.
+- **The disk fleet cache is a fallback, not a source of truth.** It is only read
+  when the API cannot be reached, and its `cached_at` is carried over as the
+  refresh time. Reading the cache *before* trying the API — which is the obvious
+  way to write it — means that once a cache file exists the daily metadata
+  refresh never happens again, and a capacity change upstream is never picked up.
+  Locked down by `test_stale_cache_does_not_pin_the_fleet`.
+- **Count requests when they are issued, not when they answer.** The budget is
+  spent by the request; a counter incremented only on success under-reports
+  exactly the 404s and 5xx that a retry budget is there to absorb.
+- **Never add an `--api-key` argv flag.** The key is read from
+  `--api-key-env`/`--api-key-file` so it cannot reach the process table, shell
+  history, or a `docker inspect` command line. Compose passes it as an
+  environment variable, which is also why `docker compose config` now renders it
+  in the clear — treat that command's output as secret.
+- **`oe_battery_scrape_success` carries the same five labels as the reading
+  metrics, not a reduced `{facility,unit}` set.** This is for the dashboard: one
+  Grafana variable has to select the same batteries in every panel, and the table
+  joins on `unit`. A reduced set matches `{name=~"$battery"}` in nothing and
+  leaves the join key absent. Locked down by
+  `test_every_per_battery_metric_shares_one_label_set`.
+- **Prometheus may be scraping before the first poll has finished.** `/metrics`
+  answers 200 with every value `NaN` and `/healthz` says healthy, so a container
+  mid-first-poll is not reported as down and a `depends_on: service_healthy`
+  gate does not deadlock. `NaN`, not 0: a fleet count of 0 claims an empty fleet.

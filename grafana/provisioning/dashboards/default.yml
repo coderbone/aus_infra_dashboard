@@ -15,11 +15,14 @@
 # matches a file to an existing dashboard, so a changed uid creates a duplicate
 # rather than updating in place:
 #
-#   western-harbour-tbm.json  adr468z          WHT TBM progress
-#   snowy-tantangara.json     snowy-tantangara Snowy reservoir levels
+#   western-harbour-tbm.json  adr468z            WHT TBM progress
+#   snowy-tantangara.json     snowy-tantangara   Snowy reservoir levels
+#   battery-state-of-charge.json nembattery-soc  NEM battery state of charge
 #
-# Both are generated/edited with indent=2, sort_keys=True to match the committed
-# files; see NOTES.md section 7.
+# All three are generated/edited with indent=2, sort_keys=True to match the
+# committed files; see NOTES.md section 7. battery-state-of-charge.json is not
+# hand-edited: it is written by tools/build_battery_dashboard.py, so a change
+# belongs there and a re-run keeps the rest of the file byte-identical.
 apiVersion: 1
 
 providers:

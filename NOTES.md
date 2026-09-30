@@ -2,17 +2,20 @@
 
 Working notes for whoever picks this up next (including future me).
 
-## 1. Layout as of 2026-09-29
+## 1. Layout as of 2026-09-30
 
 ```
 ~/src/monitoring/                                    # this project
-~/src/monitoring/docker-compose.yml                  # 4 services, project name "aus_infra_dashboard"
-~/src/monitoring/prometheus.yml                      # scrape configs: tbm-exporter:9109, reservoir-exporter:9110
+~/src/monitoring/docker-compose.yml                  # 5 services, project name "aus_infra_dashboard"
+~/src/monitoring/prometheus.yml                      # scrape configs: tbm-exporter:9109, reservoir-exporter:9110, battery-exporter:9111
 ~/src/monitoring/.env.example                        # tracked template for the secrets below
 ~/src/monitoring/.env                                # UNTRACKED, mode 600, holds GRAFANA_ADMIN_PASSWORD + OPENEA_API_KEY
 ~/src/monitoring/grafana/provisioning/datasources/prometheus.yml
+~/src/monitoring/grafana/provisioning/dashboards/battery-state-of-charge.json  # GENERATED, see tools/
+~/src/monitoring/tools/build_battery_dashboard.py   # writes the file above
 ~/src/monitoring/scrapers/wht_tbm_exporter.py        # the WHT scraper (stdlib only, no image build)
 ~/src/monitoring/scrapers/snowy_tantangara_exporter.py  # the Snowy Hydro reservoir scraper
+~/src/monitoring/scrapers/oe_battery_exporter.py     # the NEM battery scraper (OpenElectricity, bearer token)
 ~/src/monitoring/scrapers/README.md                  # metrics + run instructions
 ~/src/monitoring/scrapers/NOTES.md                   # upstream endpoints
 ~/src/monitoring/scrapers/TASKS.md                   # original task list
@@ -28,15 +31,26 @@ Docker objects (not files, survive any file move):
 
 | Thing | Name |
 | --- | --- |
-| containers | `wht-tbm-exporter`, `snowy-tantangara-exporter`, `prometheus`, `grafana` |
+| containers | `wht-tbm-exporter`, `snowy-tantangara-exporter`, `openelectricity-battery-exporter`, `prometheus`, `grafana` |
 | compose project | `aus_infra_dashboard` (pinned via `name:` in the compose file) |
 | network | `aus_infra_dashboard_monitoring` (bridge) |
-| volumes | `prometheus-data`, `grafana-storage` (external, pre-existing), `exporter-cache` |
+| volumes | `prometheus-data`, `grafana-storage` (external, pre-existing), `exporter-cache`, `battery-fleet-cache` (compose-created) |
 
 `exporter-cache` belongs to `tbm-exporter` alone — it holds that exporter's
-discovered ArcGIS layer config. `snowy-tantangara-exporter` deliberately mounts
-**no** volume: it has no discovery step, and a persistent cache of reservoir
-levels would be a way to serve a stale reading as a current one.
+discovered ArcGIS layer config. `battery-fleet-cache` holds only the battery
+exporter's fleet metadata, and is a *separate* volume rather than a second file
+in `exporter-cache`: two exporters sharing a volume means one of them
+clobbering the other's file, and there is nothing to gain from the coupling.
+`snowy-tantangara-exporter` deliberately mounts **no** volume: it has no
+discovery step, and a persistent cache of reservoir levels would be a way to
+serve a stale reading as a current one.
+
+Note the container/service naming asymmetry, now three deep: the service is
+short (`battery-exporter`) and the container is spelled out
+(`openelectricity-battery-exporter`). All `container_name`s are pinned outright
+rather than derived from the project name, which is why renaming the project
+leaves them alone — and why a second stack cannot run alongside this one under
+any name.
 
 ## 2. If files have moved
 
@@ -339,14 +353,20 @@ discovery step, so its cold start is a single ~190 KB fetch and lands around
   `admin`/`admin` default** on a LAN-published port. The one-line fix, and the
   reason it has stayed open for days is that it was never written down as a
   task.
-- **No NEM exporter.** The stack's two exporters both scrape unauthenticated
-  public feeds. An OpenElectricity exporter — the obvious third, for NEM
-  generation, price or emissions — needs a bearer token and so needs the
-  `OPENEA_API_KEY` plumbing in section 3. Nothing reads that variable yet. Two
-  things to settle when it is written: the **Community plan is non-commercial**
-  and caps at 500 requests/day, so the scrape interval has to be minutes-or-
-  worse, not the 5m this stack uses elsewhere; and the host is
-  `api.openelectricity.org.au`, not the dead `opennem.com.au`.
+- ~~**No NEM exporter.**~~ **Done 2026-09-30** — `battery-exporter`, serving
+  state of charge for the largest 10 NEM batteries that publish data, with the
+  `OPENEA_API_KEY` plumbing and a dashboard. Both of the concerns that item
+  raised were the wrong shape and are worth recording as such: the limit that
+  actually binds is not the 500 credits/day but the plan's **rate buckets**
+  (8/5min, 32/hour, 366/day), and the answer is not "scrape less often" but
+  "stop tying the poll to the scrape at all". See section 8. Generation, price
+  and emissions are still not exported — only battery storage.
+- **The battery dashboard is generated, so a UI edit to it will be lost.**
+  `grafana/provisioning/dashboards/battery-state-of-charge.json` is written by
+  `tools/build_battery_dashboard.py`; the provider has `allowUiUpdates: true`,
+  so a save in the Grafana UI appears to work and is then overwritten the next
+  time the file changes on disk. Edit the script and re-run it, exactly as
+  section 7 describes for the other two.
 - No recording or alerting rules; `prometheus.yml` has scrape configs only.
 - The dashboards are provisioned from `grafana/provisioning/dashboards/` (see
   section 7), but there is no provisioning of Grafana *users* or folders.
@@ -1125,3 +1145,176 @@ Two things that looked like faults and were not:
 
 The old network was removed by `down` itself and the old volume by an explicit
 `docker volume rm`, which is the only cleanup step in the section 2 procedure.
+
+## 9. NEM battery exporter added (2026-09-30)
+
+`battery-exporter` on 9111, scraped as job `openelectricity_battery`, dashboard
+`nembattery-soc` ("NEM battery state of charge"). Added as a third service rather
+than a fourth exporter inside an existing one for the same reason the first two
+are separate: different upstream, different failure semantics, separate blast
+radius. It is also the first exporter here that needs a credential, and the
+first that cannot afford to be scraped on the stack's normal cadence.
+
+### The budget is a rate limit, not a credit limit
+
+The assumption going in was "the Community plan gives 500 requests/day, so poll
+hourly". It is 500 *credits*, not requests. `GET /v1/plans` is the authoritative
+source and was read directly on 2026-09-30 (it rejects a default `urllib`
+User-Agent with a 403, the same rejection quirk as the rest of the API — send
+`USER_AGENT`). Plan `COMMUNITY` in full:
+
+| field | value |
+| --- | --- |
+| `daily_credits` | 500 |
+| `burst_rate_limit` | **2/s** |
+| `bucket_limits` | 5m: 8, 1h: 32, 1d: 366, 7d: 366, 1M: 732, 3M: 1830, season: 1830, 1y: 3700 |
+
+At one request per battery per cycle, scraping the exporter every 5 minutes — this
+stack's normal interval — is 288 scrapes/day, and the *obvious* mistake is to let
+each scrape be a poll: that is 2880 requests/day at `--top 5`, 8x over the bucket.
+
+So the poll loop is not the scrape handler. The exporter polls on its own
+`--poll-interval` (hourly) and serves the last completed cycle to Prometheus,
+which means the 5m scrape costs the API nothing:
+
+| | requests/day | vs 366/day |
+| --- | --- | --- |
+| scrape-driven, 5m, top 5 | 2880 | 8x over |
+| own loop, 1h, top 10 | 265 | 101 spare |
+| own loop, 1h, **top 12 (shipped)** | **313** | **53 spare** |
+| own loop, 1h, top 20 | 504 | over |
+
+The top-12 figure is 12 storage + 1 `/me` per hourly cycle, 24 cycles, plus one
+`/facilities/` refresh a day: `13 x 24 + 1 = 313`. The idle rotation does not
+change it — demotion keeps the scope full, it just changes which batteries are in
+it. The credit balance is not the constraint and was never close: ~478 of 500
+remaining at 16:00 local, having spent ~20.
+
+**Two buckets are not satisfied, deliberately:**
+
+- **`2/s` burst.** 13 sequential requests went out in 1.4–4.3 s, about 5 req/s.
+  `--request-interval` (default 0.6 s) now paces them to ~1.7 req/s; the measured
+  cycle duration went from ~2 s to 7.6 s. This one mattered: a 429 is **not
+  retried** — it is raised as a `ScrapeError` on the first attempt, because a
+  rate-limited request is treated as a hard answer — so overrunning the burst
+  limit costs the entire cycle and blanks the dashboard, rather than costing a
+  retry.
+- **`8 / 5 min`.** 13 requests in one cycle exceeds it no matter the spacing;
+  keeping inside it needs 37.5 s between requests, i.e. 8 minutes of a 60-minute
+  cycle. This has been exceeded since the exporter shipped with no 429 in 18h of
+  running, so the bucket is evidently enforced leniently or not at all. If the
+  dashboard ever shows throttling, `--request-interval 38` fixes it with no other
+  change.
+
+**`7d: 366` is the one to watch.** If that is a literal sliding window — 366
+requests per *seven days* — then 313/day exhausts it in a bit over a day and
+throttles hard, and this whole table is optimistic. The 1M/3M/1y figures do not
+scale as clean multiples of a daily rate either (732/1830/3700 against 30/90/365
+days), which is why the semantics are not obvious from the response alone. This
+is exactly what the multi-day dashboard check is for, and it is the single most
+likely way the accounting above turns out to be wrong.
+
+`scrape_interval: 5m` in `prometheus.yml` next to `--poll-interval=3600` in
+`docker-compose.yml` looks like a contradiction and is not; the comment in both
+files says so. The cost of the design is that **a stopped poll loop is
+invisible in the SOC panels**, which go on showing the last reading indefinitely.
+That is why `oe_last_poll_timestamp_seconds` and the `Since last poll` stat exist
+— it goes orange at 90 min and red at 3 h, and it is the panel to check first
+when the SOC looks plausible but stale.
+
+Credits measured anywhere from 0 to 1 per narrow call and are not the constraint;
+`oe_api_requests_total` is the number that predicts the bucket, and the
+dashboard plots it against a `clamp_max(…, 366)` ceiling line.
+
+### The dashboard is generated, not hand-written
+
+`grafana/provisioning/dashboards/battery-state-of-charge.json` comes from
+`tools/build_battery_dashboard.py`, so the sixteen panels' repeated boilerplate
+stays consistent and a re-run leaves the rest of the file byte-identical. Re-run
+it after any change:
+
+```bash
+python3 tools/build_battery_dashboard.py
+```
+
+This is a third pattern alongside the two in section 7, and it is worth knowing
+which is which: the TBM and Snowy dashboards are hand-edited JSON (either place
+is fine, git is the truth), this one is **only** editable through the script.
+`allowUiUpdates: true` means a Grafana UI save will look like it worked and then
+be overwritten. The generator asserts panel ids are unique, that no two panels
+overlap, and that nothing runs off the 24-column grid, because those are the
+mistakes worth making impossible in a generated file.
+
+Every PromQL expression in it was validated against the running Prometheus, as
+instant queries for the stat and table panels and as range queries over 7d for
+the charts, with `$battery` substituted for `.*` — the same check section 7
+describes, and for the same reason: `status: success` on an empty result proves
+nothing, and the lookback bug in section 7 was exactly that.
+
+Two design decisions in it worth keeping:
+
+- **The battery variable is `label_values(oe_battery_capacity_storage_mwh, name)`,
+  not the SOC metric.** The SOC series is *absent* for a battery that could not
+  be read, so a variable built from it would make unread batteries unselectable
+  — including the three Collie units that are the ones you would most want to
+  look at. Capacity is exported for every in-scope unit regardless.
+- **All seven per-battery metrics share one label set**
+  `{facility,unit,name,region,status}`. `oe_battery_scrape_success` originally
+  carried a reduced `{facility,unit}`, which meant a `{name=~"$battery"}`
+  selector matched nothing on that frame and the table had no `unit` field to
+  join on. Changing the exporter was the right fix rather than working around
+  it in the dashboard, and `test_every_per_battery_metric_shares_one_label_set`
+  now holds it there.
+
+### Verification actually performed
+
+- `python3 -m unittest discover -s scrapers -t scrapers` — 345 tests, all pass,
+  no network (88 of them for the new exporter).
+- `docker compose up -d battery-exporter` from a clean service, then
+  `curl -XPOST localhost:9090/-/reload`: the new target shows `health: unknown`
+  with a zero `lastScrape` for ~4m30s before its first scrape lands. That is the
+  first-scrape jitter already described in section 6 — the 5m job offset — not a
+  networking fault. Do not go looking for one.
+- All 26 dashboard queries return data, except the two `rate()`/`increase()`
+  expressions, which need two scrapes to have anything to work with.
+- Live one-shot: 74 enumerated, 10 in scope, 7 monitored, 9 series without
+  capacity, 12 requests, ~1.4–4.3 s per cycle.
+
+### Still open
+
+- The three Collie WEM units are in the default top 10 and have published
+  **nothing** in a 30-day window, so the default scope used to show 7 batteries,
+  not 10. That is upstream. The idle rotation now handles it: each Collie slot
+  refills from the next-largest candidate after 36h, at no extra request, so the
+  scope is full and `oe_batteries_demoted` is 3 in the steady state.
+- Recovery of a demoted unit is not automatic — it needs
+  `--watchlist-per-cycle`, a restart, or a higher-ranked failure. Off by default
+  because it is the only part of the rotation that costs a request.
+- Liveness is now persisted to `liveness.json` in the cache volume, so restarts
+  no longer reset the idle clock. Liveness only; readings are still never cached.
+
+### Measured 2026-09-30: conditional requests exist, and do not help
+
+Probed the live API for cache validators. `/data/facilities/{network}` (the hot
+endpoint, 240 of the 265 requests/day) sends a **weak ETag** and
+`cache-control: max-age=300`, and `If-None-Match` does return a real `304` with
+an empty body. `/facilities/` sends an ETag and `max-age=900`; `/me` sends
+neither.
+
+It is still not worth using, and the reason is the budget's shape: a 304 saves
+**bytes, not requests**. The binding limit is 366 requests/day, and a
+revalidation is still a request against that bucket. So the validator cannot buy
+frequency, and the only way to cut request *count* is to ask about fewer
+batteries — which is a coverage decision, not an optimisation.
+
+A second reason to leave it alone: the feed only carries values ~18:00–04:00, so a
+poll at 16:00 gets a 304 and learns nothing, while the same poll without a
+validator costs one request and 1.0–4.6 kB. Nothing.
+
+Credit accounting could not be settled this way either. `/me`'s balance moves
+asynchronously — across a 200/304/200/304 sequence it went 479 → 479 → 480 → 479,
+i.e. *up* after a billed request, so single-shot deltas measure nothing. Any
+future claim about whether a 304 is billed needs a batched measurement over many
+requests, not one probe.
+- The `--top 10` scope is a guess, made for a request budget rather than from
+  anything the user asked for. It is one flag in `docker-compose.yml`.

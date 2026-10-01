@@ -334,10 +334,11 @@ opennem.com.au.
 
 > **The API publishes no state of charge.** There is no SOC metric, no
 > percentage, and no full-charge flag anywhere in the OpenElectricity data model.
-> What it does publish is stored energy (`storage_battery`, MWh) and, in the
-> facility metadata, registered capacity (`capacity_storage`, MWh). Every
-> percentage in the dashboard is therefore **derived** as
-> `energy / capacity` in the exporter, and inherits both of their error
+> What it does publish is stored energy (`storage_battery`, MWh) and charge/
+> discharge power (`power`, MW), together with registered capacity
+> (`capacity_storage`, MWh) in the facility metadata. There is no SOC metric or
+> full-charge flag. Every percentage in the dashboard is therefore **derived**
+> as `energy / capacity` in the exporter, and inherits both of their error
 > sources: a capacity correction upstream moves the reading. Do not describe
 > `oe_battery_soc_ratio` as an upstream figure.
 
@@ -348,26 +349,62 @@ Two endpoints, one request per battery per cycle:
 1. `GET /facilities/?fueltech_id=battery` — the fleet metadata: every battery
    unit, its `capacity_storage`, its `status_id`, and its `data_last_seen`. Read
    once per `--fleet-refresh-interval` (24h) and cached to disk as a fallback.
-2. `GET /data/facilities/{NEM|WEM}?metrics=storage_battery&facility_code=…` — the
-   data, **per facility**, with a `date_start`/`date_end` window and
-   `interval=1h`. The response holds one series per *unit* code
-   (`storage_battery_ERB01`), which is the only way to attribute a number to a
-   battery.
+2. `GET /data/facilities/{NEM|WEM}?metrics=storage_battery&metrics=power&facility_code=…`
+   — the data, **per facility**, with a `date_start`/`date_end` window and
+   `interval=1h`. The response holds one block per metric and one series per
+   *unit* code (`storage_battery_ERB01`, `power_ERB01`), which is the only way
+   to attribute a number to a battery.
+
+Both metrics are asked for in that **one** request, by repeating the `metrics`
+parameter. That is deliberate: the budget is counted in requests per day, and a
+second call per battery would double it to fetch a number that is free to
+collect alongside. Adding charge/discharge power cost the daily budget nothing,
+which the `API requests against the daily bucket` panel confirms.
 
 The per-facility form is not optional. The same endpoint without
 `facility_code` returns one flat array of timestamps with no unit attribution at
 all, and summing it is meaningless.
 
-### The four upstream quirks that shaped it
+### The two feeds, and why they are not one metric
+
+| Upstream metric | Exported as | Unit | Publishes |
+| --- | --- | --- | --- |
+| `storage_battery` | `oe_battery_soc_ratio`, `oe_battery_energy_stored_mwh` | MWh | overnight only, ~18:00–04:00 |
+| `power` | `oe_battery_power_mw` | MW | through the day |
+
+They behave differently and are kept apart end to end. On 2026-10-01 at 11:53
+the newest Eraring energy reading was 7 hours older than its newest power
+reading, and that is the normal state of this feed rather than an anomaly. So:
+
+- Each gets **its own timestamp and age** (`oe_battery_*_sample_age_seconds`).
+  One shared timestamp would make a 7-hour-old SOC claim to be current, which is
+  the failure this exporter exists to avoid.
+- `oe_battery_scrape_success` stays tied to the **energy** reading, so
+  `Batteries with a reading` means what it says. A battery can publish power and
+  still read 0 here; that combination is real and is not a fault.
+- **Liveness takes whichever is newer.** A battery that is visibly dispatching on
+  the power panel is not idle, so a power-only battery keeps its slot. Judging
+  liveness on energy alone would rotate working batteries off the board every
+  morning.
+
+On the sign: nothing upstream documents it. It is read off the data — negative
+while charging, positive while discharging, consistent with a bidirectional
+dispatch_type — and stated in the metric's `# HELP` and the panel description
+rather than left to be inferred from the chart. The unit is not inferred
+either: each response block declares it (`MW`), and the exporter warns if that
+ever stops being true.
+
+### The five upstream quirks that shaped it
 
 These are the whole reason the file is the shape it is; `../scrapers/NOTES.md`
 has the full audit.
 
-1. **Three series per facility, one with capacity.** Each battery facility
-   returns `<CODE>1`, `<CODE>G1` and `<CODE>L1`. Only `<CODE>1` has a
-   `capacity_storage` in the metadata, so only it can yield a SOC. Summing the
-   three triples the apparent fleet size. The other two are counted in
-   `oe_battery_series_without_capacity` (~9 for the default top 10) and dropped.
+1. **Six series per facility, two with capacity.** Each battery facility returns
+   `<CODE>1`, `<CODE>G1` and `<CODE>L1` for *each* of the two metrics it
+   publishes. Only `<CODE>1` has a `capacity_storage` in the metadata, so only
+   it can yield a SOC. Summing the three triples the apparent fleet size. The
+   other four are counted in `oe_battery_series_without_capacity` (~37 for the
+   deployed top 12) and dropped.
 2. **The largest batteries in the country are unbuilt.** Of the ten
    highest-capacity units, seven are `committed` and have never dispatched —
    Richmond Valley (2200 MWh, the largest in Australia), Tomago (2000),
@@ -380,18 +417,21 @@ has the full audit.
    both publish real data.
 3. **`data_last_seen` is not proof of a series.** It says the *facility* has
    dispatched, not that the battery's `storage_battery` series has a value. The
-   three Collie WEM units in the default top 10 are all `data_last_seen` current
-   and return 1151 points that are all null. Liveness has to be learned by
-   polling, so the exporter tracks it — see the rotation below.
-3. **The feed is sparse on purpose.** As of 2026-09-30 values exist only for
-   roughly 18:00–04:00 Sydney time and are null for the rest of the day. So a
-   daytime scrape legitimately finds nothing new. The exporter exports the newest
-   *non-null* sample in the lookback window together with its real timestamp and
-   age, and drops a series only once that sample is older than
-   `--max-sample-age` (36h, comfortably past the feed's own daily gap). A
-   daytime SOC reading is hours old *by design*, and `oe_battery_sample_age_seconds`
-   is how you tell that from a dead feed.
-4. **Facilities can 404 or be in the other network.** `COLLIE_BESS2` 404s, and
+   three Collie WEM units in the original top 10 are all `data_last_seen` current
+   and return 1151 points that are all null — on both metrics. Liveness has to be
+   learned by polling, so the exporter tracks it — see the rotation below.
+4. **The energy feed is sparse on purpose; the power feed is not.** As of
+   2026-10-01 `storage_battery` values exist only for roughly 18:00–04:00 Sydney
+   time and are null for the rest of the day, while `power` updates all day. So a
+   daytime scrape legitimately finds no new energy even though the battery is
+   dispatching. The exporter exports the newest *non-null* sample of each within
+   the lookback window together with its own real timestamp and age, and drops a
+   series only once that sample is older than `--max-sample-age` (36h,
+   comfortably past the feed's own daily gap). A daytime SOC reading is hours old
+   *by design*, and `oe_battery_sample_age_seconds` is how you tell that from a
+   dead feed — read it next to `oe_battery_power_sample_age_seconds`, which will
+   be hours younger.
+5. **Facilities can 404 or be in the other network.** `COLLIE_BESS2` 404s, and
    ten of the battery facilities are WEM — querying one under `NEM` returns
    `404 No data available`, which is indistinguishable from a genuinely empty
    battery. The network is carried per row from `network_id` for exactly this
@@ -412,9 +452,10 @@ even N=5, that is 1440 requests/day — 4x over the daily bucket.
 So the exporter **polls on its own schedule** and serves the last completed
 cycle to Prometheus. Prometheus can scrape as often as it likes — 5m here — at
 zero cost to the API, and the API is only touched `--poll-interval` times per
-cycle. The defaults (N=10, hourly) are 11 requests/cycle (12 on the daily
-fleet-metadata refresh), 265/day, ~1 request
-per 5.5 min: inside every bucket with room to spare.
+cycle. Both upstream metrics ride in each data request, so the deployed
+defaults (N=12, hourly) are 13 requests/cycle (14 on the daily fleet-metadata
+refresh), 313/day, ~1 request per 4.6 min: inside every bucket with room to
+spare.
 
 Consequence worth knowing: a stopped poll loop is invisible in the SOC panels,
 which happily show the last reading forever. That is what
@@ -436,6 +477,9 @@ same batteries everywhere and the table can join on `unit`:
 | `oe_battery_scrape_success` | gauge | 1 if read, 0 if not |
 | `oe_battery_capacity_rank` | gauge | 1 = largest in the monitored set |
 | `oe_battery_idle_seconds` | gauge | Age of the newest reading seen for this unit |
+| `oe_battery_power_mw` | gauge | Charge (negative) / discharge (positive) power |
+| `oe_battery_power_sample_timestamp_seconds` | gauge | When that power value was observed |
+| `oe_battery_power_sample_age_seconds` | gauge | Its age at export time |
 
 Unlabelled fleet and poll gauges:
 
@@ -447,7 +491,7 @@ Unlabelled fleet and poll gauges:
 | `oe_batteries_monitored` | gauge | Units that produced a usable reading |
 | `oe_battery_fleet_capacity_mwh` | gauge | Capacity of the whole enumerated fleet |
 | `oe_battery_monitored_capacity_mwh` | gauge | Capacity of the monitored subset |
-| `oe_battery_series_without_capacity` | gauge | Series dropped, quirk 1 (~9, expected) |
+| `oe_battery_series_without_capacity` | gauge | Series dropped, quirk 1 (~37, expected) |
 | `oe_battery_series_too_stale` | gauge | Samples dropped for age (should be 0) |
 | `oe_poll_cycle_duration_seconds` | gauge | Wall time of the last cycle |
 | `oe_last_poll_timestamp_seconds` | gauge | When the last cycle finished |
@@ -458,18 +502,23 @@ Unlabelled fleet and poll gauges:
 A battery that could not be read keeps its capacity, rank and `scrape_success 0`
 — those are facts about the fleet — but its SOC, energy, timestamp and age series
 are **omitted rather than zeroed**. On a battery, a zero is not "no reading", it
-is "flat and empty", which is a different and much more alarming claim.
+is "flat and empty", which is a different and much more alarming claim. Power
+follows the same rule, so a gap in the power panel means *nothing was published
+for that unit*, while a real `0` there is upstream genuinely reporting zero —
+worth distinguishing, because commissioning units sit at zero all day.
 
 ### The rotation: idle slots refill, at no extra request
 
-A strict top-N is only as good as its membership. Three of the ten default units
-are Collie WEM batteries that return all-null series, so a third of the request
-budget buys nothing, while larger publishing batteries further down the fleet are
-never asked. The exporter therefore keeps the scope full:
+A strict top-N is only as good as its membership. Three of the original ten
+units were Collie WEM batteries that return all-null energy series, so a third
+of the request budget bought nothing, while larger publishing batteries further
+down the fleet were never asked. The exporter therefore keeps the scope full:
 
 - Each poll notes the newest usable reading per unit, keyed on the **sample's own
-  timestamp**, not the poll time. A unit that has not published since 04:00 is
-  correctly measured as idle from 04:00.
+  timestamp**, not the poll time, and over *both* metrics. A unit that has not
+  published since 04:00 is correctly measured as idle from 04:00; a unit
+  dispatching on power alone is not idle, which is why the clock takes the newer
+  of the two.
 - A unit whose reading is older than `--drop-idle-hours` (default 36, matching
   the sample-age limit) is dropped from scope and the next-largest candidate
   takes its slot. `oe_batteries_demoted` counts batteries skipped, not slots
@@ -506,7 +555,7 @@ restart clearing the in-memory state. `--watchlist-per-cycle N` re-asks N demote
 units per cycle, round-robin from the largest, so a battery that comes back is
 back within `len(demoted)` cycles. It is off by default because it is the only
 part that costs anything — at 1 per cycle it adds ~24 requests/day, taking the
-total from 265 to 289. Probing and re-admission are separate steps, so the cycle
+total from 313 to 337. Probing and re-admission are separate steps, so the cycle
 that probes a unit reports the scope it actually polled and the unit is back in
 scope on the next one.
 
@@ -565,13 +614,22 @@ The regressions worth naming, because each is a quiet failure:
   off the facility yields no denominator at all and silently drops every SOC.
 - **The three-series trap** — G1 and L1 counted, never summed into the SOC.
 - **A committed/unreported facility counting as a fleet *observation***, which
-  would push Eraring, Waratah and Orana out of the top 10 to make room for
+  would push Eraring, Waratah and Orana out of the selected set to make room for
   batteries that publish nothing.
 - **A stale cache pinning the fleet forever** — the cache is a fallback, and the
   daily metadata refresh has to still happen once a file exists.
 - **A null newest sample being reported as a SOC of 0** rather than omitted.
 - **WEM routed as NEM**, which returns a 404 that looks exactly like an empty
   battery.
+- **One shared timestamp for two feeds.** Energy and power are hours apart; a
+  single clock would date a 7-hour-old SOC as current.
+- **The second metric costing a second request** — `power` has to ride along in
+  the same call, not be fetched on its own.
+- **A multi-unit facility double-sampled** when both units' series are present
+  in one response: the sample must be attributed to the row's own unit, not
+  concatenated across the block.
+- **A power block arriving with a unit the metadata did not declare** — checked
+  and warned, not silently accepted, so a change upstream is visible.
 - **A sample older than the feed's daily gap being dropped**, so a dead feed
   loses its series instead of repeating a day-old reading as if it were current.
 - **A 429/5xx transient being retried inside the time budget, and a 404 not

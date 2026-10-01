@@ -1258,8 +1258,10 @@ Two design decisions in it worth keeping:
   be read, so a variable built from it would make unread batteries unselectable
   — including the three Collie units that are the ones you would most want to
   look at. Capacity is exported for every in-scope unit regardless.
-- **All seven per-battery metrics share one label set**
-  `{facility,unit,name,region,status}`. `oe_battery_scrape_success` originally
+- **All eleven per-battery metrics share one label set**
+  `{facility,unit,name,region,status}` — including the three `power` series
+  added later, which is why they were given the same treatment rather than a
+  reduced set. `oe_battery_scrape_success` originally
   carried a reduced `{facility,unit}`, which meant a `{name=~"$battery"}`
   selector matched nothing on that frame and the table had no `unit` field to
   join on. Changing the exporter was the right fix rather than working around
@@ -1277,14 +1279,21 @@ Two design decisions in it worth keeping:
   networking fault. Do not go looking for one.
 - All 26 dashboard queries return data, except the two `rate()`/`increase()`
   expressions, which need two scrapes to have anything to work with.
-- Live one-shot: 74 enumerated, 10 in scope, 7 monitored, 9 series without
-  capacity, 12 requests, ~1.4–4.3 s per cycle.
+- Live one-shot (2026-09-30, pre-`power`): 74 enumerated, 10 in scope, 7
+  monitored, 9 series without capacity, 12 requests, ~1.4–4.3 s per cycle.
+- Live after adding `power` (2026-10-01): 74 enumerated, 12 in scope, 7
+  monitored, 37 series without capacity, **14** requests, 7.5 s per cycle — the
+  two extra requests being the larger `--top` and the daily fleet refresh, not
+  the new metric. `count(oe_battery_power_mw)` is 12 against
+  `count(oe_battery_soc_ratio)` 7, which is the two feeds behaving as documented
+  rather than a gap.
 
 ### Still open
 
-- The three Collie WEM units are in the default top 10 and have published
-  **nothing** in a 30-day window, so the default scope used to show 7 batteries,
-  not 10. That is upstream. The idle rotation now handles it: each Collie slot
+- The three Collie WEM units were in the original top 10 and have published
+  **nothing** in a 30-day window, so that scope showed 7 batteries with a
+  reading, not 10. That is upstream — and adding `power` does not fix it, since
+  they publish no power either. The idle rotation handles it: each Collie slot
   refills from the next-largest candidate after 36h, at no extra request, so the
   scope is full and `oe_batteries_demoted` is 3 in the steady state.
 - Recovery of a demoted unit is not automatic — it needs
@@ -1296,7 +1305,7 @@ Two design decisions in it worth keeping:
 ### Measured 2026-09-30: conditional requests exist, and do not help
 
 Probed the live API for cache validators. `/data/facilities/{network}` (the hot
-endpoint, 240 of the 265 requests/day) sends a **weak ETag** and
+endpoint, 288 of the 313 requests/day) sends a **weak ETag** and
 `cache-control: max-age=300`, and `If-None-Match` does return a real `304` with
 an empty body. `/facilities/` sends an ETag and `max-age=900`; `/me` sends
 neither.
@@ -1307,14 +1316,16 @@ revalidation is still a request against that bucket. So the validator cannot buy
 frequency, and the only way to cut request *count* is to ask about fewer
 batteries — which is a coverage decision, not an optimisation.
 
-A second reason to leave it alone: the feed only carries values ~18:00–04:00, so a
-poll at 16:00 gets a 304 and learns nothing, while the same poll without a
-validator costs one request and 1.0–4.6 kB. Nothing.
+A second reason to leave it alone: the energy feed only carries values
+~18:00–04:00, so a poll at 16:00 gets a 304 and learns nothing, while the same
+poll without a validator costs one request and 1.0–4.6 kB. Nothing. (This is one
+of the reasons the `power` metric mattered more than it looked: it is the half of
+the data that is actually live during those hours.)
 
 Credit accounting could not be settled this way either. `/me`'s balance moves
 asynchronously — across a 200/304/200/304 sequence it went 479 → 479 → 480 → 479,
 i.e. *up* after a billed request, so single-shot deltas measure nothing. Any
 future claim about whether a 304 is billed needs a batched measurement over many
 requests, not one probe.
-- The `--top 10` scope is a guess, made for a request budget rather than from
+- The `--top 12` scope is a guess, made for a request budget rather than from
   anything the user asked for. It is one flag in `docker-compose.yml`.

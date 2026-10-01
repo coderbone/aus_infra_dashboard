@@ -316,6 +316,7 @@ The single most important fact, because everything else follows from it. The
 data model publishes:
 
 - `storage_battery` — stored energy in MWh, the actual measurement
+- `power` — charge/discharge power in MW, negative charging, positive discharging
 - `capacity_storage` — registered capacity in MWh, on the **unit** in
   `/facilities/`
 - `capacity_registered` — registered *power* in MW. Not energy. Using it as a SOC
@@ -329,15 +330,62 @@ There is no percentage, no full-charge flag, no `soc` field, no
 both series' error: if the metadata capacity is corrected, every historical SOC
 reading the dashboard has already stored shifts with it.
 
+### `power` exists, and it is not on the same clock as `storage_battery`
+
+Audited 2026-10-01, which turned a one-metric exporter into a two-metric one at
+no cost to the daily request budget.
+
+- **Both metrics come back in one request** by repeating the parameter:
+  `?metrics=storage_battery&metrics=power&facility_code=ERB&...`. The budget is
+  counted in requests, not metrics, so a second call would have doubled
+  313/day for a number that is free to collect alongside. The client's `get()`
+  takes a list of metrics for exactly this reason.
+- **The response is one block per metric**, each with its own `unit` and its own
+  timestamps: `{metric, unit, unit_type, series: [...]}` where a series is
+  `[timestamps, values, {unit_code}]`. That third element is the reliable
+  attribution mechanism. `power_ERB01` would also have worked, but
+  `columns.unit_code` does not depend on the naming convention holding.
+- **The unit is declared, not guessable.** The `power` block carries
+  `unit: "MW"`. An earlier draft of this file claimed the response had no unit
+  field and that MW was inferred from magnitude; that was wrong. The exporter
+  checks the declared unit against the one it expects and warns on a mismatch,
+  which is the part worth having — a silent unit change upstream would otherwise
+  arrive as a 1000x error in a chart.
+- **Nothing upstream documents the sign.** It was read off the data and is
+  consistent: charging negative, discharging positive, matching a bidirectional
+  `dispatch_type`. It is stated in `# HELP` and on the panel rather than left to
+  be inferred from the chart.
+- **The two feeds are hours apart, by design.** On 2026-10-01 at 11:53 the newest
+  Eraring energy sample was `2026-10-01T04:00+10:00` and its newest power sample
+  was `2026-10-01T11:00+10:00`. `storage_battery` publishes only overnight
+  (~18:00–04:00); `power` publishes through the day. Therefore:
+  - Each metric carries **its own** timestamp and age. One shared clock would
+    date a 7-hour-old SOC as current.
+  - `oe_battery_scrape_success` stays tied to **energy**, so the dashboard's
+    "batteries with a reading" means what it says instead of being propped up by
+    a live power feed.
+  - **Liveness takes the newer of the two.** Judged on energy alone, every
+    battery would rotate out of scope each morning and back in each evening. A
+    unit visibly dispatching on power is not idle.
+- **The three-series trap repeats per metric.** G1 and L1 exist for `power` too,
+  so a two-metric facility returns six series, four of them uncappable. That is
+  why `oe_battery_series_without_capacity` is ~37 at top 12 rather than the ~13
+  it was with one metric.
+- **A facility with more than one real unit** returns both units' series in one
+  block. Taking the newest sample across the whole block attributes one unit's
+  reading to the other; samples must be keyed to the row's own unit code. This
+  predates `power` and was latent until a combined response made it reachable.
+
 ### Traps
 
-- **A facility returns three series and only one has capacity.** Eraring returns
-  `storage_battery_ERB01`, `_ERBG1` and `_ERBL1`. Only `ERB01` appears in the
-  metadata with a `capacity_storage`, because G1 and L1 are the metering points
-  and the battery itself is `1`. Summing the three reports Eraring as holding
-  1,686 MWh instead of 334 and inflates the monitored fleet by roughly 3x. The
-  other two are counted in `oe_battery_series_without_capacity` (9 for the
-  default top 10, not 0) and dropped.
+- **A facility returns three series per metric and only one has capacity.**
+  Eraring returns `storage_battery_ERB01`, `_ERBG1` and `_ERBL1`. Only `ERB01`
+  appears in the metadata with a `capacity_storage`, because G1 and L1 are the
+  metering points and the battery itself is `1`. Summing the three reports
+  Eraring as holding 1,686 MWh instead of 334 and inflates the monitored fleet
+  by roughly 3x. The other four (two metrics x two metering points) are counted
+  in `oe_battery_series_without_capacity` (37 for the deployed top 12, not 0)
+  and dropped.
 - **`capacity_storage` is on the *unit*, not the facility.** It lives at
   `data[i].units[j].capacity_storage`, so the denominator has to be looked up per
   unit code. Read off the facility it is simply absent, and every SOC vanishes
@@ -388,10 +436,17 @@ miss is that the plan also carries **rate buckets: 8 requests / 5 min, 32 / 1 h,
 | Poll pattern | Requests/day | Verdict |
 | --- | --- | --- |
 | Scrape-driven, 5m, top 5 | 2880 | 8x over the daily bucket |
-| Scrape-driven, 1h, top 10 | 240 | works, but ties the upstream to the scrape |
-| Own loop, 1h, top 10 | 240 | works, and the scrape interval becomes free |
+| Own loop, 1h, top 10 | 265 | works, and the scrape interval becomes free |
+| Own loop, 1h, **top 12 (shipped)** | **313** | inside every bucket |
 | Own loop, 1h, top 20 | 504 | over the daily bucket |
 | Own loop, 2h, top 10 | 132 | works, at 12h of feed latency at worst |
+
+Each row is data requests plus the free `/me` credit check per cycle, plus the
+once-daily fleet metadata refresh. Requests per cycle, not metrics per cycle, is
+the unit that matters: asking for two metrics in one call is one request, which
+is why `power` was free. 12 in scope + 1 `/me` = 13 hourly, `13 x 24 + 1 = 313`
+per day, or one request per 4.6 min. `--request-interval=0.6` holds the 2/s
+burst limit.
 
 So the exporter polls on its own schedule and serves the last completed cycle to
 Prometheus. Scraping it every 5 minutes costs the API nothing; that is the whole
@@ -400,6 +455,10 @@ trick, and it is why `scrape_interval: 5m` in `../prometheus.yml` and
 cost of that design is that a stopped poll loop is invisible in the SOC panels,
 which show the last reading forever — hence `oe_last_poll_timestamp_seconds` and
 the `Since last poll` panel on the dashboard.
+
+Still unknown, and only observation will settle it: the plan also advertises a
+`7d:366` bucket whose meaning is not documented, and the 5m/hourly buckets have
+not been seen to trigger at this cadence.
 
 Credits themselves measured anywhere from 0 to 1 per narrow call, with a
 five-request cycle moving the balance 494 → 491 and a twelve-request cycle
@@ -426,12 +485,14 @@ buckets. `/me` on its own is free, which is what makes the gauge affordable.
 | SNB02 | SNB02 | 1090 | NEM | operating |
 | LDBESS | LDBESS1 | 1086.2 | NEM | operating |
 
-The three Collie units are in scope at the default `--top 10` and publish
-**nothing** — no non-null value in a 30-day window. So a strict top-10 yields only
-7 monitored batteries, and `oe_batteries_monitored` sitting below
-`oe_batteries_in_scope` is not a fault. The idle rotation is the fix rather than
-raising `--top`: after 36h each Collie slot goes to the next-largest candidate,
-costs no extra request, and the scope stays full. Checked WEM candidates
+The three Collie units were in scope at the original `--top 10` and publish
+**no energy at all** — no non-null value in a 30-day window. So a strict top-10
+yields only 7 batteries with a reading, and `oe_batteries_monitored` sitting
+below `oe_batteries_in_scope` is not a fault. Adding `power` did not fix that,
+because these units publish no power either; they are simply empty on both
+metrics. The idle rotation is the fix rather than raising `--top`: after 36h
+each Collie slot goes to the next-largest candidate, costs no extra request, and
+the scope stays full. Checked WEM candidates
 (`KWINANA_ESR2`, `COLLIE_ESR1`) are *also* all-null, while the NEM candidates
 (`MREHA3`, `MLB01`, `TARBESS1`, `WOOLES1`, `SNB01`) all publish — so the rotation
 walks past the WEM units rather than into them.
@@ -481,3 +542,16 @@ returning to ~0.
   answers 200 with every value `NaN` and `/healthz` says healthy, so a container
   mid-first-poll is not reported as down and a `depends_on: service_healthy`
   gate does not deadlock. `NaN`, not 0: a fleet count of 0 claims an empty fleet.
+- **The two metrics are tracked as two independent readings, not one reading
+  with extra fields.** `_record_readings()` is called per metric, each with its
+  own timestamp and its own freshness test, and only the newest of the two
+  feeds the idle clock. The tempting shortcut — one "last seen" and a power
+  value hanging off it — produces a chart that looks fine and reports a 7-hour-old
+  SOC as current every afternoon. Locked down by
+  `test_each_metric_carries_its_own_timestamp`.
+- **Name collisions in the internal row are a metric-collision risk, not a
+  style issue.** The fleet row already had `power_mw` meaning *registered MW
+  capacity* from `capacity_registered`. Adding instantaneous `power` power under
+  the same key silently overwrote one with the other and neither sum was
+  exported, so the bug produced a missing metric rather than a wrong one. The
+  row field is now `registered_mw`.

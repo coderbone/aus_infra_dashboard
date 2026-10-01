@@ -90,10 +90,13 @@ def stat(title, grid, expr, description, unit=None, decimals=None, steps=None,
 def timeseries(title, grid, targets, description, unit=None, axis=None,
                decimals=None, span_nulls=True, step="stepAfter", legend_calcs=(),
                overrides=(), min_=None, max_=None, thresholds_steps=None,
-               draw="line", stack=False):
+               draw="line", stack=False, center_zero=False):
     custom = {
         "axisBorderShow": False,
-        "axisCenteredZero": False,
+        # Only for series that cross zero, where an uncentred axis makes the
+        # magnitude of the negative side read as an artefact of the scale rather
+        # than as half the story.
+        "axisCenteredZero": center_zero,
         "axisColorMode": "text",
         "axisLabel": axis or "",
         "axisPlacement": "auto",
@@ -341,24 +344,36 @@ the facility metadata, energy from the `storage_battery` metric, so a capacity \
 correction upstream moves the reading. See `scrapers/oe_battery_exporter.py` for \
 the derivation and `scrapers/NOTES.md` for the upstream quirks.
 
+**Energy and power are two different feeds, and this board keeps them apart.** \
+State of charge comes from `storage_battery` (MWh) and charge/discharge power \
+from `power` (MW); both arrive in the same response to the same request, so \
+showing power costs nothing. They do *not* publish on the same schedule: \
+`storage_battery` carries values only overnight, while `power` updates all day. \
+So the SOC panels are stale by design for a few hours after dawn and the power \
+panel is not, and each carries its own age metric rather than sharing one. \
+`Read` in the table is about the energy reading alone - a battery can be \
+publishing power and still have no SOC to show.
+
 **Scope is the NEM and WEM battery fleet.** The `NEM` facilities endpoint also \
-returns WEM units, so the top 10 by capacity is currently 9 NEM and 1 WEM \
-(Collie 2). Each facility is queried on its own `network_id`, because asking for \
-a WEM unit on the NEM dataset returns 404 rather than empty data.
+returns WEM units, so the top 12 by capacity includes Collie 2 and Synergy in \
+the west. Each facility is queried on its own `network_id`, because asking for a \
+WEM unit on the NEM dataset returns 404 rather than empty data.
 
 **Idle batteries are rotated out, not monitored in vain.** A slot held by a \
-battery that has published nothing for 36h goes to the next-largest candidate, at \
-no extra API cost, so the scope stays full. The three Collie WEM units return \
-only nulls, so `skipped as idle` settles at 3 and the board fills up with the \
-next-largest publishing batteries. `Batteries with a reading` should therefore \
-match `Batteries in scope`, not fall short of it.
+battery that has published nothing - neither energy nor power - for 36h goes to \
+the next-largest candidate, at no extra API cost, so the scope stays full. The \
+three Collie WEM units return only nulls, so `skipped as idle` settles at 3 and \
+the board fills up with the next-largest publishing batteries. `Batteries with a \
+reading` counts energy readings, so it can sit below `Batteries in scope` \
+through the afternoon without anything being wrong; watch the power panel to see \
+that those batteries are alive.
 
-**The feed is sparse on purpose.** As of 2026-09-30 the upstream only carries \
-values for roughly 18:00-04:00 Sydney time, so a daytime reading is hours old by \
-design. The `Sample age` panel is the one to read before the SOC panels: a reading \
-older than a day means the feed went quiet, not that the battery emptied. The SOC \
-series is **omitted** rather than zeroed when a battery cannot be read, so a \
-missing bar means "no reading", never "flat and empty".
+**The energy feed is sparse on purpose.** As of 2026-10-01 the upstream only \
+carries values for roughly 18:00-04:00 Sydney time, so a daytime SOC reading is \
+hours old by design. The `Sample age` panel is the one to read before the SOC \
+panels: a reading older than a day means the feed went quiet, not that the \
+battery emptied. The SOC series is **omitted** rather than zeroed when a battery \
+cannot be read, so a missing bar means "no reading", never "flat and empty".
 
 **This is the largest N batteries that have ever reported**, not the largest N \
 batteries in Australia. Of the ten highest-capacity units in the fleet metadata, \
@@ -366,10 +381,11 @@ seven are `committed` and have never dispatched - Richmond Valley (2200 MWh), \
 Tomago (2000), Baranduda (1886) - and they publish nothing at all. Ranking over \
 units with data is the only ranking that produces a chart.
 
-Polled hourly and scoped to 10 batteries: 11 API requests per cycle (12 on the \
-once-daily cycle that also refreshes the fleet metadata), 265 a day, inside the \
-free plan's 366 requests/day bucket. The 5m Prometheus scrape does not cost the \
-API anything - the exporter answers it from the last completed cycle.\
+Polled hourly and scoped to 12 batteries: 13 API requests per cycle (14 on the \
+once-daily cycle that also refreshes the fleet metadata), 313 a day, inside the \
+free plan's 366 requests/day bucket. Both upstream metrics come back in that one \
+request per battery. The 5m Prometheus scrape does not cost the API anything - \
+the exporter answers it from the last completed cycle.\
 """
 
 panels = []
@@ -394,11 +410,14 @@ panels.append(
         "Batteries with a reading",
         {"h": 4, "w": 4, "x": 0, "y": 9},
         "oe_batteries_monitored",
-        "How many of the in-scope batteries returned a usable sample in the last "
-        "poll. This normally equals `Batteries in scope`: a battery that has "
-        "published nothing for 36h is rotated out of scope and its slot goes to "
-        "the next-largest candidate, so a shortfall here means a battery is in "
-        "scope but unread right now, not that it is dead.",
+        "How many of the in-scope batteries returned a usable **state-of-charge** "
+        "sample in the last poll. It counts energy readings only, so it dips "
+        "through the afternoon when the storage_battery feed is silent and "
+        "recovers overnight - that is the feed, not a fault, and the charge and "
+        "discharge panel is where those batteries are still visible. A battery "
+        "that has published neither energy nor power for 36h is rotated out of "
+        "scope and its slot goes to the next-largest candidate, so a *permanent* "
+        "shortfall here is a scope problem, not a reading one.",
         unit="short",
         steps=[
             {"color": "red", "value": 0},
@@ -415,7 +434,7 @@ panels.append(
         {"h": 4, "w": 4, "x": 4, "y": 9},
         "oe_batteries_in_scope",
         "Batteries being polled: the top N by capacity, set by the exporter's "
-        "`--top` flag (10 in this stack).",
+        "`--top` flag (12 in this stack).",
         unit="short",
         text_mode="value",
     )
@@ -428,7 +447,7 @@ panels.append(
         "oe_battery_fleet_capacity_mwh / 1000",
         "Registered storage capacity of every battery unit in the OpenElectricity "
         "fleet that has ever reported - 74 units. The whole fleet, not just the "
-        "monitored ten. The metric is MWh, so the query divides by 1000: in GWh "
+        "monitored twelve. The metric is MWh, so the query divides by 1000: in GWh "
         "the number reads at a glance, where in MWh it was a six-digit value with "
         "a 'k' buried in it.",
         unit="short",
@@ -442,9 +461,11 @@ panels.append(
         "Monitored capacity, GWh",
         {"h": 4, "w": 4, "x": 12, "y": 9},
         "oe_battery_monitored_capacity_mwh / 1000",
-        "Registered capacity of the batteries that produced a reading. The gap "
-        "against the in-scope ten is capacity that is in scope but unread. "
-        "Divided by 1000 for GWh, same as the fleet panel.",
+        "Registered capacity of the batteries that produced an energy reading. The "
+        "gap against the in-scope twelve is capacity that is in scope but has no "
+        "SOC to show - which through the afternoon is most of them, since the "
+        "energy feed is silent from 04:00. Check the power panel before reading "
+        "anything into that gap. Divided by 1000 for GWh, same as the fleet panel.",
         unit="short",
         decimals=1,
         text_mode="value",
@@ -456,10 +477,11 @@ panels.append(
         "Age of oldest reading",
         {"h": 4, "w": 4, "x": 16, "y": 9},
         "max(oe_battery_sample_age_seconds)",
-        "The oldest reading currently on the board. Non-zero by design - the feed "
-        "only publishes overnight - but a jump into the tens of hours means the "
-        "upstream went quiet, and every SOC panel is about to start lying by "
-        "omission.",
+        "The oldest **energy** reading currently on the board. Non-zero by design - "
+        "the storage_battery feed only publishes overnight - but a jump into the "
+        "tens of hours means that feed went quiet, and every SOC panel is about to "
+        "start lying by omission. The power panel has its own age and will keep "
+        "moving through those hours; only this one resets each morning.",
         unit="s",
         decimals=0,
         steps=[
@@ -568,10 +590,11 @@ panels.append(
         "State of charge as a percentage. `stepAfter` because this is a step "
         "function: the exporter holds each reading until the next hourly poll, so "
         "a sloped line would invent levels that were never published. The daytime "
-        "flat stretches are the sparse feed, not a fault - and Prometheus only "
-        "holds what this job has scraped since it started, so there is no history "
-        "further back than the exporter's first successful poll. Gaps are not "
-        "bridged: if the exporter stops answering, the line stops.",
+        "flat stretches are the sparse feed, not a fault - the charge and "
+        "discharge panel below keeps moving through the same hours - and Prometheus "
+        "only holds what this job has scraped since it started, so there is no "
+        "history further back than the exporter's first successful poll. Gaps are "
+        "not bridged: if the exporter stops answering, the line stops.",
         unit="percent",
         axis="% full",
         decimals=1,
@@ -583,8 +606,41 @@ panels.append(
 
 panels.append(
     timeseries(
+        "Charge and discharge power",
+        {"h": 10, "w": 24, "x": 0, "y": 36},
+        [target("oe_battery_power_mw{%s}" % SEL, instant=False,
+                legend="{{name}} ({{facility}})")],
+        "Charge and discharge power per battery in MW, from the upstream `power` "
+        "metric. **Positive is discharging to the network, negative is charging** "
+        "- so the parts of the chart above the line are batteries exporting and "
+        "the parts below are batteries absorbing, and the zero line is the "
+        "boundary between them. The axis is centred on zero so the two sides can "
+        "be compared directly. Nothing upstream documents that sign; it is read "
+        "off the data, where a charging battery goes negative, and it is stated "
+        "here so nobody has to infer it from the shape of the chart.\n\n"
+        "This costs no extra API requests: `power` and `storage_battery` come "
+        "back in the same response, one request per battery, so the request "
+        "budget below is unchanged by this panel.\n\n"
+        "Unlike the SOC panels above, this one is expected to be current through "
+        "the afternoon - the energy series stops at 04:00 and this one does not. "
+        "A battery flat at zero here is genuinely idle, and a battery missing "
+        "from this panel published no power at all, which is a different thing "
+        "again: absent, not zero. `Sample age` below measures the energy "
+        "reading's age and `oe_battery_power_sample_age_seconds` measures this "
+        "one; they are separate metrics because the two series age separately - "
+        "both are plotted on that panel.",
+        unit="megawatt",
+        axis="MW",
+        decimals=0,
+        span_nulls=False,
+        center_zero=True,
+    )
+)
+
+panels.append(
+    timeseries(
         "Energy stored, GWh",
-        {"h": 9, "w": 12, "x": 0, "y": 36},
+        {"h": 9, "w": 12, "x": 0, "y": 46},
         [target("oe_battery_energy_stored_mwh{%s} / 1000" % SEL, instant=False,
                 legend="{{name}} ({{facility}})")],
         "Stored energy, exactly as the upstream publishes it but divided by 1000 "
@@ -606,12 +662,21 @@ panels.append(
 panels.append(
     timeseries(
         "Sample age",
-        {"h": 9, "w": 12, "x": 12, "y": 36},
-        [target("oe_battery_sample_age_seconds{%s}" % SEL, instant=False, legend="{{name}}")],
-        "How old the reading behind each SOC value is. This is the honest "
-        "companion to the SOC panels: the sawtooth is the overnight publication "
-        "window resetting each day, and a line that climbs without resetting is a "
-        "feed that has stopped, however healthy the SOC curve looks.",
+        {"h": 9, "w": 12, "x": 12, "y": 46},
+        [
+            target("oe_battery_sample_age_seconds{%s}" % SEL, refid="A", instant=False,
+                   legend="{{name}} (energy)"),
+            target("oe_battery_power_sample_age_seconds{%s}" % SEL, refid="B", instant=False,
+                   legend="{{name}} (power)"),
+        ],
+        "How old the reading behind each value is, for both feeds on one axis - "
+        "the honest companion to the panels above. The **energy** line's sawtooth "
+        "is the overnight publication window resetting each day, and an energy "
+        "line that climbs without resetting is a feed that has stopped, however "
+        "healthy the SOC curve looks. The **power** line stays near zero "
+        "through the same hours, which is the visible proof that the battery is "
+        "awake and dispatching while its SOC goes stale. Two series is the point: "
+        "either one alone would be misleading here.",
         axis="age",
         decimals=0,
         span_nulls=False,
@@ -621,10 +686,10 @@ panels.append(
 panels.append(
     timeseries(
         "API credits remaining",
-        {"h": 8, "w": 8, "x": 0, "y": 45},
+        {"h": 8, "w": 8, "x": 0, "y": 55},
         [target("oe_api_credits_remaining", instant=False, legend="credits left")],
         "Daily OpenElectricity credit balance, read from the free /me endpoint each "
-        "cycle. The free plan allows 500 a day; this stack's hourly ten-battery "
+        "cycle. The free plan allows 500 a day; this stack's hourly twelve-battery "
         "cycle uses a handful.",
         axis="credits",
         decimals=0,
@@ -636,7 +701,7 @@ panels.append(
 panels.append(
     timeseries(
         "API requests against the daily bucket",
-        {"h": 8, "w": 8, "x": 8, "y": 45},
+        {"h": 8, "w": 8, "x": 8, "y": 55},
         [
             target(
                 "sum(increase(oe_api_requests_total{job=\"openelectricity_battery\"}[1d]))",
@@ -649,13 +714,14 @@ panels.append(
         "Requests issued in the trailing 24h against the API's own 366/day bucket "
         "- the real limit, and it binds long before the 500 daily credits run out. "
         "The two are compared as *daily* quantities on purpose: the poll happens "
-        "once an hour as a single burst of 12 requests, so an hourly rate would "
+        "once an hour as a single burst of 13 requests, so an hourly rate would "
         "draw a spike in one 5m bucket and zero everywhere else, and a ceiling "
         "line derived the same way would sit at 0 for 23 hours out of 24. "
-        "Steady state here is ~265, just under the ceiling. Failed requests "
-        "count too - the exporter increments the counter when a request is "
-        "issued, not when it succeeds - and a restart resets it, which "
-        "`increase` accounts for.",
+        "Steady state here is ~313, just under the ceiling. That figure includes "
+        "the charge/discharge panel: both upstream metrics come back in the same "
+        "response, so adding power did not move it. Failed requests count too - "
+        "the exporter increments the counter when a request is issued, not when "
+        "it succeeds - and a restart resets it, which `increase` accounts for.",
         axis="requests",
         decimals=0,
         span_nulls=False,
@@ -672,9 +738,9 @@ panels.append(
 panels.append(
     timeseries(
         "Poll cycle duration",
-        {"h": 8, "w": 8, "x": 16, "y": 45},
+        {"h": 8, "w": 8, "x": 16, "y": 55},
         [target("oe_poll_cycle_duration_seconds", instant=False, legend="cycle")],
-        "Wall time of the last poll: eleven sequential API calls plus the credit "
+        "Wall time of the last poll: thirteen sequential API calls plus the credit "
         "read. A duration near or above the 3600s poll interval means cycles are "
         "starting to overlap the next one.",
         axis="s",
@@ -687,7 +753,7 @@ panels.append(
 panels.append(
     timeseries(
         "Batteries enumerated, in scope, monitored",
-        {"h": 8, "w": 24, "x": 0, "y": 53},
+        {"h": 8, "w": 24, "x": 0, "y": 63},
         [
             target("oe_batteries_enumerated", refid="A", instant=False, legend="with data upstream"),
             target("oe_batteries_in_scope", refid="B", instant=False, legend="in scope (--top)"),
@@ -698,14 +764,15 @@ panels.append(
         ],
         "Scope accounting, all as step functions because they only change on a "
         "poll. `enumerated` is the fleet that has ever reported (74 of 119 "
-        "capacity-bearing units), `in scope` is the top 10, `monitored` is what "
+        "capacity-bearing units), `in scope` is the top 12, `monitored` is what "
         "actually read. `skipped as idle` counts candidates dropped for going "
         "quiet for 36h - their slots go to the next-largest battery, so the scope "
         "stays full at no extra API cost, and 3 is the expected steady state "
         "here (the Collie WEM units). `series without capacity` is expected to be "
-        "about 9: each battery facility also returns a G1 and an L1 series, which "
-        "are counted and then dropped because the metadata has no capacity for "
-        "them. `dropped as stale` is the one that should stay at 0.",
+        "in the tens: each battery facility also returns a G1 and an L1 series for "
+        "each of the two metrics it publishes, and those four are counted and then "
+        "dropped because the metadata has no capacity for them. `dropped as stale` "
+        "is the one that should stay at 0.",
         axis="units",
         decimals=0,
         span_nulls=False,

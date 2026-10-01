@@ -128,14 +128,16 @@ services:
       - /app/oe_battery_exporter.py
       - --listen-address=0.0.0.0
       - --port=9111
-      # Hourly. 10 batteries = 10 data + 1 credit check = 11 requests/cycle
-      # (12 on the once-daily cycle that also refreshes the fleet metadata), so
-      # 265/day, inside the API's
-      # 366 requests/day bucket. Do NOT shorten this to match the Prometheus
-      # scrape interval: the exporter answers every scrape from its last
-      # completed cycle, so a 5m scrape of an hourly poll costs the upstream
-      # nothing and buys no new data. See scrapers/oe_battery_exporter.py for
-      # the budget arithmetic and NOTES.md section 9.
+      # Hourly. 12 batteries = 12 data + 1 credit check = 13 requests/cycle
+      # (14 on the once-daily cycle that also refreshes the fleet metadata), so
+      # 313/day, inside the API's
+      # 366 requests/day bucket. Both upstream metrics - stored energy and charge
+      # /discharge power - come back in that one request per battery. Do NOT
+      # shorten this to match the Prometheus scrape interval: the exporter
+      # answers every scrape from its last completed cycle, so a 5m scrape of an
+      # hourly poll costs the upstream nothing and buys no new data. See
+      # scrapers/oe_battery_exporter.py for the budget arithmetic and NOTES.md
+      # section 9.
       - --poll-interval=3600
       # 12 in scope + 1 /me per hourly cycle, +1 for the daily fleet refresh
       # = 313 requests/day against the plan's 366/day bucket. 2/s burst is held

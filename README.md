@@ -16,11 +16,17 @@ charts them in Grafana:
 > signal that exists, because the 2.0 intake works are at the upper storage.
 
 > The battery **SOC is derived, not published.** OpenElectricity exposes stored
-> energy in MWh and registered capacity in MWh, and nothing else, so
+> energy in MWh and registered capacity in MWh, and no percentage, so
 > `oe_battery_soc_ratio` is `energy / capacity` computed in the exporter. It is
 > also scoped to the largest batteries that have *ever reported*: seven of the
 > ten highest-capacity units in the country are unbuilt and publish nothing, so
 > ranking over all of them would produce an empty dashboard.
+>
+> **Energy and power are not on the same clock.** The energy feed publishes only
+> overnight (~18:00–04:00 Sydney); charge/discharge power updates through the
+> day. Each is exported with its own timestamp and age, so a daytime SOC reading
+> is honestly labelled as hours old rather than looking current, and
+> `oe_battery_power_mw` keeps showing what the fleet is doing in between.
 
 - `docker-compose.yml` — the five services (`tbm-exporter`,
   `reservoir-exporter`, `battery-exporter`, `prometheus`, `grafana`)
@@ -152,13 +158,14 @@ email domain.
 
 The real budget is not the 500 credits, it is the rate buckets: **8 requests per
 5 minutes, 32 per hour, 366 per day**. `battery-exporter` polls hourly over the
-largest 10 batteries: 10 data requests plus one credit check per cycle is
-11 × 24 = 264 a day, and the once-daily fleet metadata refresh adds one more for
-**265** — inside every bucket, and the reason the exporter polls on its own
-schedule instead of on the Prometheus scrape. Scraping it every 5 minutes would
-be 288 scrapes a day that each cost the API nothing, which is fine; polling the
-API every 5 minutes would be 2880 requests a day, which is 8x over. See
-`NOTES.md` §9.
+largest 12 batteries: 12 data requests plus one credit check per cycle is
+13 × 24 = 312 a day, and the once-daily fleet metadata refresh adds one more for
+**313** — inside every bucket, and the reason the exporter polls on its own
+schedule instead of on the Prometheus scrape. Each data request returns *both*
+stored energy and charge/discharge power, so the second metric is free. Scraping
+it every 5 minutes would be 288 scrapes a day that each cost the API nothing,
+which is fine; polling the API every 5 minutes would be 2880 requests a day,
+which is 8x over. See `NOTES.md` §9.
 
 The API also **rejects the default `Python-urllib` User-Agent with a bare HTTP
 403** and no body, so the exporter sets an explicit one. If you ever see a 403

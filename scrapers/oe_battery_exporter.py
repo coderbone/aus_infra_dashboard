@@ -8,9 +8,18 @@ https://api.openelectricity.org.au . Two endpoints, both bearer-authenticated:
         Fleet metadata. Every battery facility, its units, and per unit the
         fields that matter here: `capacity_storage` (MWh) and `data_last_seen`.
 
-    GET /data/facilities/NEM?metrics=storage_battery&facility_code=<CODE>
-        Time series of stored energy in MWh, one series per *unit*, named
-        `storage_battery_<UNIT_CODE>`.
+    GET /data/facilities/NEM?metrics=storage_battery&metrics=power&facility_code=<CODE>
+        Time series for one facility, one series per *unit* per metric, named
+        `<METRIC>_<UNIT_CODE>`:
+
+            storage_battery_<UNIT>   energy stored, MWh
+            power_<UNIT>             charge/discharge power, MW
+
+        Both metrics are asked for in one request by repeating `metrics`. That is
+        deliberate and is the whole reason this is not two calls: a facility
+        costs one request out of a 366/day bucket, so a second call per battery
+        would double the budget to obtain a number that is free to fetch
+        alongside.
 
 There is no "state of charge" metric. The API publishes stored **energy in MWh**
 and the fleet metadata publishes **capacity in MWh**, so SOC is derived here as
@@ -21,17 +30,27 @@ and exported as a 0-1 ratio. Nothing upstream reports a percentage, and
 `capacity_registered` is MW (power) and must not be used as the denominator -
 that would be a units error that still produces a plausible-looking number.
 
+`power` publishes no unit per series, but each block of the response declares
+one - the `power` block came back as `MW` on 2026-10-01 - and the exporter
+checks that against the unit in the exported metric's name rather than assuming
+it. The values corroborate it: on that date the seven usable units reported
+-415 to +325, against `capacity_registered` of 150-500 MW for the same units.
+The sign convention is read off the data as well - negative while charging,
+positive while discharging - and is consistent with a bidirectional
+dispatch_type. Nothing upstream states the sign, so it is carried in the metric's
+HELP rather than assumed silently.
+
 Four upstream quirks this is built around, all measured on 2026-09-30 rather
 than assumed:
 
-1. **Three series per facility, one usable.** A battery facility returns
-   `<CODE>1` plus `<CODE>G1` and `<CODE>L1`. Only `<CODE>1` exists in the fleet
-   metadata; G1 and L1 have no `capacity_storage`, so no SOC can be computed for
-   them, and their values track the battery's rather than being independent
-   storage. Summing all three would triple-count the same MWh. Only series whose
-   unit code is present in the metadata with a positive `capacity_storage` are
-   exported as SOC; the rest are counted in
-   `oe_battery_series_without_capacity` so the gap stays visible.
+1. **Six series per facility, two usable.** A battery facility returns
+   `<CODE>1` plus `<CODE>G1` and `<CODE>L1`, for each of the two metrics. Only
+   `<CODE>1` exists in the fleet metadata; G1 and L1 have no
+   `capacity_storage`, so no SOC can be computed for them, and their values
+   track the battery's rather than being independent storage. Summing all three
+   would triple-count the same MWh. Only series whose unit code is present in
+   the metadata with a positive `capacity_storage` are exported; the rest are
+   counted in `oe_battery_series_without_capacity` so the gap stays visible.
 
 2. **The aggregate endpoint is unusable.** `?metrics=storage_battery` with no
    `facility_code` returns a single series named `storage_battery_total`
@@ -41,14 +60,22 @@ than assumed:
    per-facility `columns: {"unit_code": ...}` is the only thing that makes the
    numbers attributable.
 
-3. **The feed is legitimately sparse.** As of 2026-09-30 the feed carries values
-   only for roughly 18:00-04:00 local and nulls for the rest of the day, so a
-   scrape at 14:00 correctly finds nothing new. That is not a fault and must not
-   be reported as one. The exporter therefore exports the most recent *non-null*
-   sample within `--lookback-hours` together with its real timestamp and age,
-   and drops a series only once the newest sample is older than
-   `--max-sample-age` - so a genuinely dead feed loses its series rather than
-   repeating an ancient reading as if it were current.
+3. **The energy feed is legitimately sparse; the power feed is not.** As of
+   2026-10-01 `storage_battery` carries values only for roughly 18:00-04:00
+   local and nulls for the rest of the day, while `power` updates all day for
+   the same units. Both are correct and neither is a fault, so they must not be
+   reported as one. The exporter therefore exports the most recent *non-null*
+   sample of each within `--lookback-hours` together with its own real
+   timestamp and age, and drops a series only once that metric's newest sample
+   is older than `--max-sample-age` - so a genuinely dead feed loses its series
+   rather than repeating an ancient reading as if it were current.
+
+   The two ages are kept apart deliberately. `oe_battery_sample_age_seconds`
+   answers "how old is this SOC?", and `oe_battery_power_sample_age_seconds`
+   answers "how old is this power?"; collapsing them would make a battery with
+   yesterday's energy and today's power look fresh in both. Liveness is the one
+   place they are combined, and it takes the newer of the two: a battery that is
+   plainly dispatching is not idle, however quiet its energy series is.
 
 4. **Facilities in the metadata can 404 on the data endpoint** (`COLLIE_BESS2`
    does), and a facility whose newest unit is `committed` has no data at all.
@@ -95,16 +122,19 @@ panel and every table frame joins on the same key:
     oe_battery_soc_ratio                       SOC, 0-1
     oe_battery_energy_stored_mwh               MWh, as published
     oe_battery_capacity_storage_mwh            MWh, from metadata
+    oe_battery_power_mw                        MW, + discharging / - charging
     oe_battery_last_sample_timestamp_seconds   when that value was observed
     oe_battery_sample_age_seconds              its age at export time
-    oe_battery_scrape_success                  1 = read, 0 = not
+    oe_battery_power_sample_timestamp_seconds  when the power value was observed
+    oe_battery_power_sample_age_seconds        its age at export time
+    oe_battery_scrape_success                  1 = SOC read, 0 = not
     oe_battery_capacity_rank                   1 = largest
 
 Unlabelled fleet and poll gauges:
 
     oe_batteries_enumerated                    fleet size
     oe_batteries_in_scope                      after --top
-    oe_batteries_monitored                     with a usable reading
+    oe_batteries_monitored                     with a usable SOC sample
     oe_battery_fleet_capacity_mwh              whole fleet
     oe_battery_monitored_capacity_mwh          monitored subset
     oe_battery_series_without_capacity         quirk 1
@@ -115,9 +145,14 @@ Unlabelled fleet and poll gauges:
     oe_api_credits_remaining                   daily budget
     oe_api_requests_total                      counter, includes failures
 
-`oe_battery_scrape_success` is 0 for a facility that could not be read, and the
-SOC series is **omitted** for it rather than repeated, so a failure shows as a
-gap in the gauge plus this flag, matching the sibling exporters.
+`oe_battery_scrape_success` is 0 for a facility whose *energy* reading could not
+be read, and the SOC series is **omitted** for it rather than repeated, so a
+failure shows as a gap in the gauge plus this flag, matching the sibling
+exporters. The flag is about state of charge only: `oe_battery_power_mw` is
+published independently of it, so a unit can report power while this reads 0.
+That combination is real and expected - `storage_battery` is an overnight series
+and `power` is not - so the two ages are published separately rather than
+collapsed into one.
 
 Usage
     oe_battery_exporter.py --api-key-file=/run/secrets/openelectricity
@@ -366,7 +401,7 @@ class OpenElectricityClient:
                 raise ScrapeError("GET %s -> invalid JSON: %s" % (url, exc)) from exc
         raise ScrapeError("GET %s -> %s" % (url, last))
 
-    def get(self, path: str, params: dict | None = None) -> dict:
+    def get(self, path: str, params: dict | list | None = None) -> dict:
         url = self.base_url + path
         if params:
             url += "?" + urllib.parse.urlencode(params, doseq=True)
@@ -388,37 +423,82 @@ class OpenElectricityClient:
             raise ScrapeError("/facilities/ -> data is %s, not a list" % type(facilities).__name__)
         return facilities
 
-    def storage_battery(
+    # Upstream metric name -> the short key used everywhere below. Both are asked
+    # for in the one call `battery_metrics` makes, and each series arrives named
+    # `<METRIC>_<UNIT_CODE>`.
+    METRICS = (("storage_battery", "storage"), ("power", "power"))
+    # Unit each metric's *block* declares. The series themselves carry no unit,
+    # but the block does - `power` came back as "MW" on 2026-10-01 - so this is
+    # checked rather than assumed. A units error here would still plot as a
+    # plausible-looking line, which is the whole failure mode to avoid.
+    METRIC_UNITS = {"storage": "MWh", "power": "MW"}
+    _SHORT = {name: short for name, short in METRICS}
+
+    def battery_metrics(
         self, facility_code: str, network: str, lookback_hours: float, now: float
-    ) -> list[dict]:
-        """Return `[(unit_code, [(epoch, mwh), ...])]` for one facility.
+    ) -> list[tuple[str, str, tuple[float, float]]]:
+        """Newest non-null sample of each metric, for one facility.
+
+        Returns `[(unit_code, "storage"|"power", (epoch, value)), ...]` - one
+        entry per series the facility published, which is what lets the caller
+        count the series it has no capacity for without re-parsing names.
+
+        Both metrics go out in a single request, as `metrics=storage_battery`
+        plus `metrics=power`. The API treats a repeated parameter as a
+        multi-metric query and answers with one block per metric; the exporter
+        does not spend a second request per battery to get the power value,
+        because that would double a budget measured in requests per day.
 
         The window is `date_start` .. `date_end` with `interval=1h`, and only
         the newest non-null value per series is kept - the dashboard wants
-        state of charge now, not a backfill, and one point per series is the
-        cheapest shape this call can have.
+        state of charge and dispatch power *now*, not a backfill, and one point
+        per series is the cheapest shape this call can have.
         """
         end = now
         start = now - max(1.0, lookback_hours) * 3600.0
-        payload = self.get(
-            "/data/facilities/%s" % urllib.parse.quote(network),
-            {
-                "metrics": "storage_battery",
-                "facility_code": facility_code,
-                "interval": "1h",
-                "date_start": iso_local(start),
-                "date_end": iso_local(end),
-            },
-        )
-        out: list[tuple[str, tuple[float, float]]] = []
+        params = [("metrics", name) for name, _ in self.METRICS]
+        params += [
+            ("facility_code", facility_code),
+            ("interval", "1h"),
+            ("date_start", iso_local(start)),
+            ("date_end", iso_local(end)),
+        ]
+        payload = self.get("/data/facilities/%s" % urllib.parse.quote(network), params)
+        out: list[tuple[str, str, tuple[float, float]]] = []
         for block in payload.get("data") or []:
+            metric = block.get("metric")
+            expected = self.METRIC_UNITS.get(self._SHORT.get(metric))
+            declared = block.get("unit")
+            if expected and declared and declared != expected:
+                # Keep exporting - a wrong unit label is upstream's problem, and
+                # refusing to export would hide the drift instead of naming it -
+                # but say so, because the export name claims a unit.
+                log.warning(
+                    "%s block for %s declares unit %r, expected %r; exporting as %s",
+                    metric, facility_code, declared, expected, expected,
+                )
             for series in block.get("results") or []:
                 name = series.get("name") or ""
-                unit_code = name.split("storage_battery_", 1)[-1] if "storage_battery_" in name else name
+                key = None
+                for upstream, short in self.METRICS:
+                    if name.startswith(upstream + "_"):
+                        key, suffix = short, name[len(upstream) + 1 :]
+                        break
+                if key is None:
+                    # Only the two requested metrics can come back, so an
+                    # unrecognised name is an upstream change rather than a
+                    # series to report. Skipping it does not drop data: there is
+                    # nothing in it that is not in a series we did ask for.
+                    log.debug("ignoring unrecognised series %r from %s", name, facility_code)
+                    continue
+                # The response labels the unit in `columns`; the series name is
+                # the fallback for a response that omits it.
+                columns = series.get("columns") if isinstance(series.get("columns"), dict) else {}
+                unit_code = columns.get("unit_code") or suffix
                 latest = latest_sample(series.get("data") or [])
                 if latest is None:
                     continue
-                out.append((unit_code, latest))
+                out.append((unit_code, key, latest))
         return out
 
     def credits_remaining(self) -> float | None:
@@ -574,7 +654,11 @@ def unit_rows(facilities: list[dict], require_data: bool = True) -> list[dict]:
                     "unit": unit.get("code") or "",
                     "status": unit.get("status_id") or "",
                     "capacity_mwh": capacity,
-                    "power_mw": unit.get("capacity_registered"),
+                    # Named for what it is, not `power_mw`: `power_mw` is the
+                    # battery's *instantaneous* dispatch power from the data
+                    # endpoint, and the two would be silently interchangeable
+                    # when a sample row is built from this one.
+                    "registered_mw": unit.get("capacity_registered"),
                     "data_last_seen": unit.get("data_last_seen"),
                 }
             )
@@ -665,7 +749,15 @@ def poll_cycle(
     now: float,
     sleep_between: float = 0.0,
 ) -> dict:
-    """One request per in-scope facility, reduced to one SOC per battery."""
+    """One request per in-scope facility, reduced to one row per battery.
+
+    Each row carries both metrics, which arrive together in the same response:
+    `soc`/`stored_mwh`/`sampled_at` from `storage_battery`, and
+    `power_mw`/`power_sampled_at` from `power`. They are kept apart all the way
+    to the exposition because they age independently - one is an overnight
+    series and the other is not - and a single `sampled_at` cannot honestly
+    describe both.
+    """
     by_unit = {row["unit"]: row for row in rows}
     samples: list[dict] = []
     without_capacity = 0
@@ -673,7 +765,7 @@ def poll_cycle(
 
     for row in rows:
         try:
-            series = client.storage_battery(
+            series = client.battery_metrics(
                 row["facility"], row.get("network") or network, lookback_hours, now
             )
         except AuthError:
@@ -689,46 +781,54 @@ def poll_cycle(
                     soc=None,
                     stored_mwh=None,
                     sampled_at=None,
+                    power_mw=None,
+                    power_sampled_at=None,
                     scrape_success=False,
                 )
             )
             continue
 
-        matched = False
-        for unit_code, (stamp, mwh) in series:
+        values: dict[str, tuple[float, float]] = {}
+        for unit_code, key, (stamp, value) in series:
             known = by_unit.get(unit_code)
             if known is None or not known.get("capacity_mwh"):
-                # quirk 1: G1/L1 have no capacity, so no SOC exists for them.
+                # quirk 1: G1/L1 have no capacity, so no SOC exists for them -
+                # and nothing for power either, since the two travel together.
                 without_capacity += 1
+                continue
+            if unit_code != row["unit"]:
+                # Another in-scope unit of the same facility. It has its own
+                # request, and emitting it from this one too would put two
+                # samples with identical labels in a single exposition, which
+                # Prometheus rejects outright.
                 continue
             if now - stamp > max_sample_age:
                 too_stale += 1
                 continue
-            matched = True
-            samples.append(
-                dict(
-                    known,
-                    soc=max(0.0, min(1.0, mwh / known["capacity_mwh"])),
-                    stored_mwh=mwh,
-                    sampled_at=stamp,
-                    scrape_success=True,
-                )
+            values[key] = (stamp, value)
+
+        stored = values.get("storage")
+        power = values.get("power")
+        samples.append(
+            dict(
+                row,
+                soc=(
+                    None
+                    if stored is None
+                    else max(0.0, min(1.0, stored[1] / row["capacity_mwh"]))
+                ),
+                stored_mwh=None if stored is None else stored[1],
+                sampled_at=None if stored is None else stored[0],
+                power_mw=None if power is None else power[1],
+                power_sampled_at=None if power is None else power[0],
+                # The state-of-charge reading is what this flag has always
+                # meant and what the dashboard counts, so it stays tied to
+                # storage alone. Power is published independently: a battery can
+                # carry a power value here and still be unread for SOC, and that
+                # is a real combination rather than a failure.
+                scrape_success=stored is not None,
             )
-        if not matched and not any(
-            s["unit"] == row["unit"] and not s.get("scrape_success") for s in samples
-        ):
-            # The call succeeded but this battery's unit is absent from the
-            # response. Record it as unread so the gauge drops rather than
-            # silently disappearing with no flag.
-            samples.append(
-                dict(
-                    row,
-                    soc=None,
-                    stored_mwh=None,
-                    sampled_at=None,
-                    scrape_success=False,
-                )
-            )
+        )
         if sleep_between:
             time.sleep(sleep_between)
 
@@ -807,16 +907,46 @@ def render(state: dict, now: float) -> str:
         "capacity_mwh",
     )
     gauge(
+        "oe_battery_power_mw",
+        "Charge/discharge power of a NEM/WEM battery in MW, as published by the "
+        "power metric: positive is discharging to the network, negative is "
+        "charging. The series carry no unit, but the response block declares MW "
+        "and the exporter warns if it ever stops. The sign is not documented "
+        "upstream either - it is read off the data, where a charging battery "
+        "goes negative and a discharging one positive, and it is stated here "
+        "rather than assumed silently.",
+        "power_mw",
+    )
+    gauge(
         "oe_battery_last_sample_timestamp_seconds",
-        "Unix time of the observation behind the current reading.",
+        "Unix time of the observation behind the current state-of-charge reading.",
         "sampled_at",
     )
     gauge(
         "oe_battery_sample_age_seconds",
-        "Age of the newest published sample for this battery. Non-zero by design: "
-        "the feed only publishes overnight, so a daytime reading is hours old.",
+        "Age of the newest published sample for this battery's state of charge. "
+        "Non-zero by design: the storage_battery feed only publishes overnight, "
+        "so a daytime reading is hours old. This is the energy reading's age and "
+        "nothing else's - see oe_battery_power_sample_age_seconds.",
         "sampled_at",
         transform=lambda s, n: n - s["sampled_at"],
+    )
+    gauge(
+        "oe_battery_power_sample_timestamp_seconds",
+        "Unix time of the observation behind the current power value. Published "
+        "separately from oe_battery_last_sample_timestamp_seconds because the two "
+        "series age independently: storage_battery publishes overnight, power "
+        "updates through the day, so one timestamp cannot honestly cover both.",
+        "power_sampled_at",
+    )
+    gauge(
+        "oe_battery_power_sample_age_seconds",
+        "Age of the newest published power sample for this battery. Kept apart "
+        "from oe_battery_sample_age_seconds for the same reason - a battery with "
+        "yesterday's energy and today's power would otherwise look equally fresh "
+        "in both.",
+        "power_sampled_at",
+        transform=lambda s, n: n - s["power_sampled_at"],
     )
     gauge(
         "oe_battery_capacity_rank",
@@ -825,10 +955,13 @@ def render(state: dict, now: float) -> str:
     )
 
     lines.append(
-        "# HELP oe_battery_scrape_success Whether the last poll read this battery. "
-        "Carries the same labels as the reading metrics, not a reduced set, so "
-        "that a single Grafana variable selects the same batteries in every "
-        "panel and every table frame joins on the same key."
+        "# HELP oe_battery_scrape_success Whether the last poll read a usable "
+        "state-of-charge sample for this battery. Carries the same labels as the "
+        "reading metrics, not a reduced set, so that a single Grafana variable "
+        "selects the same batteries in every panel and every table frame joins on "
+        "the same key. It is about SOC only: oe_battery_power_mw is published "
+        "independently of this flag, so a unit can report power here and still "
+        "read 0."
     )
     lines.append("# TYPE oe_battery_scrape_success gauge")
     for sample in samples:
@@ -849,8 +982,11 @@ def render(state: dict, now: float) -> str:
     if idle_rows:
         lines.append(
             "# HELP oe_battery_idle_seconds Seconds since the newest usable "
-            "reading seen for this battery. A unit is dropped from scope once "
-            "this passes the idle limit."
+            "reading seen for this battery - state of charge or power, whichever "
+            "is more recent. A unit is dropped from scope once this passes the "
+            "idle limit, and counting either metric is deliberate: storage_battery "
+            "is an overnight series, so judging liveness on it alone would demote "
+            "batteries that are visibly dispatching."
         )
         lines.append("# TYPE oe_battery_idle_seconds gauge")
         for unit, row in sorted(idle_rows.items()):
@@ -864,8 +1000,8 @@ def render(state: dict, now: float) -> str:
         ("oe_batteries_enumerated", "Battery units in the fleet metadata with a positive storage capacity, after the dispatchability filter (see --include-undispatched)."),
         ("oe_batteries_in_scope", "Battery units selected for polling after applying the top-N limit and dropping units that have stopped publishing."),
         ("oe_batteries_demoted", "Candidate units dropped from scope because no usable reading has arrived within the idle limit. Their slots go to the next-largest candidate, so this counts batteries skipped, not slots lost."),
-        ("oe_batteries_monitored", "Battery units that returned a usable sample in the last poll."),
-        ("oe_battery_series_without_capacity", "Storage series returned upstream that have no capacity in the fleet metadata, so no SOC can be derived. Non-zero is expected: each battery facility also returns G1 and L1 series."),
+        ("oe_batteries_monitored", "Battery units that returned a usable state-of-charge sample in the last poll. This is a count of energy readings, not of polls: a unit can publish oe_battery_power_mw and still not be counted here, because storage_battery is an overnight series."),
+        ("oe_battery_series_without_capacity", "Storage or power series returned upstream whose unit has no capacity in the fleet metadata, so no SOC can be derived. Non-zero is expected: each battery facility also returns a G1 and an L1 series for each of the two metrics."),
         ("oe_battery_series_too_stale", "Samples dropped for being older than the maximum sample age."),
     )
     for metric, help_text in scalars:
@@ -1110,26 +1246,38 @@ class BatteryScraper:
         the clock, a battery polled hourly with a 36h publication gap would
         never look idle, and one polled against a 12h gap would look idle every
         afternoon.
+
+        Either metric counts, and the newer of the two wins. This is the one
+        place the ages are combined, and it has to be: the two series have
+        different publication habits - `storage_battery` carries values only
+        overnight, `power` updates all day - so judging liveness on storage
+        alone would demote a battery that is plainly dispatching and visible on
+        the power panel. It does *not* mean the sample is interchangeable: the
+        exported timestamps stay per-metric.
         """
         for sample in samples:
             unit = sample.get("unit")
             if not unit:
                 continue
-            if sample.get("scrape_success"):
-                stamp = sample.get("sampled_at") or now
-                # A clock skewed into the future would pin the unit as fresh
-                # forever, so never trust a stamp past the poll.
-                if stamp > now:
-                    stamp = now
-                previous = self._last_reading.get(unit)
-                if previous is None or stamp > previous:
-                    self._last_reading[unit] = stamp
-            else:
-                # First sight of a unit that returned nothing. Start its clock so
-                # it is judged from now rather than being immortal, but do not
-                # move an existing stamp - a failed poll must not reset progress
-                # towards dropping it.
+            observed = None
+            for key in ("sampled_at", "power_sampled_at"):
+                stamp = sample.get(key)
+                if isinstance(stamp, (int, float)) and not isinstance(stamp, bool):
+                    stamp = float(stamp)
+                    observed = stamp if observed is None else max(observed, stamp)
+            if observed is None:
+                # Nothing usable this poll. Start the clock for a unit seen for
+                # the first time so that it is judged from now rather than
+                # being immortal, but never move an existing stamp - a failed
+                # poll must not reset progress towards dropping it.
                 self._last_reading.setdefault(unit, now)
+                continue
+            # A clock skewed into the future would pin the unit as fresh
+            # forever, so never trust a stamp past the poll.
+            stamp = min(observed, now)
+            previous = self._last_reading.get(unit)
+            if previous is None or stamp > previous:
+                self._last_reading[unit] = stamp
 
     def _probe_demoted(self, rows: list[dict], demoted: list[dict], now: float) -> list[dict]:
         """Optionally re-ask a demoted unit whether it has started publishing.

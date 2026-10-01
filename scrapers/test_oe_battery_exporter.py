@@ -2,9 +2,9 @@
 """Tests for oe_battery_exporter.py.
 
 Offline: every upstream response is served from scrapers/fixtures/, sampled
-verbatim from api.openelectricity.org.au on 2026-09-30. No test touches the
-network. The `/me` fixture has the account's name, email and key id redacted -
-it is a committed file and the real ones were not.
+verbatim from api.openelectricity.org.au on 2026-09-30 and 2026-10-01. No test
+touches the network. The `/me` fixture has the account's name, email and key id
+redacted - it is a committed file and the real ones were not.
 
 From the repo root:
 
@@ -25,6 +25,12 @@ plausible wrong number rather than an obvious failure:
   2. The aggregate endpoint is a flat array with no unit attribution.
   3. The feed is legitimately sparse, so nulls must not read as 0%.
   4. Facilities 404, and WEM facilities 404 when queried as NEM.
+
+Two more properties are pinned by tests rather than by inspection, because
+neither shows up as a wrong-looking number on its own: `storage_battery` and
+`power` arrive in one request (the budget is counted in requests, so a second
+call per battery would double it), and they age independently - the real
+fixture has energy seven hours older than power for the same battery.
 """
 
 from __future__ import annotations
@@ -40,6 +46,7 @@ import threading
 import time
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import ThreadingHTTPServer
 from unittest import mock
@@ -58,6 +65,14 @@ WTAHB_CAPACITY_MWH = 1680.0
 # ERB01 series, and its timestamp.
 ERB_NEWEST_MWH = 334.768342
 ERB_NEWEST_TS = "2026-09-29T23:00:00+10:00"
+# Read out of oe_metrics_ERB.json, which is a real two-metric response captured
+# at 11:53 on 2026-10-01. It is the interesting shape: the overnight energy
+# series stops at 04:00 while the power series runs to 11:00, so the two are
+# seven hours apart in one payload.
+COMBINED_NEWEST_MWH = 124.1611
+COMBINED_NEWEST_TS = "2026-10-01T04:00:00+10:00"
+COMBINED_POWER_MW = -129.73099
+COMBINED_POWER_TS = "2026-10-01T11:00:00+10:00"
 # The two largest units in the whole fleet, both of which never dispatched.
 RICHMOND_CAPACITY_MWH = 2200.0
 TOMAGO_CAPACITY_MWH = 2000.0
@@ -78,6 +93,10 @@ def facilities() -> list:
 
 def storage_erb() -> dict:
     return fixture_json("oe_storage_battery_ERB.json")
+
+
+def metrics_erb() -> dict:
+    return fixture_json("oe_metrics_ERB.json")
 
 
 # --------------------------------------------------------------------------- #
@@ -326,7 +345,12 @@ class SelectTopTest(unittest.TestCase):
 
 
 class FakeClient:
-    """Stands in for OpenElectricityClient, keyed by facility code."""
+    """Stands in for OpenElectricityClient, keyed by facility code.
+
+    `series` is keyed by facility code and holds the same
+    `[(unit, "storage"|"power", (epoch, value))]` triples the real client
+    returns, so the tests exercise `poll_cycle` against the shape it will see.
+    """
 
     def __init__(self, series=None, error=None, credits=494):
         self.series = series or {}
@@ -335,7 +359,7 @@ class FakeClient:
         self.requests_made = 0
         self.calls = []
 
-    def storage_battery(self, facility_code, network, lookback_hours, now):
+    def battery_metrics(self, facility_code, network, lookback_hours, now):
         self.requests_made += 1
         self.calls.append((facility_code, network))
         if self.error:
@@ -351,12 +375,26 @@ def erb_row():
 
 
 def series_from_fixture(unit="ERB01"):
+    """The storage-only fixture, as the client would hand it over."""
     block = storage_erb()["data"][0]
     for result in block["results"]:
         if result["name"] == "storage_battery_%s" % unit:
             newest = exporter.latest_sample(result["data"])
-            return [(unit, newest)]
+            return [(unit, "storage", newest)]
     raise AssertionError("fixture has no series %s" % unit)
+
+
+def both_metrics(unit="ERB01", stored_at=ERB_NEWEST_TS, stored_mwh=100.0,
+                 power=-246.4, power_at=None):
+    """One unit publishing both metrics, each with its own timestamp.
+
+    `power_at` defaults to `stored_at`; pass it separately for the case that
+    matters most, which is the two series being different ages.
+    """
+    return [
+        (unit, "storage", (exporter.parse_timestamp(stored_at), stored_mwh)),
+        (unit, "power", (exporter.parse_timestamp(power_at or stored_at), power)),
+    ]
 
 
 class PollCycleTest(unittest.TestCase):
@@ -387,8 +425,8 @@ class PollCycleTest(unittest.TestCase):
 
     def test_extra_series_without_capacity_are_counted_not_dropped_silently(self):
         series = series_from_fixture() + [
-            ("ERBG1", (self.now, 999.0)),
-            ("ERBL1", (self.now, 888.0)),
+            ("ERBG1", "storage", (self.now, 999.0)),
+            ("ERBL1", "power", (self.now, 888.0)),
         ]
         result = self.cycle(FakeClient(series={"ERB": series}))
         self.assertEqual(len(result["samples"]), 1)
@@ -403,8 +441,9 @@ class PollCycleTest(unittest.TestCase):
         """quirk 4: absent facilities are an expected answer."""
         client = FakeClient(error=ScrapeError("GET ... -> HTTP 404: No data"))
         result = self.cycle(client)
-        self.assertEqual(result["samples"][0]["scrape_success"], False)
+        self.assertFalse(result["samples"][0]["scrape_success"])
         self.assertIsNone(result["samples"][0]["soc"])
+        self.assertIsNone(result["samples"][0]["power_mw"])
 
     def test_auth_error_propagates(self):
         client = FakeClient(error=AuthError("HTTP 403"))
@@ -419,14 +458,14 @@ class PollCycleTest(unittest.TestCase):
             error=None,
         )
 
-        def storage(facility_code, network, lookback_hours, now):
+        def metrics(facility_code, network, lookback_hours, now):
             client.requests_made += 1
             client.calls.append((facility_code, network))
             if facility_code == "WTAHB":
                 raise ScrapeError("HTTP 404: No data")
             return client.series.get(facility_code, [])
 
-        client.storage_battery = storage
+        client.battery_metrics = metrics
         result = exporter.poll_cycle(client, rows, "NEM", 12, exporter.DEFAULT_MAX_SAMPLE_AGE, self.now)
         by_facility = {s["facility"]: s for s in result["samples"]}
         self.assertTrue(by_facility["ERB"]["scrape_success"])
@@ -435,17 +474,23 @@ class PollCycleTest(unittest.TestCase):
 
     def test_soc_is_clamped_to_zero_one(self):
         for mwh, expected in ((-50.0, 0.0), (ERB_CAPACITY_MWH * 3, 1.0)):
-            series = [("ERB01", (self.now, mwh))]
+            series = [("ERB01", "storage", (self.now, mwh))]
             result = self.cycle(FakeClient(series={"ERB": series}))
             self.assertEqual(result["samples"][0]["soc"], expected)
 
     def test_sample_older_than_max_age_is_dropped(self):
         old = (self.now - 48 * 3600, 500.0)
         result = self.cycle(
-            FakeClient(series={"ERB": [("ERB01", old)]}), max_age=36 * 3600
+            FakeClient(series={"ERB": [("ERB01", "storage", old)]}), max_age=36 * 3600
         )
         self.assertEqual(result["series_too_stale"], 1)
         self.assertFalse(result["samples"][0]["scrape_success"])
+
+    def test_empty_response_leaves_the_battery_unread(self):
+        result = self.cycle(FakeClient(series={"ERB": []}))
+        self.assertEqual(len(result["samples"]), 1)
+        self.assertFalse(result["samples"][0]["scrape_success"])
+
 
     def test_empty_response_leaves_the_battery_unread(self):
         result = self.cycle(FakeClient(series={"ERB": []}))
@@ -456,6 +501,115 @@ class PollCycleTest(unittest.TestCase):
         client = FakeClient(series={"ERB": []})
         result = self.cycle(client)
         self.assertEqual(result["series_without_capacity"], 0)
+
+    # -- power ---------------------------------------------------------------- #
+
+    def test_power_is_exported_with_a_timestamp_of_its_own(self):
+        """The two series age independently, so they cannot share a stamp.
+
+        storage_battery stops at 04:00 and power runs to 11:00, which is the
+        normal state of this feed seven hours out of ten. Collapsing them into
+        one timestamp would make a seven-hour-old SOC claim to be current.
+        """
+        stored_at = "2026-10-01T04:00:00+10:00"
+        power_at = "2026-10-01T11:00:00+10:00"
+        result = self.cycle(
+            FakeClient(
+                series={
+                    "ERB": both_metrics(
+                        stored_at=stored_at, stored_mwh=COMBINED_NEWEST_MWH,
+                        power=COMBINED_POWER_MW, power_at=power_at,
+                    )
+                }
+            )
+        )
+        sample = result["samples"][0]
+        self.assertEqual(sample["sampled_at"], exporter.parse_timestamp(stored_at))
+        self.assertAlmostEqual(sample["power_mw"], COMBINED_POWER_MW, places=6)
+        self.assertEqual(sample["power_sampled_at"], exporter.parse_timestamp(power_at))
+
+    def test_both_metrics_cost_one_request(self):
+        """The budget is counted in requests, so power must not add one."""
+        client = FakeClient(
+            series={"ERB": both_metrics(stored_at=COMBINED_NEWEST_TS, power=123.4,
+                                        power_at=COMBINED_POWER_TS)}
+        )
+        self.cycle(client)
+        self.assertEqual(client.requests_made, 1)
+
+    def test_power_survives_a_daytime_window_with_no_energy_reading(self):
+        """The real daytime case: storage is all null, power is current.
+
+        This is a successful poll of a healthy battery, not a failure, so the
+        power value is exported even though there is no SOC to go with it.
+        """
+        at = COMBINED_POWER_TS
+        result = self.cycle(
+            FakeClient(series={"ERB": [("ERB01", "power", (exporter.parse_timestamp(at), -129.7))]})
+        )
+        sample = result["samples"][0]
+        self.assertAlmostEqual(sample["power_mw"], -129.7, places=6)
+        self.assertIsNone(sample["soc"])
+        self.assertIsNone(sample["sampled_at"])
+        # The flag is about SOC, so it stays 0 - but the power gauge is there.
+        self.assertFalse(sample["scrape_success"])
+
+    def test_energy_without_power_leaves_the_power_metric_empty(self):
+        """Not every facility publishes both, and absence is not zero."""
+        result = self.cycle(FakeClient(series={"ERB": series_from_fixture()}))
+        sample = result["samples"][0]
+        self.assertIsNone(sample["power_mw"])
+        self.assertIsNone(sample["power_sampled_at"])
+        self.assertTrue(sample["scrape_success"])
+
+    def test_a_negative_power_value_is_passed_through(self):
+        """Negative is charging, and clamping it away would invert the sign.
+
+        A clamp that turned -246 MW into 0 would make a charging battery
+        indistinguishable from an idle one.
+        """
+        result = self.cycle(
+            FakeClient(series={"ERB": [("ERB01", "power", (self.now, -246.4))]})
+        )
+        self.assertAlmostEqual(result["samples"][0]["power_mw"], -246.4, places=6)
+
+    def test_stale_power_is_dropped_without_costing_the_energy_reading(self):
+        old = (self.now - 48 * 3600, 500.0)
+        result = self.cycle(
+            FakeClient(series={"ERB": series_from_fixture() + [("ERB01", "power", old)]}),
+            max_age=36 * 3600,
+        )
+        sample = result["samples"][0]
+        self.assertEqual(result["series_too_stale"], 1)
+        self.assertIsNone(sample["power_mw"])
+        self.assertAlmostEqual(sample["stored_mwh"], ERB_NEWEST_MWH, places=6)
+        self.assertTrue(sample["scrape_success"])
+
+    def test_a_second_unit_of_the_same_facility_is_not_exported_twice(self):
+        """Two in-scope units, one request each, one sample each.
+
+        The response for a facility carries every unit that facility owns, so
+        without this check each of those units would be emitted twice per
+        request - and two samples with identical labels in one exposition is
+        something Prometheus rejects, not merely untidy.
+        """
+        rows = [dict(self.row, unit="ERB01"), dict(self.row, unit="ERBX1")]
+        series = [
+            ("ERB01", "storage", (self.now, 100.0)),
+            ("ERB01", "power", (self.now, 10.0)),
+            ("ERBX1", "storage", (self.now, 50.0)),
+            ("ERBX1", "power", (self.now, -20.0)),
+        ]
+        result = exporter.poll_cycle(
+            FakeClient(series={"ERB": series}), rows, "NEM", 12,
+            exporter.DEFAULT_MAX_SAMPLE_AGE, self.now,
+        )
+        units = [s["unit"] for s in result["samples"]]
+        self.assertEqual(sorted(units), ["ERB01", "ERBX1"])
+        self.assertEqual(len(units), len(set(units)))
+        self.assertAlmostEqual(
+            next(s for s in result["samples"] if s["unit"] == "ERBX1")["power_mw"], -20.0
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -474,6 +628,10 @@ def sample(**over):
         "soc": 0.1676,
         "stored_mwh": ERB_NEWEST_MWH,
         "sampled_at": 1790686800.0,
+        # A power reading seven hours newer than the energy one, which is the
+        # ordinary state of this feed rather than an edge case.
+        "power_mw": COMBINED_POWER_MW,
+        "power_sampled_at": 1790710800.0,
         "scrape_success": True,
         "rank": 1,
     }
@@ -485,9 +643,9 @@ def state(samples=None, **over):
     base = {
         "samples": samples if samples is not None else [sample()],
         "oe_batteries_enumerated": 74,
-        "oe_batteries_in_scope": 10,
+        "oe_batteries_in_scope": 12,
         "oe_batteries_monitored": 1,
-        "oe_battery_series_without_capacity": 2,
+        "oe_battery_series_without_capacity": 4,
         "oe_battery_series_too_stale": 0,
         "oe_battery_fleet_capacity_mwh": 32085.47,
         "oe_battery_monitored_capacity_mwh": ERB_CAPACITY_MWH,
@@ -495,10 +653,24 @@ def state(samples=None, **over):
         "oe_last_poll_timestamp_seconds": 1790742930.0,
         "oe_last_fleet_refresh_timestamp_seconds": 1790742926.0,
         "oe_api_credits_remaining": 494,
-        "oe_api_requests_total": 12,
+        "oe_api_requests_total": 13,
     }
     base.update(over)
     return base
+
+
+PER_BATTERY_METRICS = (
+    "oe_battery_soc_ratio",
+    "oe_battery_energy_stored_mwh",
+    "oe_battery_capacity_storage_mwh",
+    "oe_battery_power_mw",
+    "oe_battery_last_sample_timestamp_seconds",
+    "oe_battery_sample_age_seconds",
+    "oe_battery_power_sample_timestamp_seconds",
+    "oe_battery_power_sample_age_seconds",
+    "oe_battery_capacity_rank",
+    "oe_battery_scrape_success",
+)
 
 
 class RenderTest(unittest.TestCase):
@@ -518,15 +690,7 @@ class RenderTest(unittest.TestCase):
                 )
 
     def test_help_and_type_appear_exactly_once(self):
-        for metric in (
-            "oe_battery_soc_ratio",
-            "oe_battery_energy_stored_mwh",
-            "oe_battery_capacity_storage_mwh",
-            "oe_battery_last_sample_timestamp_seconds",
-            "oe_battery_sample_age_seconds",
-            "oe_battery_capacity_rank",
-            "oe_battery_scrape_success",
-        ):
+        for metric in PER_BATTERY_METRICS:
             self.assertEqual(self.text.count("# HELP %s " % metric), 1, metric)
             self.assertEqual(self.text.count("# TYPE %s " % metric), 1, metric)
 
@@ -539,19 +703,48 @@ class RenderTest(unittest.TestCase):
                       'region="NSW1"', 'status="operating"'):
             self.assertIn(label, line)
 
+    def test_power_is_exported_in_megawatts(self):
+        line = self.lines_named("oe_battery_power_mw")[0]
+        self.assertAlmostEqual(
+            float(line.rsplit(" ", 1)[1]), COMBINED_POWER_MW, places=6
+        )
+        self.assertIn('unit="ERB01"', line)
+
+    def test_a_charging_battery_keeps_its_negative_value(self):
+        """The sign is the reading: negative is charging, not an error."""
+        line = self.lines_named("oe_battery_power_mw")[0]
+        self.assertTrue(line.endswith(" -%s" % abs(COMBINED_POWER_MW)), line)
+
+    def test_the_power_age_is_computed_from_the_power_timestamp(self):
+        """Not from the energy timestamp, which is seven hours older here."""
+        line = self.lines_named("oe_battery_power_sample_age_seconds")[0]
+        self.assertAlmostEqual(
+            float(line.rsplit(" ", 1)[1]), self.now - 1790710800.0, places=3
+        )
+        age_of_energy = self.lines_named("oe_battery_sample_age_seconds")[0]
+        self.assertGreater(
+            float(age_of_energy.rsplit(" ", 1)[1]), float(line.rsplit(" ", 1)[1])
+        )
+
     def test_missing_value_is_omitted_not_zero(self):
         """A battery that could not be read has an unknown SOC.
 
         Emitting 0 would read as "flat and empty" on the dashboard, which is a
         different and much more alarming claim than "no reading".
         """
-        unread = sample(soc=None, stored_mwh=None, sampled_at=None, scrape_success=False)
+        unread = sample(
+            soc=None, stored_mwh=None, sampled_at=None,
+            power_mw=None, power_sampled_at=None, scrape_success=False,
+        )
         text = exporter.render(state([unread]), self.now)
         for metric in (
             "oe_battery_soc_ratio",
             "oe_battery_energy_stored_mwh",
             "oe_battery_last_sample_timestamp_seconds",
             "oe_battery_sample_age_seconds",
+            "oe_battery_power_mw",
+            "oe_battery_power_sample_timestamp_seconds",
+            "oe_battery_power_sample_age_seconds",
         ):
             self.assertEqual(
                 [l for l in text.splitlines() if l.startswith(metric + "{")], [], metric
@@ -561,6 +754,28 @@ class RenderTest(unittest.TestCase):
         self.assertEqual(
             len([l for l in text.splitlines()
                  if l.startswith("oe_battery_capacity_storage_mwh{")]), 1
+        )
+        self.assertIn(
+            'oe_battery_scrape_success{facility="ERB",unit="ERB01",name="Eraring",'
+            'region="NSW1",status="operating"} 0',
+            text,
+        )
+
+    def test_power_is_exported_even_when_the_soc_reading_is_not(self):
+        """The daytime case: energy silent, power current, SOC flag still 0.
+
+        The two flags disagreeing is correct and informative here, which is why
+        they are separate metrics rather than one "is it alive" boolean.
+        """
+        text = exporter.render(
+            state([sample(soc=None, stored_mwh=None, sampled_at=None, scrape_success=False)]),
+            self.now,
+        )
+        power = [l for l in text.splitlines() if l.startswith("oe_battery_power_mw{")]
+        self.assertEqual(len(power), 1, power)
+        self.assertAlmostEqual(float(power[0].rsplit(" ", 1)[1]), COMBINED_POWER_MW, places=6)
+        self.assertEqual(
+            [l for l in text.splitlines() if l.startswith("oe_battery_soc_ratio{")], []
         )
         self.assertIn(
             'oe_battery_scrape_success{facility="ERB",unit="ERB01",name="Eraring",'
@@ -588,15 +803,7 @@ class RenderTest(unittest.TestCase):
         cannot join on `unit` because the field is not there.
         """
         expected = 'facility="ERB",unit="ERB01",name="Eraring",region="NSW1",status="operating"'
-        for metric in (
-            "oe_battery_soc_ratio",
-            "oe_battery_energy_stored_mwh",
-            "oe_battery_capacity_storage_mwh",
-            "oe_battery_last_sample_timestamp_seconds",
-            "oe_battery_sample_age_seconds",
-            "oe_battery_capacity_rank",
-            "oe_battery_scrape_success",
-        ):
+        for metric in PER_BATTERY_METRICS:
             line = [l for l in self.text.splitlines() if l.startswith(metric + "{")]
             self.assertEqual(len(line), 1, metric)
             self.assertEqual(line[0].split(" ", 1)[0], "%s{%s}" % (metric, expected), metric)
@@ -696,9 +903,154 @@ class ClientTest(unittest.TestCase):
             "error": "No data available for facility=['X'] in the specified time range",
         }
         with self.assertRaises(ScrapeError) as ctx:
-            client.storage_battery("X", "NEM", 12, 1790686800.0)
+            client.battery_metrics("X", "NEM", 12, 1790686800.0)
         self.assertIn("No data available", str(ctx.exception))
         client._request = original
+
+    # -- battery_metrics ------------------------------------------------------ #
+
+    def answering(self, payload):
+        """A client whose single request is answered with `payload`, URL kept."""
+        client = self._client()
+        seen = {}
+
+        def fake(url):
+            seen["url"] = url
+            return payload
+
+        client._request = fake
+        return client, seen
+
+    def test_both_metrics_are_asked_for_in_one_request(self):
+        """The request budget is counted in requests, so this must stay one.
+
+        Two `metrics` parameters is the API's own multi-metric shape; asking
+        twice would cost a second request per battery per cycle and double a
+        budget that is already the binding constraint.
+        """
+        client, seen = self.answering({"success": True, "data": []})
+        client.battery_metrics("ERB", "NEM", 12, 1790686800.0)
+        pairs = urllib.parse.parse_qsl(urllib.parse.urlparse(seen["url"]).query)
+        self.assertEqual(
+            [value for name, value in pairs if name == "metrics"], ["storage_battery", "power"]
+        )
+        self.assertEqual([v for k, v in pairs if k == "facility_code"], ["ERB"])
+        self.assertEqual(
+            [v for k, v in pairs if k == "interval"], ["1h"]
+        )
+
+    def test_the_real_two_metric_response_splits_into_both_metrics(self):
+        """Parsed against a captured response, not a hand-built one.
+
+        The fixture is the interesting shape: energy stops at 04:00 and power
+        runs to 11:00 for the same battery, so a parser that kept one timestamp
+        per facility would lose seven hours of information silently.
+        """
+        client, _ = self.answering(metrics_erb())
+        series = client.battery_metrics("ERB", "NEM", 13, 1790816400.0)
+        by_key = {(unit, key): (stamp, value) for unit, key, (stamp, value) in series}
+        self.assertEqual(
+            sorted((unit, key) for unit, key in by_key),
+            [
+                ("ERB01", "power"), ("ERB01", "storage"),
+                ("ERBG01", "power"), ("ERBG01", "storage"),
+                ("ERBL01", "power"), ("ERBL01", "storage"),
+            ],
+        )
+        stored_at, stored = by_key[("ERB01", "storage")]
+        self.assertEqual(stored_at, exporter.parse_timestamp(COMBINED_NEWEST_TS))
+        self.assertAlmostEqual(stored, COMBINED_NEWEST_MWH, places=6)
+        power_at, power = by_key[("ERB01", "power")]
+        self.assertEqual(power_at, exporter.parse_timestamp(COMBINED_POWER_TS))
+        self.assertAlmostEqual(power, COMBINED_POWER_MW, places=6)
+        # The point of asking for both: the power sample is seven hours newer
+        # than the energy sample for the very same unit.
+        self.assertEqual(power_at - stored_at, 7 * 3600)
+
+    def test_the_unit_code_is_read_from_the_columns_block(self):
+        """`columns: {unit_code: ...}` is the upstream's own attribution."""
+        client, _ = self.answering(metrics_erb())
+        series = client.battery_metrics("ERB", "NEM", 13, 1790816400.0)
+        self.assertIn(("ERB01", "storage"), [(u, k) for u, k, _ in series])
+
+    def test_the_series_name_is_used_when_columns_are_absent(self):
+        client, _ = self.answering(
+            {
+                "success": True,
+                "data": [
+                    {
+                        "metric": "power",
+                        "unit": "MW",
+                        "results": [
+                            {
+                                "name": "power_ERB01",
+                                "data": [[COMBINED_POWER_TS, COMBINED_POWER_MW]],
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+        series = client.battery_metrics("ERB", "NEM", 13, 1790816400.0)
+        self.assertEqual([u for u, _, _ in series], ["ERB01"])
+
+    def test_an_unexpected_unit_on_a_block_is_warned_about(self):
+        """The exported metric name claims MW, so a change of unit must be named.
+
+        It is a warning rather than a failure: refusing to export would hide the
+        drift, and the value is still more use than nothing - but a silent unit
+        change would plot as a plausible line a factor of 1000 out.
+        """
+        payload = metrics_erb()
+        for block in payload["data"]:
+            if block["metric"] == "power":
+                block["unit"] = "kW"
+        client, _ = self.answering(payload)
+        with self.assertLogs(exporter.log, level="WARNING") as caught:
+            series = client.battery_metrics("ERB", "NEM", 13, 1790816400.0)
+        self.assertTrue(any("kW" in line for line in caught.output), caught.output)
+        # Still exported, still in the documented unit.
+        self.assertTrue(any(key == "power" for _, key, _ in series))
+
+    def test_an_unrecognised_series_name_is_ignored(self):
+        client, _ = self.answering(
+            {
+                "success": True,
+                "data": [
+                    {
+                        "metric": "demand",
+                        "unit": "MW",
+                        "results": [
+                            {"name": "demand_ERB01", "data": [[COMBINED_POWER_TS, 5.0]]}
+                        ],
+                    }
+                ],
+            }
+        )
+        with self.assertLogs(exporter.log, level="DEBUG"):
+            self.assertEqual(client.battery_metrics("ERB", "NEM", 13, 1790816400.0), [])
+
+    def test_a_series_of_nothing_but_nulls_is_dropped(self):
+        """quirk 3 again, one metric down: no non-null point, no series."""
+        client, _ = self.answering(
+            {
+                "success": True,
+                "data": [
+                    {
+                        "metric": "power",
+                        "unit": "MW",
+                        "results": [
+                            {
+                                "name": "power_ERB01",
+                                "columns": {"unit_code": "ERB01"},
+                                "data": [[COMBINED_POWER_TS, None]],
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+        self.assertEqual(client.battery_metrics("ERB", "NEM", 13, 1790816400.0), [])
 
     def test_missing_data_key_is_an_empty_list(self):
         client = self._client()
@@ -794,11 +1146,17 @@ def make_scraper(client, **kwargs):
 
 class ScraperTest(unittest.TestCase):
     def test_poll_once_produces_exposition(self):
-        client = ScraperClient(series={"ERB": series_from_fixture()})
-        scraper = make_scraper(client)
+        # The clock is pinned to just after the fixture's newest sample rather
+        # than left on wall time: the fixture is a real response from a real
+        # evening, and it silently aged past `--max-sample-age` until this test
+        # started failing for a reason that had nothing to do with the code.
+        now = exporter.parse_timestamp(ERB_NEWEST_TS) + 3600.0
+        client = ScraperClient(series={"ERB": both_metrics(stored_at=ERB_NEWEST_TS)})
+        scraper = make_scraper(client, now_fn=lambda: now)
         body, ok = scraper.poll_once()
         self.assertTrue(ok)
         self.assertIn("oe_battery_soc_ratio{facility=\"ERB\"", body)
+        self.assertIn("oe_battery_power_mw{facility=\"ERB\"", body)
         self.assertIn("oe_batteries_in_scope 3", body)
 
     def test_metrics_are_served_before_the_first_poll(self):
@@ -1155,6 +1513,46 @@ class RecordReadingsTest(unittest.TestCase):
         )
         self.assertEqual(scraper._last_reading["A1"], self.NOW)
 
+    def test_a_power_reading_on_its_own_keeps_the_unit_alive(self):
+        """The daytime case: energy silent, power current.
+
+        Judging liveness on storage alone would let a battery that is visibly
+        dispatching on the power panel be demoted out of scope.
+        """
+        scraper = self.scraper()
+        scraper._record_readings(
+            [{"unit": "A1", "sampled_at": None, "power_sampled_at": self.NOW - 1800}], self.NOW
+        )
+        self.assertEqual(scraper._last_reading["A1"], self.NOW - 1800)
+
+    def test_the_newer_of_the_two_metrics_is_the_one_that_counts(self):
+        scraper = self.scraper()
+        scraper._record_readings(
+            [{"unit": "A1", "sampled_at": self.NOW - 7 * 3600,
+              "power_sampled_at": self.NOW - 3600}],
+            self.NOW,
+        )
+        self.assertEqual(scraper._last_reading["A1"], self.NOW - 3600)
+
+    def test_an_older_power_sample_does_not_move_the_stamp_backwards(self):
+        """Energy fresher than power is unusual but must not reset liveness."""
+        scraper = self.scraper()
+        scraper._last_reading["A1"] = self.NOW - 60
+        scraper._record_readings(
+            [{"unit": "A1", "sampled_at": self.NOW - 3600,
+              "power_sampled_at": self.NOW - 7200}],
+            self.NOW,
+        )
+        self.assertEqual(scraper._last_reading["A1"], self.NOW - 60)
+
+    def test_a_future_power_stamp_is_clamped(self):
+        scraper = self.scraper()
+        scraper._record_readings(
+            [{"unit": "A1", "sampled_at": None, "power_sampled_at": self.NOW + 86400}],
+            self.NOW,
+        )
+        self.assertEqual(scraper._last_reading["A1"], self.NOW)
+
 
 class RotationBase(unittest.TestCase):
     """End to end through poll_once, against a clock the test moves.
@@ -1229,10 +1627,10 @@ class RotationBase(unittest.TestCase):
             bodies.append(self.cycle_at(first + index * self.HOUR))
         return bodies[-1], bodies
 
-    def static(self, publishing, age_hours=0.5):
-        """A fake where the named facilities publish a reading `age_hours` old."""
+    def static(self, publishing, age_hours=0.5, key="storage", value=100.0):
+        """A fake where the named facilities publish one metric `age_hours` old."""
         return lambda now: {
-            code: [(code + "1", (now - age_hours * self.HOUR, 100.0))]
+            code: [(code + "1", key, (now - age_hours * self.HOUR, value))]
             for code in publishing
         }
 
@@ -1270,7 +1668,7 @@ class RotationTest(RotationBase):
         def overnight_publishers(now):
             stamp = self.overnight(now)
             return {
-                code: [(code + "1", (stamp, 100.0))] for code in ("AAA", "BBB")
+                code: [(code + "1", "storage", (stamp, 100.0))] for code in ("AAA", "BBB")
             }
 
         client = self.fleet_client(overnight_publishers)
@@ -1301,6 +1699,33 @@ class RotationTest(RotationBase):
         body = self.cycle_at(start + 37 * self.HOUR)
         self.assertIn("oe_batteries_demoted 2", body)
         self.assertEqual(self.scope_units(body), ["CCC1", "DDD1"])
+
+    def test_a_battery_that_still_publishes_power_keeps_its_slot(self):
+        """Liveness follows whichever metric is fresher.
+
+        `storage_battery` can go days without publishing anything while `power`
+        keeps updating all day. A battery in that state is dispatching, not dead,
+        so rotating its slot away would drop a working battery off the board to
+        make room for another one that is equally alive.
+        """
+
+        def power_only_publishers(now):
+            # AAA has no energy reading for days, but power as fresh as ever.
+            return {
+                "AAA": [("AAA1", "power", (now - 1800.0, -246.4))],
+                "BBB": [("BBB1", "storage", (self.overnight(now), 100.0))],
+            }
+
+        client = self.fleet_client(power_only_publishers)
+        _, bodies = self.run_hours(client, 40)
+        final = bodies[-1]
+        self.assertIn("oe_batteries_demoted 0", final)
+        self.assertEqual(self.scope_units(final), ["AAA1", "BBB1"])
+        # It is in scope and publishing power, but it has no SOC to report - the
+        # two are separate facts and the exporter says so rather than guessing.
+        self.assertNotIn('oe_battery_soc_ratio{facility="AAA"', final)
+        self.assertIn('oe_battery_power_mw{facility="AAA",unit="AAA1"', final)
+        self.assertIn('oe_battery_scrape_success{facility="AAA",unit="AAA1"', final)
 
     def test_idle_seconds_are_exported_for_in_scope_and_demoted_units(self):
         client = self.fleet_client(self.static([]))

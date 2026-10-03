@@ -28,6 +28,14 @@ OUT = os.path.join(
 INSTANT = "last_over_time(%s[2h])"
 SEL = "name=~\"$battery\""
 
+# Mirrors `--max-infer-hours` in docker-compose.yml, drawn as the threshold
+# line on the anchor-age panel. Past this the exporter stops publishing an
+# inferred SOC altogether, so it is the line that explains a missing dashed line.
+# Kept as a constant here rather than a metric because it is deployment
+# configuration, not an observation - if the two ever disagree, this is the one
+# to change.
+MAX_INFER_HOURS = 48.0
+
 
 def target(expr, refid="A", instant=True, legend="{{name}}", fmt=None):
     out = {
@@ -375,6 +383,16 @@ panels: a reading older than a day means the feed went quiet, not that the \
 battery emptied. The SOC series is **omitted** rather than zeroed when a battery \
 cannot be read, so a missing bar means "no reading", never "flat and empty".
 
+**One panel on this board is synthetic, and says so.** `State of charge: \
+measured vs inferred` plots the measured line solid and a dead-reckoned one \
+dashed: the exporter anchors on each battery's last measured energy and \
+integrates its power from there. It exists because the sparse feed above leaves \
+the board flat from dawn until the next night, but it is **not an upstream \
+reading** and it does not last all day - it is published only for the first few \
+hours after a measured reading, then stops rather than drift further. Every \
+other SOC panel on this board is measured. Judge the method on that one panel \
+before trusting it anywhere.
+
 **This is the largest N batteries that have ever reported**, not the largest N \
 batteries in Australia. Of the ten highest-capacity units in the fleet metadata, \
 seven are `committed` and have never dispatched - Richmond Valley (2200 MWh), \
@@ -606,8 +624,63 @@ panels.append(
 
 panels.append(
     timeseries(
+        "State of charge: measured vs inferred",
+        {"h": 11, "w": 24, "x": 0, "y": 36},
+        [
+            target("100 * oe_battery_soc_ratio{%s}" % SEL, refid="A", instant=False,
+                   legend="{{name}} ({{facility}}) measured"),
+            target("100 * oe_battery_soc_inferred_ratio{%s}" % SEL, refid="B",
+                   instant=False, legend="{{name}} ({{facility}}) inferred"),
+        ],
+        "**Not an upstream reading.** The dashed lines are dead-reckoned by the "
+        "exporter: it anchors on each battery's last *measured* energy and "
+        "integrates its charge/discharge power from there, discounted by the "
+        "configured charging efficiency. The solid lines are the real thing.\n\n"
+        "The two families never overlap - while a measured reading is younger "
+        "than `--infer-fresh-hours` no inferred value is published at all - so "
+        "the handover is a clean handoff rather than two lines competing for the "
+        "same battery.\n\n"
+        "**Accuracy decays with age, and the panel shows the whole window on "
+        "purpose.** Each overnight reading restarts the estimate, so the dashed "
+        "line is most trustworthy just after it appears and drifts from there. "
+        "Measured against the live feed over four days at 5-minute resolution: "
+        "~0.4% of capacity after 1 hour, ~1.5% at 6, ~1.8% at 8, ~5% at 14 - the "
+        "full overnight gap. So the line runs all day rather than stopping while "
+        "the battery is still moving, trading a few percent of drift late in the "
+        "window for continuous coverage. The cap is still there as a backstop: a "
+        "dashed line that stops is `--max-infer-hours` working, not a fault. A "
+        "line pinned flat at 0% or 100% is not a full or empty battery either - "
+        "that is the estimate hitting its capacity bound.\n\n"
+        "**Between polls the line is partly extrapolated.** The newest power "
+        "sample is carried forward and scaled by real elapsed time, so the "
+        "value tracks the clock instead of stepping once an hour; each new "
+        "sample re-anchors it. `oe_battery_inferred_hold_hours` reports how much "
+        "of the value is carried rather than integrated - minutes in normal "
+        "operation, and it rising toward the cap means the power feed has "
+        "stopped arriving rather than that the battery has.\n\n"
+        "`oe_battery_inferred_saturated` and `oe_battery_inferred_age_seconds` quantify "
+        "both of those, and this panel is the one to judge the method on; the SOC "
+        "panel above remains the measured view.",
+        unit="percent",
+        axis="% full",
+        decimals=1,
+        span_nulls=False,
+        min_=0,
+        max_=100,
+        overrides=[
+            # Dashed so the synthetic family can never be mistaken for the
+            # measured one at a glance, whatever colours the palette picks.
+            override({"id": "byRegexp", "options": ".*inferred"},
+                     [("custom.lineStyle", {"fill": "dash"}),
+                      ("custom.lineWidth", 1)]),
+        ],
+    )
+)
+
+panels.append(
+    timeseries(
         "Charge and discharge power",
-        {"h": 10, "w": 24, "x": 0, "y": 36},
+        {"h": 10, "w": 24, "x": 0, "y": 47},
         [target("oe_battery_power_mw{%s}" % SEL, instant=False,
                 legend="{{name}} ({{facility}})")],
         "Charge and discharge power per battery in MW, from the upstream `power` "
@@ -640,7 +713,7 @@ panels.append(
 panels.append(
     timeseries(
         "Energy stored, GWh",
-        {"h": 9, "w": 12, "x": 0, "y": 46},
+        {"h": 9, "w": 12, "x": 0, "y": 57},
         [target("oe_battery_energy_stored_mwh{%s} / 1000" % SEL, instant=False,
                 legend="{{name}} ({{facility}})")],
         "Stored energy, exactly as the upstream publishes it but divided by 1000 "
@@ -662,7 +735,7 @@ panels.append(
 panels.append(
     timeseries(
         "Sample age",
-        {"h": 9, "w": 12, "x": 12, "y": 46},
+        {"h": 9, "w": 12, "x": 12, "y": 57},
         [
             target("oe_battery_sample_age_seconds{%s}" % SEL, refid="A", instant=False,
                    legend="{{name}} (energy)"),
@@ -685,8 +758,42 @@ panels.append(
 
 panels.append(
     timeseries(
+        "Inference anchor age",
+        {"h": 9, "w": 24, "x": 0, "y": 66},
+        [
+            target("max by (unit) (oe_battery_anchor_age_hours{%s})" % SEL, refid="A",
+                   instant=False, legend="{{name}}"),
+            target("vector(%s)" % MAX_INFER_HOURS, refid="B", instant=False,
+                   legend="--max-infer-hours"),
+        ],
+        "How far back the measured reading that inferred SOC integrates away from "
+        "is, in hours. The **sawtooth** is the normal overnight publication "
+        "window resetting each day - same shape as the energy line in `Sample "
+        "age`, and for the same reason.\n\n"
+        "The line that matters is one that **climbs without resetting**. That is "
+        "upstream `storage_battery` not publishing, and it is why the dashed line "
+        "in `measured vs inferred` goes missing: `--max-infer-hours` is a hard "
+        "cut-off, not a degradation, so past the threshold the exporter stops "
+        "publishing an estimate entirely rather than publishing a worse one. The "
+        "grey **%s** line is that threshold. Before this panel existed, a missing "
+        "dashed line was indistinguishable from a battery having no data at all.\n\n"
+        "Read it as the evidence it is: the anchor is identical across units when "
+        "the whole feed stalled, and staggered when individual batteries are "
+        "genuinely late. Current deployment value is %s hours; it is set above the "
+        "worst gap seen so a missed publication yields a visibly-degrading estimate "
+        "instead of no estimate."
+        % (MAX_INFER_HOURS, MAX_INFER_HOURS),
+        axis="hours",
+        decimals=1,
+        span_nulls=False,
+        min_=0,
+    )
+)
+
+panels.append(
+    timeseries(
         "API credits remaining",
-        {"h": 8, "w": 8, "x": 0, "y": 55},
+        {"h": 8, "w": 8, "x": 0, "y": 75},
         [target("oe_api_credits_remaining", instant=False, legend="credits left")],
         "Daily OpenElectricity credit balance, read from the free /me endpoint each "
         "cycle. The free plan allows 500 a day; this stack's hourly twelve-battery "
@@ -701,7 +808,7 @@ panels.append(
 panels.append(
     timeseries(
         "API requests against the daily bucket",
-        {"h": 8, "w": 8, "x": 8, "y": 55},
+        {"h": 8, "w": 8, "x": 8, "y": 75},
         [
             target(
                 "sum(increase(oe_api_requests_total{job=\"openelectricity_battery\"}[1d]))",
@@ -738,7 +845,7 @@ panels.append(
 panels.append(
     timeseries(
         "Poll cycle duration",
-        {"h": 8, "w": 8, "x": 16, "y": 55},
+        {"h": 8, "w": 8, "x": 16, "y": 75},
         [target("oe_poll_cycle_duration_seconds", instant=False, legend="cycle")],
         "Wall time of the last poll: thirteen sequential API calls plus the credit "
         "read. A duration near or above the 3600s poll interval means cycles are "
@@ -753,7 +860,7 @@ panels.append(
 panels.append(
     timeseries(
         "Batteries enumerated, in scope, monitored",
-        {"h": 8, "w": 24, "x": 0, "y": 63},
+        {"h": 8, "w": 24, "x": 0, "y": 83},
         [
             target("oe_batteries_enumerated", refid="A", instant=False, legend="with data upstream"),
             target("oe_batteries_in_scope", refid="B", instant=False, legend="in scope (--top)"),

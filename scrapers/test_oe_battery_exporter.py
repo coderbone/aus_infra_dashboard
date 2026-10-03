@@ -54,7 +54,12 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import oe_battery_exporter as exporter  # noqa: E402
-from oe_battery_exporter import AuthError, ScrapeError  # noqa: E402
+from oe_battery_exporter import (  # noqa: E402
+    AuthError,
+    ScrapeError,
+    infer_soc,
+    trapezoid,
+)
 
 FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 
@@ -359,11 +364,16 @@ class FakeClient:
         self.requests_made = 0
         self.calls = []
 
-    def battery_metrics(self, facility_code, network, lookback_hours, now):
+    def battery_metrics(
+        self, facility_code, network, lookback_hours, now, full_series=False
+    ):
         self.requests_made += 1
-        self.calls.append((facility_code, network))
+        self.calls.append((facility_code, network, full_series))
+        self.full_series_seen = full_series
         if self.error:
             raise self.error
+        # The fake is already keyed on full triples, so `full_series` is a no-op
+        # here beyond recording that the exporter asked for it.
         return self.series.get(facility_code, [])
 
     def credits_remaining(self):
@@ -384,6 +394,31 @@ def series_from_fixture(unit="ERB01"):
     raise AssertionError("fixture has no series %s" % unit)
 
 
+def combined_series_from_fixture(unit="ERB01"):
+    """The real two-metric fixture, flattened to what the client returns.
+
+    Every point of both series rather than just the newest, because inference
+    integrates over the whole window and a fixture reduced to two samples would
+    test the arithmetic but not the data. Triples are
+    `(unit, metric, (epoch, value))`; the exporter normally only acts on the
+    newest of each metric, and inference is the one path that needs the rest.
+    """
+    payload = metrics_erb()
+    out = []
+    for block in payload["data"]:
+        metric = "storage" if block["metric"] == "storage_battery" else "power"
+        for result in block["results"]:
+            if result["columns"].get("unit_code") != unit:
+                continue
+            for stamp, value in result["data"]:
+                if value is None:
+                    continue
+                out.append((unit, metric, (exporter.parse_timestamp(stamp), float(value))))
+    if not out:
+        raise AssertionError("fixture has no combined series for %s" % unit)
+    return out
+
+
 def both_metrics(unit="ERB01", stored_at=ERB_NEWEST_TS, stored_mwh=100.0,
                  power=-246.4, power_at=None):
     """One unit publishing both metrics, each with its own timestamp.
@@ -402,9 +437,11 @@ class PollCycleTest(unittest.TestCase):
         self.now = exporter.parse_timestamp("2026-09-30T12:00:00+10:00")
         self.row = erb_row()
 
-    def cycle(self, client, rows=None, max_age=exporter.DEFAULT_MAX_SAMPLE_AGE):
+    def cycle(self, client, rows=None, max_age=exporter.DEFAULT_MAX_SAMPLE_AGE,
+              full_series=False):
         return exporter.poll_cycle(
-            client, rows or [self.row], "NEM", 12, max_age, self.now
+            client, rows or [self.row], "NEM", 12, max_age, self.now,
+            full_series=full_series,
         )
 
     def test_soc_is_energy_over_capacity(self):
@@ -430,6 +467,20 @@ class PollCycleTest(unittest.TestCase):
         ]
         result = self.cycle(FakeClient(series={"ERB": series}))
         self.assertEqual(len(result["samples"]), 1)
+        self.assertEqual(result["series_without_capacity"], 2)
+
+    def test_series_without_capacity_counts_series_not_points(self):
+        # With `--enable-inferred` the client hands over every point of every
+        # series, so a per-point counter reports ~740 "series" for a fleet that
+        # has 37. The count has to be per series for it to stay a useful
+        # canary either way.
+        uncapped = [
+            ("ERBG1", "storage", (self.now - i * 3600.0, 999.0)) for i in range(24)
+        ] + [("ERBL1", "power", (self.now - i * 3600.0, 888.0)) for i in range(24)]
+        series = series_from_fixture() + uncapped
+        result = self.cycle(
+            FakeClient(series={"ERB": series}), full_series=True
+        )
         self.assertEqual(result["series_without_capacity"], 2)
 
     def test_wrong_network_is_passed_through(self):
@@ -458,7 +509,7 @@ class PollCycleTest(unittest.TestCase):
             error=None,
         )
 
-        def metrics(facility_code, network, lookback_hours, now):
+        def metrics(facility_code, network, lookback_hours, now, full_series=False):
             client.requests_made += 1
             client.calls.append((facility_code, network))
             if facility_code == "WTAHB":
@@ -912,10 +963,11 @@ class ClientTest(unittest.TestCase):
     def answering(self, payload):
         """A client whose single request is answered with `payload`, URL kept."""
         client = self._client()
-        seen = {}
+        seen = {"count": 0}
 
         def fake(url):
             seen["url"] = url
+            seen["count"] += 1
             return payload
 
         client._request = fake
@@ -935,9 +987,664 @@ class ClientTest(unittest.TestCase):
             [value for name, value in pairs if name == "metrics"], ["storage_battery", "power"]
         )
         self.assertEqual([v for k, v in pairs if k == "facility_code"], ["ERB"])
+        # 5m by default: a query parameter on this same request, so the finer
+        # series is free, and the hourly value is only its mean.
         self.assertEqual(
-            [v for k, v in pairs if k == "interval"], ["1h"]
+            [v for k, v in pairs if k == "interval"], [exporter.DEFAULT_API_INTERVAL]
         )
+        self.assertEqual(exporter.DEFAULT_API_INTERVAL, "5m")
+
+    def test_the_interval_is_a_query_parameter_not_another_request(self):
+        # The whole reason to prefer 5m is that it costs nothing. Coarsening or
+        # refining the series must stay one call - a second request here would
+        # double the daily budget, which is the binding constraint.
+        for interval in ("1h", "5m", "15m"):
+            with self.subTest(interval=interval):
+                client, seen = self.answering({"success": True, "data": []})
+                client.interval = interval
+                client.battery_metrics("ERB", "NEM", 12, 1790686800.0)
+                pairs = urllib.parse.parse_qsl(
+                    urllib.parse.urlparse(seen["url"]).query
+                )
+                self.assertEqual(
+                    [v for k, v in pairs if k == "interval"], [interval]
+                )
+                self.assertEqual(
+                    len([v for k, v in pairs if k == "metrics"]), 2
+                )
+
+    # ------------------------------------------------------------------ #
+    # Inferred (power-integrated) SOC
+    # ------------------------------------------------------------------ #
+
+    def test_trapezoid_of_a_steady_sign_is_exact(self):
+        # A constant -100 MW over one hour is -100 MWh: MW x h = MWh, so a
+        # one-hour interval is the unit conversion itself, and the trapezoid is
+        # exact for the straight line between two equal endpoints.
+        self.assertAlmostEqual(
+            trapezoid(-100.0, 0.0, -100.0, 3600.0), -100.0, places=9
+        )
+
+    def test_trapezoid_scales_with_elapsed_time(self):
+        # The same power held for twice as long must be twice the energy - the
+        # guard against a rule that silently ignored its own timestamps.
+        one_hour = trapezoid(50.0, 0.0, 50.0, 3600.0)
+        two_hours = trapezoid(50.0, 0.0, 50.0, 7200.0)
+        self.assertAlmostEqual(one_hour, 50.0, places=9)
+        self.assertAlmostEqual(two_hours, 100.0, places=9)
+        self.assertAlmostEqual(two_hours, 2 * one_hour, places=9)
+
+    def test_trapezoid_splits_a_step_between_its_endpoints(self):
+        # A rectangle rule would put this whole hour's energy at the left edge.
+        # 300 MW for 1h is 300 MWh; the trapezoid puts 150 MWh in the first
+        # half-hour, which matters when integrating into a live window.
+        self.assertAlmostEqual(
+            trapezoid(300.0, 0.0, 0.0, 3600.0), 150.0, places=9
+        )
+
+    def test_trapezoid_of_zero_duration_is_zero(self):
+        self.assertEqual(trapezoid(100.0, 500.0, -100.0, 500.0), 0.0)
+
+    def test_charging_negative_power_raises_the_inferred_energy(self):
+        # Upstream signs `power` from the grid's point of view, so charging is
+        # negative while the battery's stored energy goes *up*. The integral is
+        # therefore subtracted - the sign convention is the whole subtlety here.
+        result = infer_soc(
+            anchor_mwh=100.0,
+            anchor_ts=0.0,
+            power_series=[(0.0, -100.0), (3600.0, -100.0)],
+            now=3600.0,
+            capacity_mwh=500.0,
+            max_hours=24.0,
+            clamp=True,
+        )
+        self.assertIsNotNone(result)
+        # 100 MWh - (-100 MW x 1h) = 200 MWh
+        self.assertAlmostEqual(result["energy_mwh"], 200.0, places=9)
+
+    def test_discharging_positive_power_lowers_the_inferred_energy(self):
+        result = infer_soc(
+            anchor_mwh=100.0,
+            anchor_ts=0.0,
+            power_series=[(0.0, 50.0), (3600.0, 50.0)],
+            now=3600.0,
+            capacity_mwh=500.0,
+            max_hours=24.0,
+            clamp=True,
+        )
+        # 100 MWh - (+50 MW x 1h) = 50 MWh
+        self.assertAlmostEqual(result["energy_mwh"], 50.0, places=9)
+
+    def test_inferred_soc_is_energy_over_capacity(self):
+        result = infer_soc(
+            anchor_mwh=250.0,
+            anchor_ts=0.0,
+            power_series=[(0.0, -100.0), (7200.0, -100.0)],
+            now=7200.0,
+            capacity_mwh=500.0,
+            max_hours=24.0,
+            clamp=True,
+        )
+        # 250 - (-100 x 2h) = 450 MWh of 500
+        self.assertAlmostEqual(result["energy_mwh"], 450.0, places=9)
+        self.assertAlmostEqual(result["soc"], 0.9, places=9)
+
+    def test_inference_needs_at_least_two_power_samples(self):
+        self.assertIsNone(
+            infer_soc(100.0, 0.0, [(0.0, -50.0)], 3600.0, 500.0, 24.0, True)
+        )
+
+    def test_inference_needs_a_measured_anchor(self):
+        # No anchor: there is nothing to integrate *from*. This is the rule
+        # that stops inferred values from chaining into each other.
+        self.assertIsNone(
+            infer_soc(None, None, [(0.0, -50.0), (3600.0, -50.0)], 3600.0, 500.0, 24.0, True)
+        )
+
+    def test_inference_refuses_an_anchor_older_than_the_window(self):
+        # 30h-old anchor, 24h window: integrating across that would be
+        # arithmetic rather than measurement.
+        self.assertIsNone(
+            infer_soc(
+                anchor_mwh=100.0,
+                anchor_ts=0.0,
+                power_series=[(0.0, -50.0), (30 * 3600.0, -50.0)],
+                now=30 * 3600.0,
+                capacity_mwh=500.0,
+                max_hours=24.0,
+                clamp=True,
+            )
+        )
+
+    def test_inference_ignores_power_before_the_anchor(self):
+        # Power samples all predate the measured reading. There is nothing to
+        # integrate forward, and integrating backwards would be nonsense.
+        self.assertIsNone(
+            infer_soc(
+                anchor_mwh=100.0,
+                anchor_ts=7200.0,
+                power_series=[(0.0, -50.0), (3600.0, -50.0)],
+                now=10800.0,
+                capacity_mwh=500.0,
+                max_hours=24.0,
+                clamp=True,
+            )
+        )
+
+    def test_inference_clamps_at_empty(self):
+        # Discharging hard from near-empty would integrate below zero, which no
+        # battery can do. Clamped to 0 rather than exported as a negative SOC.
+        result = infer_soc(
+            anchor_mwh=100.0,
+            anchor_ts=0.0,
+            power_series=[(0.0, 300.0), (7200.0, 300.0)],
+            now=7200.0,
+            capacity_mwh=500.0,
+            max_hours=24.0,
+            clamp=True,
+        )
+        # 100 - (+300 x 2h) = -500 MWh, clamped up to 0.
+        self.assertEqual(result["energy_mwh"], 0.0)
+        self.assertEqual(result["soc"], 0.0)
+
+    def test_inference_clamps_at_full_charge(self):
+        # Charging past nameplate integrates above capacity, which no battery
+        # can hold. Clamped to capacity rather than exported above 100%.
+        result = infer_soc(
+            anchor_mwh=400.0,
+            anchor_ts=0.0,
+            power_series=[(0.0, -300.0), (7200.0, -300.0)],
+            now=7200.0,
+            capacity_mwh=500.0,
+            max_hours=24.0,
+            clamp=True,
+        )
+        # 400 - (-300 x 2h) = 1000 MWh, clamped down to 500.
+        self.assertEqual(result["energy_mwh"], 500.0)
+        self.assertEqual(result["soc"], 1.0)
+        # A clamped SOC is indistinguishable from a real 100% once exported, so
+        # the clamp has to say that it happened.
+        self.assertEqual(result["saturated"], 1.0)
+
+    def test_saturation_is_not_reported_when_the_estimate_is_inside(self):
+        result = infer_soc(
+            anchor_mwh=200.0,
+            anchor_ts=0.0,
+            power_series=[(0.0, -50.0), (7200.0, -50.0)],
+            now=7200.0,
+            capacity_mwh=500.0,
+            max_hours=24.0,
+            clamp=True,
+        )
+        self.assertEqual(result["energy_mwh"], 300.0)
+        self.assertEqual(result["saturated"], 0.0)
+
+    def test_saturation_is_flagged_even_with_clamping_off(self):
+        # With clamping off the runaway value is exported for diagnosis, but it
+        # is still out of bounds and must still say so.
+        result = infer_soc(
+            anchor_mwh=400.0,
+            anchor_ts=0.0,
+            power_series=[(0.0, -300.0), (7200.0, -300.0)],
+            now=7200.0,
+            capacity_mwh=500.0,
+            max_hours=24.0,
+            clamp=False,
+        )
+        self.assertEqual(result["energy_mwh"], 1000.0)
+        self.assertEqual(result["saturated"], 1.0)
+
+    def test_clamping_can_be_switched_off_for_diagnosis(self):
+        # Unclamped output is what a chart should be inspected against when
+        # inference looks wrong: it shows how far the raw integral ran past the
+        # physical bound, which is a useful diagnostic and a bad metric.
+        result = infer_soc(
+            anchor_mwh=400.0,
+            anchor_ts=0.0,
+            power_series=[(0.0, -300.0), (7200.0, -300.0)],
+            now=7200.0,
+            capacity_mwh=500.0,
+            max_hours=24.0,
+            clamp=False,
+        )
+        self.assertAlmostEqual(result["energy_mwh"], 1000.0, places=9)
+
+    def test_inference_never_past_now(self):
+        # A future-dated power sample must not drag the estimate forward.
+        result = infer_soc(
+            anchor_mwh=100.0,
+            anchor_ts=0.0,
+            power_series=[(0.0, 50.0), (999999.0, 50.0)],
+            now=3600.0,
+            capacity_mwh=500.0,
+            max_hours=24.0,
+            clamp=True,
+        )
+        # Only the (0.0, 50.0) sample survives; one point cannot form a segment.
+        self.assertIsNone(result)
+
+    def test_inferred_timestamp_is_the_newest_power_sample_used(self):
+        result = infer_soc(
+            anchor_mwh=100.0,
+            anchor_ts=0.0,
+            power_series=[(0.0, -10.0), (3600.0, -20.0), (7200.0, -30.0)],
+            now=7200.0,
+            capacity_mwh=500.0,
+            max_hours=24.0,
+            clamp=True,
+        )
+        self.assertEqual(result["inferred_ts"], 7200.0)
+
+    # -- inference wiring in the scraper itself ------------------------- #
+
+    def _scraper_with_anchor(self, now, **kwargs):
+        """A scraper pre-seeded with a measured anchor, no network needed."""
+        client = FakeClient({})
+        scraper = exporter.BatteryScraper(client, now_fn=lambda: now, **kwargs)
+        scraper._last_measured_mwh["ERB01"] = 200.0
+        scraper._last_measured_ts["ERB01"] = now - 3600.0
+        return scraper
+
+    def test_no_inferred_metrics_are_exported_by_default(self):
+        now = exporter.parse_timestamp("2026-10-01T12:00:00+10:00")
+        scraper = self._scraper_with_anchor(now)
+        self.assertFalse(scraper.enable_inferred)
+        samples = [
+            dict(
+                erb_row(),
+                soc=None,
+                stored_mwh=None,
+                sampled_at=None,
+                power_mw=-50.0,
+                power_sampled_at=now - 3600.0,
+                power_series=[(now - 3600.0, -50.0), (now, -50.0)],
+                scrape_success=False,
+            )
+        ]
+        self.assertEqual(scraper._compute_inferred(samples, now, now), [])
+        body = exporter.render({"samples": samples, "inferred": []}, now)
+        self.assertNotIn("oe_battery_soc_inferred_ratio{", body)
+
+    def test_inferred_metrics_appear_when_enabled_and_measured_is_missing(self):
+        now = exporter.parse_timestamp("2026-10-01T12:00:00+10:00")
+        scraper = self._scraper_with_anchor(now, enable_inferred=True)
+        samples = [
+            dict(
+                erb_row(),
+                soc=None,
+                stored_mwh=None,
+                sampled_at=None,
+                power_mw=-50.0,
+                power_sampled_at=now - 3600.0,
+                power_series=[(now - 3600.0, -50.0), (now, -50.0)],
+                scrape_success=False,
+            )
+        ]
+        rows = scraper._compute_inferred(samples, now, now)
+        self.assertEqual(len(rows), 1)
+        # 200 MWh anchor + 50 MW charged over an hour = 250 MWh.
+        self.assertAlmostEqual(rows[0]["inferred_energy_mwh"], 250.0, places=6)
+        body = exporter.render(
+            {"samples": samples, "inferred": rows, "oe_batteries_inferred": 1}, now
+        )
+        self.assertIn("oe_battery_soc_inferred_ratio{", body)
+        self.assertIn("oe_battery_energy_inferred_mwh{", body)
+        self.assertIn("oe_battery_inferred_timestamp_seconds{", body)
+        self.assertIn("oe_battery_inferred_age_seconds{", body)
+
+    def test_measured_soc_wins_and_suppresses_the_inferred_row(self):
+        # The important precedence rule: when a real reading exists this cycle,
+        # no synthetic value is published beside it, so there is never a moment
+        # where the dashboard could show either.
+        now = exporter.parse_timestamp("2026-10-01T12:00:00+10:00")
+        scraper = self._scraper_with_anchor(now, enable_inferred=True)
+        samples = [
+            dict(
+                erb_row(),
+                soc=0.5,
+                stored_mwh=998.5,
+                sampled_at=now - 60.0,
+                power_mw=-50.0,
+                power_sampled_at=now - 3600.0,
+                power_series=[(now - 3600.0, -50.0), (now, -50.0)],
+                scrape_success=True,
+            )
+        ]
+        self.assertEqual(scraper._compute_inferred(samples, now, now), [])
+
+    def test_inferred_rows_are_omitted_not_zeroed_when_there_is_no_anchor(self):
+        now = exporter.parse_timestamp("2026-10-01T12:00:00+10:00")
+        client = FakeClient({})
+        scraper = exporter.BatteryScraper(
+            client, enable_inferred=True, now_fn=lambda: now
+        )
+        samples = [
+            dict(
+                erb_row(),
+                soc=None,
+                stored_mwh=None,
+                sampled_at=None,
+                power_mw=-50.0,
+                power_sampled_at=now - 3600.0,
+                power_series=[(now - 3600.0, -50.0), (now, -50.0)],
+                scrape_success=False,
+            )
+        ]
+        rows = scraper._compute_inferred(samples, now, now)
+        self.assertEqual(rows, [])
+        body = exporter.render({"samples": samples, "inferred": rows}, now)
+        # No anchor, no anchor-based line at all - and not a zero either.
+        self.assertNotIn("oe_battery_soc_inferred_ratio{", body)
+
+    def test_inference_stops_at_the_max_hours_window(self):
+        # An anchor older than the window means we would be integrating across
+        # more un-sampled hours than sampled ones.
+        now = exporter.parse_timestamp("2026-10-01T12:00:00+10:00")
+        scraper = self._scraper_with_anchor(now, enable_inferred=True, max_infer_hours=0.5)
+        samples = [
+            dict(
+                erb_row(),
+                soc=None,
+                stored_mwh=None,
+                sampled_at=None,
+                power_mw=-50.0,
+                power_sampled_at=now - 3600.0,
+                power_series=[(now - 3600.0, -50.0), (now, -50.0)],
+                scrape_success=False,
+            )
+        ]
+        self.assertEqual(scraper._compute_inferred(samples, now, now), [])
+
+    def test_inferred_metrics_carry_the_same_five_labels(self):
+        # The label set has to match the measured metrics or the Grafana
+        # `$battery` variable selects nothing on these frames and the table
+        # cannot join on unit.
+        now = exporter.parse_timestamp("2026-10-01T12:00:00+10:00")
+        scraper = self._scraper_with_anchor(now, enable_inferred=True)
+        samples = [
+            dict(
+                erb_row(),
+                soc=None,
+                stored_mwh=None,
+                sampled_at=None,
+                power_mw=-50.0,
+                power_sampled_at=now - 3600.0,
+                power_series=[(now - 3600.0, -50.0), (now, -50.0)],
+                scrape_success=False,
+            )
+        ]
+        rows = scraper._compute_inferred(samples, now, now)
+        body = exporter.render({"samples": samples, "inferred": rows}, now)
+        measured = re.search(r'oe_battery_soc_ratio\{([^}]*)\}', body)
+        self.assertIsNone(measured, "measured SOC absent from this fixture")
+        power_line = re.search(r'oe_battery_power_mw\{([^}]*)\}', body)
+        inferred_line = re.search(r'oe_battery_soc_inferred_ratio\{([^}]*)\}', body)
+        self.assertIsNotNone(power_line)
+        self.assertIsNotNone(inferred_line)
+        self.assertEqual(power_line.group(1), inferred_line.group(1))
+
+    def test_scrape_success_stays_tied_to_the_measured_reading(self):
+        # Inference must not quietly promote the "has a reading" count: a unit
+        # with only a synthetic SOC is still a unit we could not measure.
+        now = exporter.parse_timestamp("2026-10-01T12:00:00+10:00")
+        scraper = self._scraper_with_anchor(now, enable_inferred=True)
+        samples = [
+            dict(
+                erb_row(),
+                soc=None,
+                stored_mwh=None,
+                sampled_at=None,
+                power_mw=-50.0,
+                power_sampled_at=now - 3600.0,
+                power_series=[(now - 3600.0, -50.0), (now, -50.0)],
+                scrape_success=False,
+            )
+        ]
+        rows = scraper._compute_inferred(samples, now, now)
+        self.assertEqual(len(rows), 1)
+        body = exporter.render({"samples": samples, "inferred": rows}, now)
+        self.assertIn("oe_battery_scrape_success{", body)
+        match = re.search(r'oe_battery_scrape_success\{([^}]*)\} (\d)', body)
+        self.assertIsNotNone(match)
+        self.assertEqual(match.group(2), "0")
+
+    def test_inference_over_many_hours_does_not_run_away(self):
+        # 12 hours of steady charging from half capacity, integrated hourly.
+        # This is the shape the daytime gap actually has, and it is where a
+        # drift bug would show up as a battery pinned at full.
+        now = 12 * 3600.0
+        series = [(i * 3600.0, -100.0) for i in range(13)]
+        result = infer_soc(
+            anchor_mwh=1000.0,
+            anchor_ts=0.0,
+            power_series=series,
+            now=now,
+            capacity_mwh=1997.0,
+            max_hours=24.0,
+            clamp=True,
+        )
+        # 1000 + 1200 = 2200 MWh of integrated energy, clamped to capacity.
+        self.assertEqual(result["energy_mwh"], 1997.0)
+        unclamped = infer_soc(
+            anchor_mwh=1000.0,
+            anchor_ts=0.0,
+            power_series=series,
+            now=now,
+            capacity_mwh=1997.0,
+            max_hours=24.0,
+            clamp=False,
+        )
+        self.assertAlmostEqual(unclamped["energy_mwh"], 2200.0, places=6)
+
+    def test_inference_of_a_full_day_of_holding_stays_put(self):
+        # A battery idling at 0 MW all day should integrate to its anchor, not
+        # drift. This is the null case a real feed will spend a lot of its life
+        # in, so it is worth pinning.
+        now = 24 * 3600.0
+        series = [(i * 3600.0, 0.0) for i in range(25)]
+        result = infer_soc(
+            anchor_mwh=1234.5,
+            anchor_ts=0.0,
+            power_series=series,
+            now=now,
+            capacity_mwh=1997.0,
+            max_hours=48.0,
+            clamp=True,
+        )
+        self.assertAlmostEqual(result["energy_mwh"], 1234.5, places=6)
+        self.assertAlmostEqual(result["soc"], 1234.5 / 1997.0, places=9)
+
+    def test_a_full_day_of_inference_is_refused_by_default_window(self):
+        # The default 24h window is a deliberate ceiling: it bounds how far a
+        # single estimate can be from the measurement it is anchored to.
+        now = 30 * 3600.0
+        series = [(i * 3600.0, -10.0) for i in range(31)]
+        self.assertIsNone(
+            infer_soc(1000.0, 0.0, series, now, 1997.0, max_hours=24.0, clamp=True)
+        )
+
+    def test_uncapped_units_never_reach_inference(self):
+        # G1/L1 have no capacity, so they are dropped before a sample is ever
+        # built and there is no denominator to infer a ratio against.
+        row = dict(erb_row(), capacity_mwh=0)
+        self.assertFalse(row["capacity_mwh"])
+        self.assertIsNone(
+            infer_soc(100.0, 0.0, [(0.0, -50.0), (3600.0, -50.0)], 3600.0, 0, 24.0, True)
+        )
+
+    def test_an_inferred_row_carries_the_power_clock_not_the_energy_clock(self):
+        # The anchor and the integrated point are deliberately different
+        # timestamps; collapsing them would make a daytime estimate claim the
+        # freshness of an overnight reading.
+        now = exporter.parse_timestamp("2026-10-01T12:00:00+10:00")
+        scraper = self._scraper_with_anchor(now, enable_inferred=True)
+        scraper._last_measured_ts["ERB01"] = now - 7200.0
+        samples = [
+            dict(
+                erb_row(),
+                soc=None,
+                stored_mwh=None,
+                sampled_at=None,
+                power_mw=-50.0,
+                power_sampled_at=now - 3600.0,
+                power_series=[(now - 7200.0, -30.0), (now - 3600.0, -50.0)],
+                scrape_success=False,
+            )
+        ]
+        rows = scraper._compute_inferred(samples, now, now)
+        self.assertEqual(len(rows), 1)
+        # The newest *integrated* power point, which is an hour old even though
+        # the poll just ran - so the age is honest rather than reset by the poll.
+        self.assertEqual(rows[0]["inferred_ts"], now - 3600.0)
+        self.assertAlmostEqual(rows[0]["inferred_age"], 3600.0, places=6)
+
+    def test_inference_refuses_to_bridge_a_wide_gap(self):
+        # Two samples 10h apart with nothing between. Integrating across the
+        # hole would invent ten hours the feed never reported, so there is no
+        # estimate at all rather than a plausible-looking one.
+        self.assertIsNone(
+            infer_soc(
+                anchor_mwh=100.0,
+                anchor_ts=0.0,
+                power_series=[(0.0, -50.0), (36000.0, -50.0)],
+                now=36000.0,
+                capacity_mwh=500.0,
+                max_hours=48.0,
+                clamp=True,
+                max_gap_hours=2.0,
+            )
+        )
+
+    def test_inference_survives_one_missing_hourly_sample(self):
+        # The ordinary case: hourly data with a single null interval is normal,
+        # not an outage, so a 2h default gap limit integrates straight over it.
+        result = infer_soc(
+            anchor_mwh=100.0,
+            anchor_ts=0.0,
+            power_series=[(0.0, -10.0), (7200.0, -10.0)],
+            now=7200.0,
+            capacity_mwh=500.0,
+            max_hours=48.0,
+            clamp=True,
+            max_gap_hours=2.0,
+        )
+        self.assertIsNotNone(result)
+        # -10 MW is charging, so two hours of it puts 20 MWh *into* the battery.
+        self.assertAlmostEqual(result["energy_mwh"], 120.0, places=9)
+
+    def test_inference_stops_at_a_gap_rather_than_resuming_after_it(self):
+        # Three hours of clean hourly data, then an outage, then more data.
+        # Resuming past the outage would apply the later power to a battery
+        # whose state across the outage is unknown, so the estimate is reported
+        # as of the last continuous sample.
+        result = infer_soc(
+            anchor_mwh=100.0,
+            anchor_ts=0.0,
+            power_series=[(0.0, -10.0), (3600.0, -10.0), (7200.0, -10.0), (86400.0, -50.0)],
+            now=86400.0,
+            capacity_mwh=500.0,
+            max_hours=48.0,
+            clamp=True,
+            max_gap_hours=2.0,
+        )
+        self.assertIsNotNone(result)
+        # Two hours of charging integrated, not twenty-four: 100 + 2*10.
+        self.assertAlmostEqual(result["energy_mwh"], 120.0, places=9)
+        self.assertAlmostEqual(result["inferred_ts"], 7200.0)
+
+    def test_the_real_response_integrates_to_a_plausible_energy(self):
+        # The captured ERB response, integrated across its real overnight
+        # window. Whatever the exact number, the estimate has to stay inside
+        # the battery's physical envelope and near its anchor - an integration
+        # bug shows up as an absurd value, not a subtly wrong one.
+        series = combined_series_from_fixture("ERB01")
+        points = [(t, v) for _, key, (t, v) in series if key == "power"]
+        storage = sorted((t, v) for _, key, (t, v) in series if key == "storage")
+        self.assertTrue(points)
+        self.assertTrue(storage)
+        anchor_ts, anchor_mwh = storage[0]
+        result = infer_soc(
+            anchor_mwh=anchor_mwh,
+            anchor_ts=anchor_ts,
+            power_series=points,
+            now=max(t for t, _ in points),
+            capacity_mwh=1997.0,
+            max_hours=24.0,
+            clamp=True,
+        )
+        self.assertIsNotNone(result)
+        self.assertGreaterEqual(result["energy_mwh"], 0.0)
+        self.assertLessEqual(result["energy_mwh"], 1997.0)
+        self.assertLess(abs(result["energy_mwh"] - anchor_mwh), 1997.0 * 0.35)
+
+    def test_the_real_response_infers_a_ratio_within_bounds(self):
+        series = combined_series_from_fixture("ERB01")
+        points = [(t, v) for _, key, (t, v) in series if key == "power"]
+        storage = sorted((t, v) for _, key, (t, v) in series if key == "storage")
+        anchor_ts, anchor_mwh = storage[0]
+        result = infer_soc(
+            anchor_mwh=anchor_mwh,
+            anchor_ts=anchor_ts,
+            power_series=points,
+            now=max(t for t, _ in points),
+            capacity_mwh=1997.0,
+            max_hours=24.0,
+            clamp=True,
+        )
+        self.assertGreaterEqual(result["soc"], 0.0)
+        self.assertLessEqual(result["soc"], 1.0)
+        # The measured anchor's own SOC, for comparison.
+        measured = anchor_mwh / 1997.0
+        self.assertLess(abs(result["soc"] - measured), 0.35)
+
+    def test_the_real_response_integrates_from_the_newest_measured_value(self):
+        # Anchoring on the *oldest* storage point would integrate a whole
+        # night of discharge and claim the battery is far emptier than it is.
+        # This pins the behaviour to the newest measured reading.
+        series = combined_series_from_fixture("ERB01")
+        points = [(t, v) for _, key, (t, v) in series if key == "power"]
+        storage = sorted((t, v) for _, key, (t, v) in series if key == "storage")
+        anchor_ts, anchor_mwh = storage[-1]
+        result = infer_soc(
+            anchor_mwh=anchor_mwh,
+            anchor_ts=anchor_ts,
+            power_series=points,
+            now=max(t for t, _ in points),
+            capacity_mwh=1997.0,
+            max_hours=24.0,
+            clamp=True,
+        )
+        # Anchored on the newest reading and integrated forward over a morning
+        # of charging (power negative, so stored energy rises), the estimate
+        # lands above the anchor and inside the battery's envelope. Anchoring on
+        # the *oldest* reading instead would integrate the night's discharge and
+        # report it far emptier.
+        self.assertGreater(result["energy_mwh"], anchor_mwh)
+        self.assertLess(result["energy_mwh"], 1997.0)
+
+    def test_the_real_response_integration_tracks_the_measured_deltas(self):
+        # The real accuracy check, on the real data: integrate power across
+        # each hour that also has a measured reading and compare. This is the
+        # number that decides whether the feature is worth shipping at all.
+        series = combined_series_from_fixture("ERB01")
+        points = sorted((t, v) for _, key, (t, v) in series if key == "power")
+        storage = sorted((t, v) for _, key, (t, v) in series if key == "storage")
+        capacity = 1997.0
+        errors = []
+        for (a, start), (b, end) in zip(storage, storage[1:]):
+            window = [(t, p) for t, p in points if a <= t <= b]
+            if len(window) < 2 or (b - a) > 7 * 3600:
+                continue
+            implied = -sum(
+                trapezoid(p0, t0, p1, t1)
+                for (t0, p0), (t1, p1) in zip(window, window[1:])
+            )
+            errors.append(abs(implied - (end - start)) / capacity)
+        self.assertGreaterEqual(len(errors), 4)
+        # Every hour within 4% of capacity, and the mean within 1%. Direction
+        # is right and the magnitude is usable - which is the whole claim.
+        self.assertLess(max(errors), 0.04)
+        self.assertLess(sum(errors) / len(errors), 0.01)
 
     def test_the_real_two_metric_response_splits_into_both_metrics(self):
         """Parsed against a captured response, not a hand-built one.
@@ -966,6 +1673,64 @@ class ClientTest(unittest.TestCase):
         # The point of asking for both: the power sample is seven hours newer
         # than the energy sample for the very same unit.
         self.assertEqual(power_at - stored_at, 7 * 3600)
+
+    def test_full_series_returns_the_whole_window_in_order(self):
+        """`full_series` is what makes inference possible at all.
+
+        The default path collapses each series to its newest point, which is
+        right for "what is the SOC now" and useless for integrating: with one
+        point per series there is no trapezoid to draw. This is the request
+        shape that inference depends on, against the real fixture.
+        """
+        client, seen = self.answering(metrics_erb())
+        series = client.battery_metrics(
+            "ERB", "NEM", 13, 1790816400.0, full_series=True
+        )
+        power = sorted(
+            (stamp, value)
+            for unit, key, (stamp, value) in series
+            if unit == "ERB01" and key == "power"
+        )
+        self.assertGreater(len(power), 2)
+        self.assertEqual(power, sorted(power), "points must come back time-ordered")
+        # Energy stops at 04:00; power runs on to 11:00.
+        storage = [
+            stamp for unit, key, (stamp, _) in series if unit == "ERB01" and key == "storage"
+        ]
+        self.assertLess(max(storage), max(s for s, _ in power))
+        # Same number of requests either way - this is not a budget question.
+        self.assertEqual(seen["count"], 1)
+
+    def test_full_series_skips_nulls_and_bad_rows(self):
+        """A null interval is a gap, not a zero-power reading."""
+        client, _ = self.answering(
+            {
+                "success": True,
+                "data": [
+                    {
+                        "metric": "power",
+                        "unit": "MW",
+                        "results": [
+                            {
+                                "name": "power_X",
+                                "columns": {"unit_code": "X"},
+                                "data": [
+                                    ["2026-10-01T00:00", 1.0],
+                                    ["2026-10-01T01:00", None],
+                                    ["2026-10-01T02:00", 3.0],
+                                    ["2026-10-01T03:00", "junk"],
+                                    ["2026-10-01T04:00"],
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+        series = client.battery_metrics(
+            "X", "NEM", 12, 1790686800.0, full_series=True
+        )
+        self.assertEqual([v for _, _, (_, v) in series], [1.0, 3.0])
 
     def test_the_unit_code_is_read_from_the_columns_block(self):
         """`columns: {unit_code: ...}` is the upstream's own attribution."""
@@ -1144,7 +1909,277 @@ def make_scraper(client, **kwargs):
     return exporter.BatteryScraper(client, **options)
 
 
+class ChargeEfficiencyTest(unittest.TestCase):
+    """The loss term: not all grid-facing charging reaches the cells."""
+
+    def test_charging_stores_only_the_efficient_share(self):
+        # -100 MW for 1h is 100 MWh into the grid connection. At 0.9, 90 MWh
+        # reaches the cells.
+        delta = exporter.stored_energy_delta(-100.0, 0.0, -100.0, 3600.0, 0.9)
+        self.assertAlmostEqual(delta, 90.0, places=9)
+
+    def test_discharge_costs_the_full_amount(self):
+        # The discharge side is already measured at the terminals, so there is
+        # nothing further to discount: the whole integral leaves the battery.
+        delta = exporter.stored_energy_delta(100.0, 0.0, 100.0, 3600.0, 0.9)
+        self.assertAlmostEqual(delta, -100.0, places=9)
+
+    def test_no_efficiency_term_is_exactly_the_old_integral(self):
+        # The default must stay inert, so the loss term is additive on top of
+        # behaviour that was already tested.
+        self.assertAlmostEqual(
+            exporter.stored_energy_delta(-100.0, 0.0, -100.0, 3600.0, 1.0), 100.0, places=9
+        )
+
+    def test_a_segment_crossing_zero_is_split_at_the_crossing(self):
+        # -100 MW ramping to +100 MW over 2h crosses zero at the midpoint.
+        # Charging half an hour is 50 MWh grid-facing -> 45 MWh stored;
+        # discharging half an hour costs 50 MWh. Net -5 MWh, not 0: averaging
+        # across the switch point would apply one factor to both halves.
+        delta = exporter.stored_energy_delta(-100.0, 0.0, 100.0, 7200.0, 0.9)
+        self.assertAlmostEqual(delta, 45.0 - 50.0, places=9)
+
+    def test_round_trip_is_the_charging_coefficient(self):
+        # 100 MWh in at the grid connection for an hour, then the same 90 MWh
+        # out over the next hour: at 0.9 a battery gives back 90, not 100.
+        in_ = exporter.stored_energy_delta(-100.0, 0.0, -100.0, 3600.0, 0.9)
+        self.assertAlmostEqual(in_, 90.0, places=9)
+        # Discharging `in_` MWh over one hour takes `in_` MW at the terminals.
+        out = exporter.stored_energy_delta(in_, 3600.0, in_, 7200.0, 0.9)
+        self.assertAlmostEqual(out, -90.0, places=9)
+        self.assertAlmostEqual(in_ + out, 0.0, places=6)
+
+    def test_efficiency_lowers_a_charging_estimate(self):
+        args = dict(anchor_mwh=200.0, anchor_ts=0.0,
+                    power_series=[(0.0, -100.0), (7200.0, -100.0)],
+                    now=7200.0, capacity_mwh=1000.0, max_hours=24.0, clamp=True)
+        plain = infer_soc(**args, charge_efficiency=1.0)
+        lossy = infer_soc(**args, charge_efficiency=0.9)
+        # 200 MWh + 200 MWh charged, or the same charge at 90%.
+        self.assertAlmostEqual(plain["energy_mwh"], 400.0, places=9)
+        self.assertAlmostEqual(lossy["energy_mwh"], 380.0, places=9)
+
+    def test_efficiency_leaves_a_discharge_only_estimate_alone(self):
+        args = dict(anchor_mwh=500.0, anchor_ts=0.0,
+                    power_series=[(0.0, 100.0), (7200.0, 100.0)],
+                    now=7200.0, capacity_mwh=1000.0, max_hours=24.0, clamp=True)
+        plain = infer_soc(**args, charge_efficiency=1.0)
+        lossy = infer_soc(**args, charge_efficiency=0.9)
+        self.assertAlmostEqual(plain["energy_mwh"], lossy["energy_mwh"], places=9)
+
+    def test_the_efficient_estimate_is_less_likely_to_saturate(self):
+        # The reason the term exists: charging hard used to run past capacity
+        # and clamp to a flat 100%. 105 MWh at the grid connection puts the
+        # battery over its 1000 MWh nameplate at no loss, and just under it at
+        # 0.9 - so the coefficient is the difference between "full" and "full".
+        args = dict(anchor_mwh=900.0, anchor_ts=0.0,
+                    power_series=[(0.0, -105.0), (3600.0, -105.0)],
+                    now=3600.0, capacity_mwh=1000.0, max_hours=24.0, clamp=True)
+        self.assertEqual(infer_soc(**args, charge_efficiency=1.0)["saturated"], 1.0)
+        lossy = infer_soc(**args, charge_efficiency=0.9)
+        self.assertEqual(lossy["saturated"], 0.0)
+        self.assertAlmostEqual(lossy["energy_mwh"], 994.5, places=9)
+
+    def test_the_coefficient_is_carried_into_the_exposition_state(self):
+        # Guards the plumbing only: a flag parsed but never handed to
+        # infer_soc() would look like a working knob and change nothing.
+        scraper = make_scraper(
+            ScraperClient(series={"ERB": both_metrics()}),
+            top=1,
+            enable_inferred=True,
+            infer_charge_efficiency=0.87,
+        )
+        self.assertEqual(scraper.infer_charge_efficiency, 0.87)
+
+
 class ScraperTest(unittest.TestCase):
+    def test_two_cycles_of_inference_across_the_daytime_gap(self):
+        # The end-to-end shape of the feature: one poll with a measured reading
+        # to establish the anchor, then a later poll where the energy feed has
+        # gone quiet but power is still publishing. The second cycle is what
+        # inference exists for.
+        anchor_at = "2026-10-01T04:00:00+10:00"
+        anchor_ts = exporter.parse_timestamp(anchor_at)
+        day = "2026-10-01T12:00:00+10:00"
+        now = exporter.parse_timestamp(day)
+        capacity = 1997.0
+
+        # Cycle 1: measured 124.16 MWh at 04:00 plus power through the morning.
+        first = ScraperClient(
+            series={
+                "ERB": [
+                    ("ERB01", "storage", (anchor_ts, 124.1611)),
+                    ("ERB01", "power", (anchor_ts, -5.749592)),
+                ]
+            }
+        )
+        scraper = make_scraper(first, top=1, enable_inferred=True, now_fn=lambda: now)
+        body, ok = scraper.poll_once()
+        self.assertTrue(ok)
+        self.assertIn("oe_battery_soc_ratio{", body)
+        # Measured this cycle, so nothing synthetic is published beside it.
+        self.assertNotIn("oe_battery_soc_inferred_ratio{", body)
+        self.assertEqual(scraper._last_measured_ts["ERB01"], anchor_ts)
+        self.assertAlmostEqual(scraper._last_measured_mwh["ERB01"], 124.1611)
+
+        # Cycle 2: energy silent since 04:00, power charging hard at -100 MW
+        # hour by hour. More than one point is required - the exporter
+        # integrates between samples and refuses to guess across a gap.
+        midday_ts = exporter.parse_timestamp("2026-10-01T11:00:00+10:00")
+        second = ScraperClient(
+            series={
+                "ERB": [
+                    ("ERB01", "power", (anchor_ts + i * 3600.0, -100.0))
+                    for i in range(8)
+                ]
+            }
+        )
+        scraper.client = second
+        body, ok = scraper.poll_once()
+        self.assertTrue(ok)
+        # The measured SOC is gone from the exposition...
+        self.assertNotIn("oe_battery_soc_ratio{", body)
+        self.assertIn("oe_battery_scrape_success{facility=\"ERB\"", body)
+        self.assertIn("oe_battery_scrape_success{facility=\"ERB\",unit=\"ERB01\",name=\"Eraring\",region=\"NSW1\",status=\"operating\"} 0", body)
+        # ...and a synthetic one has taken its place.
+        self.assertIn("oe_battery_soc_inferred_ratio{", body)
+        self.assertIn("oe_battery_energy_inferred_mwh{", body)
+        self.assertIn("oe_batteries_inferred 1", body)
+
+        match = re.search(
+            r'oe_battery_energy_inferred_mwh\{[^}]*\} ([\d.]+)', body
+        )
+        self.assertIsNotNone(match)
+        inferred = float(match.group(1))
+        # Anchored at 124.16 MWh at 04:00, charging at ~100 MW through to 11:00
+        # is roughly 700 MWh, so the estimate must sit well above the anchor
+        # and inside the battery's 1997 MWh envelope.
+        self.assertGreater(inferred, 124.1611)
+        self.assertLess(inferred, capacity)
+        ratio = float(
+            re.search(r'oe_battery_soc_inferred_ratio\{[^}]*\} ([\d.]+)', body).group(1)
+        )
+        self.assertGreaterEqual(ratio, 0.0)
+        self.assertLessEqual(ratio, 1.0)
+        self.assertAlmostEqual(ratio, inferred / capacity, places=4)
+
+    def test_saturation_is_exported_so_a_pinned_soc_is_visible(self):
+        # Waratah pinned at exactly 1.0 in the live data because the
+        # integration ran past capacity. Without this flag it is
+        # indistinguishable from a battery that is genuinely full.
+        anchor_ts = exporter.parse_timestamp("2026-10-01T04:00:00+10:00")
+        charging = [
+            ("ERB01", "power", (anchor_ts + i * 3600.0, -900.0)) for i in range(4)
+        ]
+        scraper = make_scraper(
+            ScraperClient(series={"ERB": charging}),
+            top=1,
+            enable_inferred=True,
+            now_fn=lambda: anchor_ts + 4 * 3600.0,
+        )
+        scraper._last_measured_mwh["ERB01"] = 1900.0
+        scraper._last_measured_ts["ERB01"] = anchor_ts
+        body, ok = scraper.poll_once()
+        self.assertTrue(ok)
+        self.assertIn("oe_battery_soc_inferred_ratio{", body)
+        self.assertIn("oe_battery_inferred_saturated{facility=\"ERB\"", body)
+        self.assertIn("oe_battery_inferred_saturated{facility=\"ERB\",unit=\"ERB01\",name=\"Eraring\",region=\"NSW1\",status=\"operating\"} 1", body)
+
+    def test_measured_reading_hands_over_to_inference_when_it_goes_stale(self):
+        # The core handover. `storage_battery` publishes overnight, so the
+        # exporter sees the same 04:00 reading all day and keeps reporting
+        # scrape_success=1. Inference must take over on freshness, not on
+        # presence, or the daytime hours it exists for would never be covered.
+        anchor_ts = exporter.parse_timestamp("2026-10-01T04:00:00+10:00")
+        charging = [("ERB01", "power", (anchor_ts + i * 3600.0, -60.0)) for i in range(9)]
+        series = {"ERB": [("ERB01", "storage", (anchor_ts, 400.0))] + charging}
+
+        # 04:30 - the reading is 30 minutes old, so it is still today's answer.
+        early = make_scraper(
+            ScraperClient(series=series),
+            top=1,
+            enable_inferred=True,
+            now_fn=lambda: anchor_ts + 1800.0,
+        )
+        body, ok = early.poll_once()
+        self.assertTrue(ok)
+        self.assertIn("oe_battery_soc_ratio{", body)
+        self.assertNotIn("oe_battery_soc_inferred_ratio{", body)
+        self.assertIn("oe_batteries_inferred 0", body)
+        self.assertIn("oe_batteries_monitored 1", body)
+
+        # 12:00 - same reading, eight hours old. Measured is still exported,
+        # because that is what the API says, but inference now carries the
+        # daytime hours alongside it.
+        midday = make_scraper(
+            ScraperClient(series=series),
+            top=1,
+            enable_inferred=True,
+            now_fn=lambda: anchor_ts + 8 * 3600.0,
+        )
+        body, ok = midday.poll_once()
+        self.assertTrue(ok)
+        self.assertIn("oe_battery_soc_ratio{", body)
+        self.assertIn("oe_battery_soc_inferred_ratio{", body)
+        self.assertIn("oe_batteries_inferred 1", body)
+        self.assertIn("oe_batteries_monitored 1", body)
+
+    def test_freshness_window_is_configurable(self):
+        # A battery publishing twice a day cannot use the one-gap default: its
+        # readings are ~12h apart, so the window has to be widened or inference
+        # would flap on and off all day.
+        anchor_ts = exporter.parse_timestamp("2026-10-01T04:00:00+10:00")
+        charging = [("ERB01", "power", (anchor_ts + i * 3600.0, -60.0)) for i in range(9)]
+        series = {"ERB": [("ERB01", "storage", (anchor_ts, 400.0))] + charging}
+        scraper = make_scraper(
+            ScraperClient(series=series),
+            top=1,
+            enable_inferred=True,
+            infer_fresh_hours=12.0,
+            now_fn=lambda: anchor_ts + 8 * 3600.0,
+        )
+        body, ok = scraper.poll_once()
+        self.assertTrue(ok)
+        self.assertIn("oe_battery_soc_ratio{", body)
+        self.assertNotIn("oe_battery_soc_inferred_ratio{", body)
+
+    def test_inference_reports_nothing_when_the_energy_feed_is_current(self):
+        # The converse guard: with a measured reading in hand the exporter must
+        # not publish an inferred value even though power is available.
+        now = exporter.parse_timestamp("2026-10-01T12:00:00+10:00")
+        client = ScraperClient(series={"ERB": both_metrics(stored_at="2026-10-01T11:00:00+10:00")})
+        scraper = make_scraper(client, top=1, enable_inferred=True, now_fn=lambda: now)
+        body, ok = scraper.poll_once()
+        self.assertTrue(ok)
+        self.assertIn("oe_battery_soc_ratio{", body)
+        self.assertNotIn("oe_battery_soc_inferred_ratio{", body)
+        self.assertIn("oe_batteries_inferred 0", body)
+
+    def test_inferred_soc_survives_a_poll_where_the_api_fails(self):
+        # The anchor is in memory and is not a reading, so a transient API
+        # failure must not wipe it: the next good poll should still be able to
+        # infer. If this regresses, one 500 costs a day of inferred coverage.
+        anchor_ts = exporter.parse_timestamp("2026-10-01T04:00:00+10:00")
+        now = exporter.parse_timestamp("2026-10-01T12:00:00+10:00")
+        charging = [("ERB01", "power", (anchor_ts + i * 3600.0, -50.0)) for i in range(8)]
+        client = ScraperClient(
+            series={"ERB": [("ERB01", "storage", (anchor_ts, 500.0))] + charging}
+        )
+        scraper = make_scraper(client, top=1, enable_inferred=True, now_fn=lambda: now)
+        scraper.poll_once()
+        self.assertIn("ERB01", scraper._last_measured_ts)
+
+        scraper.client = ScraperClient(error=exporter.ScrapeError("HTTP 500"))
+        body, ok = scraper.poll_once()
+        # quirk 4 again: one facility failing is a warning, not a failed poll.
+        self.assertTrue(ok)
+        self.assertIn("ERB01", scraper._last_measured_ts)
+
+        scraper.client = ScraperClient(series={"ERB": charging})
+        body, ok = scraper.poll_once()
+        self.assertTrue(ok)
+        self.assertIn("oe_battery_soc_inferred_ratio{", body)
+
     def test_poll_once_produces_exposition(self):
         # The clock is pinned to just after the fixture's newest sample rather
         # than left on wall time: the fixture is a real response from a real
@@ -1642,6 +2677,176 @@ class RotationBase(unittest.TestCase):
     def ranks(body):
         return dict(re.findall(r'capacity_rank\{[^}]*unit="([^"]+)"[^}]*\} ([0-9]+)', body))
 
+class PowerHistoryStoreTest(unittest.TestCase):
+    """The local power cache: what it promises, and what it must not promise."""
+
+    def test_repolling_a_window_replaces_rather_than_duplicates(self):
+        # The API hands back the whole lookback every cycle. Appending blindly
+        # would quadruple the file within a day and put four readings on one
+        # timestamp for the integrator to step through.
+        history = exporter.PowerHistory()
+        history.record({"E1": [(100.0, 5.0), (200.0, 6.0)]}, now=300.0)
+        history.record({"E1": [(100.0, 5.0), (200.0, 6.0)]}, now=300.0)
+        self.assertEqual(history.total_points(), 2)
+        self.assertEqual(history.series("E1"), [(100.0, 5.0), (200.0, 6.0)])
+
+    def test_a_revised_upstream_value_wins(self):
+        history = exporter.PowerHistory()
+        history.record({"E1": [(100.0, 5.0)]}, now=300.0)
+        history.record({"E1": [(100.0, 7.5)]}, now=300.0)
+        self.assertEqual(history.series("E1"), [(100.0, 7.5)])
+
+    def test_merged_prefers_the_fresh_series_on_collision(self):
+        history = exporter.PowerHistory()
+        history.record({"E1": [(100.0, 5.0)]}, now=300.0)
+        merged = history.merged("E1", [(100.0, 9.0), (200.0, 1.0)])
+        self.assertEqual(merged, [(100.0, 9.0), (200.0, 1.0)])
+
+    def test_retention_drops_old_points(self):
+        day = 86400.0
+        history = exporter.PowerHistory(retention_days=2.0)
+        history.record(
+            {"E1": [(1000.0, 1.0), (1000.0 + day, 2.0), (1000.0 + 3 * day, 3.0)]},
+            now=1000.0 + 3 * day,
+        )
+        self.assertEqual(history.total_points(), 2)
+        self.assertNotIn(1000.0, dict(history.series("E1")))
+
+    def test_zero_retention_keeps_everything(self):
+        # Disabling the bound must mean "unbounded", not "keep nothing".
+        history = exporter.PowerHistory(retention_days=0)
+        history.record({"E1": [(1.0, 1.0)]}, now=1e12)
+        self.assertEqual(history.total_points(), 1)
+
+    def test_round_trips_through_disk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "power-history.json")
+            first = exporter.PowerHistory(path)
+            first.record({"E1": [(100.0, 5.0), (200.0, 6.0)], "E2": [(100.0, 1.0)]}, now=300.0)
+            first.save()
+            second = exporter.PowerHistory(path)
+            self.assertEqual(second.load(), 3)
+            self.assertEqual(second.series("E1"), [(100.0, 5.0), (200.0, 6.0)])
+            self.assertEqual(second.series("E2"), [(100.0, 1.0)])
+
+    def test_a_corrupt_file_starts_cold_instead_of_raising(self):
+        # A cache is not worth an outage. This must warn and continue.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "power-history.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("{not json")
+            history = exporter.PowerHistory(path)
+            self.assertEqual(history.load(), 0)
+            history.record({"E1": [(100.0, 5.0)]}, now=300.0)
+            self.assertEqual(history.total_points(), 1)
+
+    def test_no_path_means_no_writes_and_no_error(self):
+        history = exporter.PowerHistory(None)
+        history.record({"E1": [(100.0, 5.0)]}, now=300.0)
+        history.save()
+        self.assertEqual(history.load(), 0)
+
+    def test_junk_rows_are_skipped_not_fatal(self):
+        history = exporter.PowerHistory()
+        history.record({"E1": [(None, 5.0), ("x", 1.0), (100.0, 2.0)]}, now=300.0)
+        self.assertEqual(history.series("E1"), [(100.0, 2.0)])
+
+
+class PowerHistoryIntegrationTest(RotationBase):
+    """Inference must survive a scrape that brings no power of its own."""
+
+    def setUp(self):
+        super().setUp()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "power-history.json")
+        # 04:00 is where the overnight feed lands, and the anchor has to sit
+        # inside capacity: AAA registers 400 MWh, so a 500 MWh reading would be
+        # past full before the test began.
+        self.anchor = self.overnight(self.clock[0], hour=4)
+        self.first = self.anchor + self.HOUR
+        self.second = self.anchor + 3 * self.HOUR
+
+    def series_with_history_then_gap(self):
+        """One good cycle of power, then a silent one.
+
+        The battery charges at -20 MW from a 100 MWh anchor. Once the API stops
+        returning power, the only way to keep integrating is our own cache -
+        which is the whole point of storing it.
+        """
+        seen = []
+
+        def series_for(now):
+            if seen:
+                return {}
+            seen.append(now)
+            return {
+                "AAA": [
+                    ("AAA1", "storage", (self.anchor, 100.0)),
+                    ("AAA1", "power", (self.anchor + 1800.0, -20.0)),
+                    ("AAA1", "power", (self.anchor + 5400.0, -20.0)),
+                ]
+            }
+
+        return series_for
+
+    def build(self, history):
+        client = self.fleet_client(self.series_with_history_then_gap())
+        return self.make(
+            client, top=1, enable_inferred=True, infer_fresh_hours=1.0,
+            max_infer_hours=6.0, infer_max_gap_hours=2.0, power_history=history,
+        )
+
+    def test_cached_power_keeps_inference_alive_when_the_api_goes_quiet(self):
+        history = exporter.PowerHistory(self.path)
+        self.build(history)
+        self.cycle_at(self.first)                 # records power into the cache
+        self.assertGreater(history.total_points(), 0)
+        # Two hours later the facility returns nothing at all.
+        body = self.cycle_at(self.second)
+        self.assertIn("oe_batteries_inferred 1", body)
+        self.assertIn('oe_battery_soc_inferred_ratio{facility="AAA"', body)
+
+    def test_without_the_cache_the_same_scrape_publishes_nothing(self):
+        # The control, and the reason the first test means anything: same data,
+        # no cache, so the silent scrape has no power to integrate and inference
+        # has to stay silent. If this ever passed, the cache would be untested.
+        self.build(None)
+        self.cycle_at(self.first)
+        body = self.cycle_at(self.second)
+        self.assertIn("oe_batteries_inferred 0", body)
+        self.assertNotIn('oe_battery_soc_inferred_ratio{facility="AAA"', body)
+
+    def test_history_persists_across_a_restart(self):
+        history = exporter.PowerHistory(self.path)
+        self.build(history)
+        self.cycle_at(self.first)
+        self.assertTrue(os.path.exists(self.path))
+        # A brand new store, exactly as a restarted process would build.
+        revived = exporter.PowerHistory(self.path)
+        self.assertGreater(revived.load(), 0)
+        self.assertEqual(revived.series("AAA1"), history.series("AAA1"))
+
+    def test_the_anchor_is_never_persisted(self):
+        # The one thing this store must not hold is a claim about present
+        # energy. A file cannot know whether it is still true, and a restart
+        # that trusted one would serve a stale SOC as current - the failure mode
+        # the rest of the exporter refuses everywhere.
+        history = exporter.PowerHistory(self.path)
+        self.build(history)
+        self.cycle_at(self.first)
+        history.save()
+        with open(self.path, "r", encoding="utf-8") as handle:
+            blob = json.load(handle)
+        self.assertEqual(sorted(blob["units"]), ["AAA1"])
+        self.assertEqual(blob["version"], 1)
+        for stamp, value in blob["units"]["AAA1"]:
+            self.assertNotAlmostEqual(value, 100.0, places=6)   # not the anchor
+            self.assertNotAlmostEqual(stamp, self.anchor, places=3)
+        self.assertNotIn("anchor", json.dumps(blob).lower())
+        self.assertNotIn("mwh", json.dumps(blob).lower())
+
+
 class RotationTest(RotationBase):
     """The rotation itself: who is in scope, and at what cost."""
 
@@ -1886,6 +3091,555 @@ class LivenessPersistenceTest(RotationBase):
             exporter.resolve_liveness_path("/tmp/x.json", "/cache/fleet.json"),
             "/tmp/x.json",
         )
+
+
+class ZeroOrderHoldTest(unittest.TestCase):
+    """Carrying the last observed rate forward to `now`, scaled by elapsed time.
+
+    The power series is sampled on a fixed grid and scrapes land between those
+    points, so without a hold every scrape in an interval republishes the same
+    number. With one, an hour-old hourly rate contributes an hour of energy and
+    a five-minute-old one contributes 1/12th.
+    """
+    def _scraper(self, now=0.0):
+        client = exporter.OpenElectricityClient("k", retries=0, request_interval=0.0)
+        return make_scraper(client, enable_inferred=True, now_fn=lambda: now)
+
+
+    def test_the_your_one_twelfth_example(self):
+        # -100 MW held for 5 minutes: 100/12 MWh grid-side, times 0.9 efficiency.
+        r = exporter.infer_soc(
+            anchor_mwh=500.0, anchor_ts=0.0,
+            power_series=[(0.0, -100.0), (3600.0, -100.0)],
+            now=3900.0, capacity_mwh=1000.0, max_hours=24.0, clamp=True,
+            max_gap_hours=2.0, charge_efficiency=0.9,
+            hold_rate=-100.0, hold_max_hours=6.0,
+        )
+        # One full hour integrated (90 MWh stored) plus 5 minutes held (7.5).
+        self.assertAlmostEqual(r["energy_mwh"], 500.0 + 90.0 + 7.5, places=6)
+        self.assertAlmostEqual(r["hold_hours"], 5.0 / 60.0, places=6)
+
+    def test_the_hold_is_proportional_to_elapsed_time(self):
+        # Same rate, three different ages: energy must scale linearly. This is
+        # the property that makes it a rate rather than a per-poll step.
+        base = dict(
+            anchor_mwh=500.0, anchor_ts=0.0,
+            power_series=[(0.0, -100.0), (3600.0, -100.0)],
+            capacity_mwh=1000.0, max_hours=24.0, clamp=True,
+            max_gap_hours=2.0, charge_efficiency=0.9,
+            hold_rate=-100.0, hold_max_hours=6.0,
+        )
+        energies = [
+            exporter.infer_soc(now=3900.0 + 600 * k, **base)["energy_mwh"]
+            for k in range(3)
+        ]
+        # 10 min of -100 MW is 16.667 MWh grid-side, 15.0 at 0.9 efficiency.
+        self.assertAlmostEqual(energies[1] - energies[0], 15.0, places=6)
+        self.assertAlmostEqual(energies[2] - energies[1], 15.0, places=6)
+
+    def test_no_hold_by_default_keeps_the_exact_integral(self):
+        # Default is off, so the pre-existing behaviour is preserved for any
+        # caller that does not ask for a hold.
+        r = exporter.infer_soc(
+            anchor_mwh=500.0, anchor_ts=0.0,
+            power_series=[(0.0, -100.0), (3600.0, -100.0)],
+            now=3900.0, capacity_mwh=1000.0, max_hours=24.0, clamp=True,
+            max_gap_hours=2.0, charge_efficiency=0.9,
+        )
+        self.assertAlmostEqual(r["energy_mwh"], 590.0, places=6)
+        self.assertEqual(r["hold_hours"], 0.0)
+
+    def test_the_hold_is_capped(self):
+        # A rate nobody is confirming cannot be carried indefinitely. 24h of
+        # staleness against a 6h cap contributes exactly 6h of energy.
+        r = exporter.infer_soc(
+            anchor_mwh=500.0, anchor_ts=0.0,
+            power_series=[(0.0, -100.0), (3600.0, -100.0)],
+            now=3600.0 + 24 * 3600.0, capacity_mwh=100000.0, max_hours=48.0,
+            clamp=True, max_gap_hours=2.0, charge_efficiency=1.0,
+            hold_rate=-100.0, hold_max_hours=6.0,
+        )
+        self.assertAlmostEqual(r["hold_hours"], 6.0, places=6)
+        self.assertAlmostEqual(r["energy_mwh"], 500.0 + 100.0 + 600.0, places=6)
+
+    def test_a_zero_cap_disables_the_hold_entirely(self):
+        r = exporter.infer_soc(
+            anchor_mwh=500.0, anchor_ts=0.0,
+            power_series=[(0.0, -100.0), (3600.0, -100.0)],
+            now=3900.0, capacity_mwh=1000.0, max_hours=24.0, clamp=True,
+            max_gap_hours=2.0, charge_efficiency=0.9,
+            hold_rate=-100.0, hold_max_hours=0.0,
+        )
+        self.assertAlmostEqual(r["energy_mwh"], 590.0, places=6)
+        self.assertEqual(r["hold_hours"], 0.0)
+
+    def test_a_held_battery_stops_at_full_and_says_so(self):
+        # Charging at 100 MW from 990/1000 would pass full within the hold. It
+        # must clamp at capacity and report saturation rather than exceed it -
+        # otherwise the line walks off the top of the panel.
+        r = exporter.infer_soc(
+            anchor_mwh=990.0, anchor_ts=0.0,
+            power_series=[(0.0, -100.0), (3600.0, -100.0)],
+            now=4200.0, capacity_mwh=1000.0, max_hours=24.0, clamp=True,
+            max_gap_hours=2.0, charge_efficiency=1.0,
+            hold_rate=-100.0, hold_max_hours=6.0,
+        )
+        self.assertEqual(r["energy_mwh"], 1000.0)
+        self.assertEqual(r["saturated"], 1.0)
+
+    def test_the_hold_only_ever_runs_forwards(self):
+        # now=3600 is exactly the newest sample, so there is no lag to fill and
+        # the hold is zero. `now` earlier than that is rejected outright, since
+        # `infer_soc` refuses to integrate a partial segment rather than report
+        # a half-integrated anchor as if it were the whole window.
+        r = exporter.infer_soc(
+            anchor_mwh=500.0, anchor_ts=0.0,
+            power_series=[(0.0, -100.0), (3600.0, -100.0)],
+            now=3600.0, capacity_mwh=1000.0, max_hours=24.0, clamp=True,
+            max_gap_hours=2.0, charge_efficiency=1.0,
+            hold_rate=-100.0, hold_max_hours=6.0,
+        )
+        self.assertEqual(r["hold_hours"], 0.0)
+        self.assertAlmostEqual(r["energy_mwh"], 600.0, places=6)
+        self.assertIsNone(
+            exporter.infer_soc(
+                anchor_mwh=500.0, anchor_ts=0.0,
+                power_series=[(0.0, -100.0), (3600.0, -100.0)],
+                now=1000.0, capacity_mwh=1000.0, max_hours=24.0, clamp=True,
+                max_gap_hours=2.0, charge_efficiency=1.0,
+                hold_rate=-100.0, hold_max_hours=6.0,
+            )
+        )
+
+    def test_a_reading_that_goes_stale_after_the_poll_gets_an_inferred_row(self):
+        # Measured was fresh when the poll ran, so `_compute_inferred` correctly
+        # produced nothing. Measured then kept ageing with no re-evaluation until
+        # the next poll, which meant the unit published a long-expired measured
+        # value and no inferred line at all - the handover drifted by up to a
+        # whole poll interval.
+        scraper = self._scraper()
+        scraper.infer_fresh_hours = 2.0
+        unit = "E1"
+        series = [(t * 300.0, -100.0) for t in range(0, 25)]
+        scraper._last_measured_mwh = {unit: 500.0}
+        scraper._last_measured_ts = {unit: 0.0}
+        sample = {
+            "unit": unit, "facility": "ERB", "scrape_success": 1,
+            "sampled_at": 0.0, "capacity_mwh": 1000.0, "power_series": series,
+        }
+        poll_t = 3600.0                       # measured 1h old: still current
+        rows = scraper._compute_inferred([sample], poll_t, poll_t)
+        self.assertEqual(rows, [])
+        scraper._state = {
+            "samples": [sample], "samples_map": {unit: sample}, "inferred": rows,
+            "last_measured_mwh": {unit: 500.0}, "last_measured_ts": {unit: 0.0},
+            "max_infer_hours": 15.0, "infer_max_hold_hours": 6.0,
+            "infer_charge_efficiency": 0.9,
+        }
+        # Still inside the freshness window: measured keeps winning, so there is
+        # nothing to add and the refresh must not invent a competing value.
+        early = scraper._refresh_inferred_for_render(scraper._state, poll_t + 3600.0)
+        self.assertEqual(early.get("inferred") or [], [])
+        # Past it: the inferred line appears without waiting for the next poll.
+        late = scraper._refresh_inferred_for_render(scraper._state, poll_t + 5400.0)
+        self.assertEqual(len(late["inferred"]), 1)
+        self.assertEqual(late["inferred"][0]["unit"], unit)
+        self.assertGreater(late["inferred"][0]["inferred_soc"], 0.0)
+
+    def test_the_newly_stale_path_never_duplicates_an_existing_row(self):
+        # E2 is already stale at poll time so the poll produced a row for it.
+        # E1 is fresh then and only earns one later. Adding E1 must not disturb
+        # E2, and neither unit may end up with two rows - Grafana would read that
+        # as two batteries.
+        scraper = self._scraper()
+        scraper.infer_fresh_hours = 2.0
+
+        def make(unit):
+            return {
+                "unit": unit, "facility": "ERB", "scrape_success": 1,
+                "sampled_at": 0.0, "capacity_mwh": 1000.0,
+                "power_series": [(t * 300.0, -100.0) for t in range(0, 25)],
+            }
+
+        e1, e2 = make("E1"), make("E2")
+        scraper._last_measured_mwh = {"E1": 500.0, "E2": 500.0}
+        scraper._last_measured_ts = {"E1": 0.0, "E2": 0.0}
+        poll_t = 10 * 3600.0                  # E1 10h old -> inferred, E2 same
+        rows = scraper._compute_inferred([e1, e2], poll_t, poll_t)
+        self.assertEqual(sorted(r["unit"] for r in rows), ["E1", "E2"])
+        scraper._state = {
+            "samples": [e1, e2], "samples_map": {"E1": e1, "E2": e2},
+            "inferred": rows,
+            "last_measured_mwh": {"E1": 500.0, "E2": 500.0},
+            "last_measured_ts": {"E1": 0.0, "E2": 0.0},
+            "max_infer_hours": 15.0, "infer_max_hold_hours": 6.0,
+            "infer_charge_efficiency": 0.9,
+        }
+        out = scraper._refresh_inferred_for_render(scraper._state, poll_t + 3600.0)
+        units = [r["unit"] for r in out["inferred"]]
+        self.assertEqual(sorted(units), ["E1", "E2"])
+        self.assertEqual(len(units), len(set(units)))
+
+    def test_the_newly_stale_path_respects_the_inference_opt_out(self):
+        scraper = self._scraper()
+        scraper.enable_inferred = False
+        unit = "E1"
+        sample = {
+            "unit": unit, "facility": "ERB", "scrape_success": 1,
+            "sampled_at": 0.0, "capacity_mwh": 1000.0,
+            "power_series": [(t * 300.0, -100.0) for t in range(0, 25)],
+        }
+        state = {
+            "samples": [sample], "samples_map": {unit: sample}, "inferred": [],
+            "last_measured_mwh": {unit: 500.0}, "last_measured_ts": {unit: 0.0},
+            "max_infer_hours": 15.0, "infer_max_hold_hours": 6.0,
+            "infer_charge_efficiency": 0.9,
+        }
+        out = scraper._refresh_inferred_for_render(state, 20000.0)
+        self.assertEqual(out.get("inferred") or [], [])
+
+    def test_saturation_is_judged_after_the_hold_not_before(self):
+        # The held stretch is part of the estimate, so it has to be included in
+        # what `saturated` looks at. Capturing the pre-hold value let a battery
+        # sit pinned at exactly capacity reporting sat=0 - indistinguishable
+        # from a genuine full battery, which is the one thing the flag exists to
+        # prevent.
+        # 950 MWh anchor, -70 MW: integrated 378 MWh reaches the 1090 ceiling
+        # during the hold, not before it.
+        r = exporter.infer_soc(
+            anchor_mwh=950.0, anchor_ts=0.0,
+            power_series=[(t * 300.0, -70.0) for t in range(0, 24)],   # 0..2h
+            now=7200.0 + 3600.0, capacity_mwh=1090.0, max_hours=24.0, clamp=True,
+            max_gap_hours=2.0, charge_efficiency=1.0,
+            hold_rate=-70.0, hold_max_hours=6.0,
+        )
+        # 2h of samples puts the raw integral at 980 MWh; the hold then carries
+        # the rate forward from 6900s to 10800s, adding ~75.8 more and taking it
+        # past the 1090 ceiling. It must clamp at capacity and report the raw
+        # value as outside the envelope, which is what distinguishes a held
+        # estimate sitting at 100% from a genuinely full battery.
+        self.assertEqual(r["energy_mwh"], 1090.0)
+        self.assertEqual(r["saturated"], 1.0)
+        self.assertAlmostEqual(r["hold_hours"], 3900.0 / 3600.0, places=6)
+
+    def test_charging_is_still_discounted_in_the_held_stretch(self):
+        # The hold is part of the estimate, so the efficiency term applies to
+        # it exactly as it does to an integrated segment.
+        kw = dict(
+            anchor_mwh=0.0, anchor_ts=0.0,
+            power_series=[(0.0, -100.0), (3600.0, -100.0)],
+            capacity_mwh=100000.0, max_hours=24.0, clamp=True,
+            max_gap_hours=2.0, hold_rate=-100.0, hold_max_hours=6.0,
+        )
+        efficient = exporter.infer_soc(now=5400.0, charge_efficiency=1.0, **kw)
+        lossy = exporter.infer_soc(now=5400.0, charge_efficiency=0.9, **kw)
+        # now=5400 is one hour integrated plus 30 minutes held.
+        self.assertAlmostEqual(efficient["energy_mwh"], 100.0 + 50.0, places=6)
+        self.assertAlmostEqual(lossy["energy_mwh"], (100.0 + 50.0) * 0.9, places=6)
+
+    def test_the_render_refresh_advances_the_value_between_polls(self):
+        # End to end through the scraper: two scrapes with no poll in between,
+        # same power samples, and the published SOC must move - because the
+        # hold grows with the wall clock rather than being frozen at poll time.
+        client = exporter.OpenElectricityClient("k", retries=0, request_interval=0.0)
+        anchor_ts = 0.0
+        series = [(0.0, -100.0), (3600.0, -100.0)]
+        scraper = make_scraper(
+            client, enable_inferred=True, now_fn=lambda: 3600.0
+        )
+        scraper.infer_max_hold_hours = 6.0
+        scraper.infer_charge_efficiency = 0.9
+        scraper.infer_max_gap_hours = 2.0
+        scraper.infer_clamp = True
+        scraper._last_measured_mwh = {"E1": 500.0}
+        scraper._last_measured_ts = {"E1": anchor_ts}
+        # The reading has to be older than --infer-fresh-hours or measured wins
+        # and inference correctly publishes nothing at all.
+        scraper.infer_fresh_hours = 0.5
+        sample = {
+            "unit": "E1", "facility": "ERB", "scrape_success": 1,
+            "sampled_at": 0.0, "capacity_mwh": 100000.0,
+            "power_series": series,
+        }
+        rows = scraper._compute_inferred([sample], 3600.0, 3600.0)
+        self.assertEqual(len(rows), 1)
+        scraper._state = {
+            "samples": [sample],
+            "samples_map": {"E1": sample},
+            "inferred": rows,
+            "last_measured_mwh": {"E1": 500.0},
+            "last_measured_ts": {"E1": anchor_ts},
+            "max_infer_hours": 24.0,
+            "infer_max_hold_hours": 6.0,
+            "infer_charge_efficiency": 0.9,
+        }
+        scraper.now_fn = lambda: 3600.0
+        first, _ = scraper.exposition()
+        scraper.now_fn = lambda: 4200.0   # ten minutes later, no new poll
+        second, _ = scraper.exposition()
+
+        def soc_of(body):
+            for line in body.splitlines():
+                if line.startswith("oe_battery_soc_inferred_ratio{"):
+                    return float(line.rsplit(" ", 1)[1])
+            return None
+
+        self.assertIsNotNone(soc_of(first))
+        # 10 min of -100 MW at 0.9 is 15 MWh against 100000 MWh of capacity.
+        self.assertAlmostEqual(soc_of(second) - soc_of(first), 15.0 / 100000.0, places=9)
+        # And the hold is published, so the extrapolation is visible.
+        self.assertIn("oe_battery_inferred_hold_hours{", second)
+
+
+class AnchorAgeTest(unittest.TestCase):
+    """`oe_battery_anchor_age_hours` is the evidence that an inferred line is
+    missing because the upstream feed went quiet, rather than because the
+    battery has no data. It has to be published in both of those cases, which
+    means independently of whether inference produced anything at all.
+    """
+
+    NOW = 1_700_000_000.0
+
+    def _render(self, samples, last_measured_ts, inferred=None, max_infer_hours=24.0):
+        return exporter.render(
+            {
+                "samples": samples,
+                "inferred": inferred or [],
+                "last_measured_ts": last_measured_ts,
+                "max_infer_hours": max_infer_hours,
+            },
+            self.NOW,
+        )
+
+    def _value(self, text, metric, unit="E1"):
+        for line in text.splitlines():
+            if line.startswith(metric + "{") and ('unit="%s"' % unit) in line:
+                return float(line.rsplit(" ", 1)[1])
+        return None
+
+    def _sample(self, unit="E1", **kw):
+        base = {
+            "unit": unit, "facility": "ERB", "facility_name": "Eraring",
+            "region": "NSW1", "status": "operating", "capacity_mwh": 1997.0,
+            "scrape_success": 1, "sampled_at": self.NOW - 31.8 * 3600,
+            "stored_mwh": 330.3, "soc": 330.3 / 1997.0,
+        }
+        base.update(kw)
+        return base
+
+    def test_anchor_age_is_published_in_hours(self):
+        stamp = self.NOW - 31.8 * 3600
+        text = self._render([self._sample()], {"E1": stamp})
+        self.assertAlmostEqual(
+            self._value(text, "oe_battery_anchor_age_hours"), 31.8, places=6
+        )
+
+    def test_anchor_timestamp_is_published(self):
+        stamp = self.NOW - 31.8 * 3600
+        text = self._render([self._sample()], {"E1": stamp})
+        self.assertEqual(self._value(text, "oe_battery_anchor_timestamp_seconds"), stamp)
+
+    def test_it_is_published_even_with_no_estimate_at_all(self):
+        # The whole reason this metric exists. A 31.8h-old anchor is past
+        # --max-infer-hours, so inference refuses and the inferred line is
+        # absent - which used to be the only symptom, indistinguishable from a
+        # battery with no data at all.
+        stamp = self.NOW - 31.8 * 3600
+        text = self._render([self._sample()], {"E1": stamp}, max_infer_hours=15.0)
+        self.assertEqual(self._value(text, "oe_battery_soc_inferred_ratio"), None)
+        self.assertIsNotNone(self._value(text, "oe_battery_anchor_age_hours"))
+
+    def test_it_is_published_while_an_estimate_does_exist(self):
+        stamp = self.NOW - 6.0 * 3600
+        row = dict(
+            self._sample(), unit="E1", inferred_soc=0.42, inferred_ts=stamp,
+            inferred_age=6.0 * 3600, inferred_saturated=0, inferred_hold_hours=0.5,
+        )
+        text = self._render([self._sample()], {"E1": stamp}, inferred=[row])
+        self.assertIsNotNone(self._value(text, "oe_battery_soc_inferred_ratio"))
+        self.assertAlmostEqual(
+            self._value(text, "oe_battery_anchor_age_hours"), 6.0, places=6
+        )
+
+    def test_units_with_no_known_anchor_are_omitted_not_zeroed(self):
+        # A zero here would read as "published right now", which is the opposite
+        # of the truth and would defeat the metric's purpose.
+        text = self._render([self._sample()], {})
+        self.assertEqual(self._value(text, "oe_battery_anchor_age_hours"), None)
+        self.assertEqual(self._value(text, "oe_battery_anchor_timestamp_seconds"), None)
+
+    def test_a_future_anchor_clamps_to_zero_rather_than_going_negative(self):
+        stamp = self.NOW + 600.0
+        text = self._render([self._sample()], {"E1": stamp})
+        self.assertEqual(self._value(text, "oe_battery_anchor_age_hours"), 0.0)
+
+    def test_each_unit_gets_its_own_anchor(self):
+        a, b = self.NOW - 3.0 * 3600, self.NOW - 20.0 * 3600
+        text = self._render(
+            [self._sample(unit="E1"), self._sample(unit="E2")],
+            {"E1": a, "E2": b},
+        )
+        self.assertAlmostEqual(
+            self._value(text, "oe_battery_anchor_age_hours", "E1"), 3.0, places=6
+        )
+        self.assertAlmostEqual(
+            self._value(text, "oe_battery_anchor_age_hours", "E2"), 20.0, places=6
+        )
+
+    def test_it_survives_a_failed_poll_that_returns_no_samples(self):
+        # A failed cycle publishes an empty sample list. The measured ages go
+        # with it, so nothing distinguishes that from a quiet feed - this is the
+        # second blind spot the anchor pair is meant to close, so the rendering
+        # must at least not crash or invent a value.
+        text = self._render([], {"E1": self.NOW - 3600.0})
+        self.assertEqual(self._value(text, "oe_battery_anchor_age_hours"), None)
+
+
+class InferredAgeClockTest(unittest.TestCase):
+    """State is published per poll and rendered per scrape, so the wall clock
+    has to be read at render time. Otherwise two ages in one exposition
+    disagree, and the measured/inferred handover fires late.
+    """
+
+    def _scraper(self, now):
+        client = exporter.OpenElectricityClient("k", retries=0, request_interval=0.0)
+        scraper = make_scraper(
+            client, enable_inferred=True, now_fn=lambda: now
+        )
+        return scraper
+
+    def _state_with_inferred(self, scraper, inferred_ts, inferred_age):
+        # The shape poll_once publishes: an inferred row plus a state wrapper.
+        state = {
+            "samples": [],
+            "inferred": [
+                {
+                    "unit": "E1",
+                    "facility": "ERB",
+                    "inferred_ts": inferred_ts,
+                    "inferred_age": inferred_age,
+                    "inferred_soc": 0.5,
+                }
+            ],
+            "oe_batteries_inferred": 1,
+        }
+        return state
+
+    def test_the_bug_this_fixes_two_ages_in_one_exposition_disagree(self):
+        # Reproduces the live symptom: same inferred timestamp, two clocks.
+        poll_now = 1000.0
+        scraper = self._scraper(poll_now)
+        state = self._state_with_inferred(scraper, inferred_ts=900.0, inferred_age=100.0)
+        scraper._state = state
+
+        # Scrape 30 minutes after the poll, with no new power samples.
+        scraper.now_fn = lambda: 1300.0
+        body, _ = scraper.exposition()
+        self.assertIn("oe_battery_inferred_age_seconds", body)
+        # The age must now be measured from the scrape, not replayed from the
+        # poll: 1300 - 900 = 400s, not the 100s frozen into the state.
+        self.assertIn("} 400", body)
+        self.assertNotIn("} 100", body)
+
+    def test_inferred_age_matches_the_power_sample_age(self):
+        # The two metrics describe the same power timestamp, so at scrape time
+        # they must agree. Before the fix they were computed against different
+        # `now`s and drifted apart by up to a whole poll interval.
+        poll_now = 1000.0
+        scraper = self._scraper(poll_now)
+        power_ts = 900.0
+        state = {
+            "samples": [
+                {
+                    "unit": "E1",
+                    "facility": "ERB",
+                    "scrape_success": 1,
+                    "power_sampled_at": power_ts,
+                    "power_age": 100.0,
+                }
+            ],
+            "inferred": [
+                {
+                    "unit": "E1",
+                    "facility": "ERB",
+                    "inferred_ts": power_ts,
+                    "inferred_age": 100.0,
+                }
+            ],
+        }
+        scraper._state = state
+        scraper.now_fn = lambda: 1300.0
+        body, _ = scraper.exposition()
+        ages = {}
+        for line in body.splitlines():
+            for key in (
+                "oe_battery_inferred_age_seconds",
+                "oe_battery_power_sample_age_seconds",
+            ):
+                if line.startswith(key + "{"):
+                    ages[key] = float(line.rsplit(" ", 1)[1])
+        self.assertIn("oe_battery_inferred_age_seconds", ages)
+        self.assertIn("oe_battery_power_sample_age_seconds", ages)
+        self.assertEqual(ages["oe_battery_inferred_age_seconds"], 400.0)
+
+    def test_without_a_hold_the_energy_does_not_move_between_polls(self):
+        # Hold disabled: the value is the exact integral up to the newest
+        # sample, so a later scrape changes nothing but the age. This is the
+        # older behaviour, still reachable with --infer-max-hold-hours=0.
+        poll_now = 1000.0
+        scraper = self._scraper(poll_now)
+        scraper.infer_max_hold_hours = 0.0
+        state = self._state_with_inferred(scraper, inferred_ts=900.0, inferred_age=100.0)
+        scraper._state = state
+        scraper.now_fn = lambda: 1000.0
+        before, _ = scraper.exposition()
+        scraper.now_fn = lambda: 4000.0
+        after, _ = scraper.exposition()
+
+        def value_of(body):
+            for line in body.splitlines():
+                if line.startswith("oe_battery_energy_inferred_mwh{"):
+                    return line.rsplit(" ", 1)[1]
+            return None
+
+        self.assertEqual(value_of(before), value_of(after))
+        self.assertIn("} 3100", after)  # the age did move
+
+    def test_render_does_not_mutate_the_published_state(self):
+        # A render in flight must keep a consistent view: the refresh returns a
+        # new dict rather than editing the one the poll thread published.
+        scraper = self._scraper(1000.0)
+        state = self._state_with_inferred(scraper, inferred_ts=900.0, inferred_age=100.0)
+        scraper._state = state
+        scraper.now_fn = lambda: 1300.0
+        scraper.exposition()
+        self.assertEqual(state["inferred"][0]["inferred_age"], 100.0)
+        self.assertIs(scraper._state, state)
+
+    def test_a_state_with_no_inferred_rows_is_returned_untouched(self):
+        scraper = self._scraper(1000.0)
+        state = {"samples": [], "inferred": []}
+        scraper._state = state
+        scraper.now_fn = lambda: 1300.0
+        scraper.exposition()
+        # Untouched: an empty inferred list means nothing to re-stamp, so the
+        # refresh short-circuits rather than rebuilding the state dict.
+        self.assertEqual(scraper._state["inferred"], [])
+        self.assertEqual(len(scraper._state["inferred"]), 0)
+
+    def test_the_handover_to_inference_is_not_delayed_by_a_poll(self):
+        # A reading inside --infer-fresh-hours at poll time must stop counting
+        # as current once the wall clock passes it, without waiting for the next
+        # poll to re-evaluate. Checked on the predicate the render path uses.
+        scraper = self._scraper(1000.0)
+        scraper.infer_fresh_hours = 1.0
+        sample = {"scrape_success": 1, "sampled_at": 1000.0}
+        # 500s in: comfortably inside the 1h window.
+        self.assertTrue(scraper._measured_is_current(sample, 1500.0))
+        # The window is inclusive of its boundary, so 3600s still counts.
+        self.assertTrue(scraper._measured_is_current(sample, 4600.0))
+        # One second past it, and the reading stops being current.
+        self.assertFalse(scraper._measured_is_current(sample, 4601.0))
 
 
 class PacingTest(unittest.TestCase):

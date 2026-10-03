@@ -466,6 +466,109 @@ five-request cycle moving the balance 494 → 491 and a twelve-request cycle
 as a precise meter, and use `oe_api_requests_total` to reason about the rate
 buckets. `/me` on its own is free, which is what makes the gauge affordable.
 
+### The resolution lever is free; the polling lever is not
+
+Audited 2026-10-02, prompted by a reasonable suggestion: poll every 15 minutes
+instead of hourly to cut inferred-SOC error. The answer turned out to be the
+opposite - and more useful.
+
+- **Polling faster is genuinely pointless.** At the shipped `interval=5m` the
+  upstream series is already fully resolved, so two fetches 100 seconds apart
+  return byte-identical data with zero new points. Every gap across a 48h window
+  is exactly 5 minutes. There is nothing between polls to observe.
+- **The request budget is the wall, and we are near it.** `oe_api_requests_total`
+  reads **14 per cycle** (12 in scope + `/me` + fleet metadata on its cycle),
+  i.e. **336/day against the 366/day bucket**. A 15-minute loop would be
+  **1344/day — 3.7x over** — and 48/hour against a 32/hour bucket. Credits are
+  the *looser* limit (~60 of 500/day), which is why they are the wrong number to
+  watch; see the budget section above.
+- **Finer upstream data is free, and it is much better.** `interval` is a query
+  parameter on the *same* single request, so `5m` costs exactly what `1h` costs
+  — same endpoint, same request count, same credits. And the hourly value is
+  only the arithmetic mean of the twelve 5m samples beneath it (confirmed to
+  1e-6 across 119 hours), so the hourly series is the *lossy* view and asking
+  for `5m` simply stops throwing the intra-hour shape away. Integrated with the
+  shipped `infer_soc`, over four days:
+
+  | Horizon | 1h power | 5m power |
+  | --- | --- | --- |
+  | 1h | 0.82% | **0.40%** |
+  | 4h | 1.63% | **1.11%** |
+  | 6h | 2.12% | **1.47%** |
+  | 8h | 2.73% | **1.82%** (saturation 2% vs 9%) |
+  | 14h | 8.64% | **5.12%** |
+
+  Better at every horizon, on 7/7 units, for zero requests. **Shipped as
+  `--api-interval=5m`.**
+
+- **Per-unit efficiency coefficients do not generalise, so they do not ship.**
+  The model is linear in the coefficient (dE = A + eff·B), so it was fitted in
+  closed form per unit over five days (~50–225 windows each) and validated
+  leave-one-day-out. The fitted values are physically impossible — two units
+  want more than 1.0 (you cannot store more than you draw) and two go negative.
+  Leave-one-day-out moved the fleet from **1.47% → 1.42%**, a 3% gain, and was
+  *worse* than a flat 0.9 on 3 of 7 units. Refitting the single global
+  coefficient from scratch lands at 0.81 and buys 1.71% → 1.69%.
+
+#### What the residual actually is
+
+Decomposing it over 1365 windows (actual minus modelled, `--infer-charge-efficiency=0.9`):
+
+| Quantity | Value |
+| --- | --- |
+| Mean residual | −6.9 MWh (−0.49% of capacity) |
+| corr(residual, discharge energy) | **−0.46** |
+| corr(residual, charge energy) | −0.13 |
+| corr(residual, mean power) | +0.34 |
+| Least-squares scale error on discharge | **−5.9%** |
+| Least-squares scale error on charge | −8.6% |
+
+The dominant systematic term is on the **discharge** side — the side
+`stored_energy_delta` deliberately does *not* discount. But correcting it is
+nearly pointless: a two-parameter fit that removes both scale errors cuts mean
+abs residual by only **2%** (24.99 → 24.37 MWh). The error is not a scale
+problem, which is why no coefficient tuning moves it. **Do not spend more effort
+on coefficients.**
+
+By hour of day the residual is also not flat: **+3.6% of capacity for windows
+centred on 08:00 UTC** (18:00 Sydney, the first reading of each overnight window)
+settling to about −1% for the rest of the night. One candidate was checked and
+**ruled out**: the obvious suspect is a leading gap, since `infer_soc` begins
+integrating at the first power sample at or after the anchor, so a missing
+leading segment would be silently treated as no movement. It does not happen —
+across 385 anchors the first power sample lands at the anchor timestamp in
+**385/385 cases**. So whatever produces the 18:00 spike is not that, and it
+remains unexplained.
+
+#### The solar co-location hypothesis — a thread, deliberately left thin
+
+An earlier draft of this note proposed that the residual might be explained by
+solar contaminating the `power` metric. **I do not believe this, and the reason
+is worth recording so it is not re-litigated.**
+
+The idea is not crazy in the abstract: `power` is facility-level, and if it is
+metered at the connection point rather than at the battery terminals, then for
+any site with co-located solar the series is `battery + solar`, and integrating
+it would move energy that the battery never saw. Collie and Kwinana are known
+solar-plus-storage sites in reality, which is presumably why the idea occurred.
+
+**The evidence is against it.** `/facilities/` returns `fueltech_id` per unit,
+and all 12 polled units are `fueltech_id="battery"`. More telling, **no facility
+in the entire battery fleet registers a single solar unit** — including Collie
+and Kwinana, which unquestionably have solar. So the registry is *known* to be
+incomplete on precisely this question; it cannot rule co-location in or out on
+its own. What does rule it out as a *general* explanation is that the discharge
+residual appears identically at ERB01, WTAHB1, ORABESS1, STABESS1 and LDBESS1 —
+Eraring, Waratah, Hornsdale, Torrens and Lake Dartmoor, all standalone grid
+batteries with no solar on site. A contamination that requires solar cannot
+explain error at a site that has none.
+
+It remains worth *one* cheap check if someone wants to close it out: pick a
+battery with known co-located solar and compare its residual against the
+standalone fleet above. If it is not an outlier, the thread is dead and should
+be deleted rather than carried. Until then it is a hypothesis, not a finding,
+and it should not be cited as an explanation for the residual.
+
 ### The fleet as of 2026-09-30
 
 119 capacity-bearing battery units, 74 of them with any upstream observation,
@@ -555,3 +658,104 @@ returning to ~0.
   the same key silently overwrote one with the other and neither sum was
   exported, so the bug produced a missing metric rather than a wrong one. The
   row field is now `registered_mw`.
+- **Inferred SOC hands over on _freshness_, not on _presence_.**
+  `storage_battery` publishes overnight, so its 04:00 reading is still in the
+  lookback window at midday, still counted in `oe_battery_scrape_success`, and
+  hours out of date. Keying inference on `scrape_success` suppressed it for
+  exactly the daytime hours it exists to fill — the feature was inert and the
+  tests were green because both fixtures were built around an overnight
+  timestamp. `--infer-fresh-hours` is what decides handover;
+  `test_measured_reading_hands_over_to_inference_when_it_goes_stale` pins it.
+- **`--enable-inferred` needs the whole power series, which used to be thrown
+  away.** `battery_metrics()` collapsed each series to its newest point, which
+  is right for "SOC now" and leaves nothing to integrate. Hence `full_series`.
+  It costs **no extra requests** — the response already carried the window and
+  the exporter was discarding most of it. `poll_cycle` passes it only when
+  inference is on, so the default path is unchanged.
+- **A per-point counter multiplied by the window length.** With `full_series`,
+  `oe_battery_series_without_capacity` read 739 instead of 37, because the G1/L1
+  series are now counted once per *point* rather than once per *series*. Fixed
+  with a set keyed `(facility, unit, metric)`. Pinned by
+  `test_series_without_capacity_counts_series_not_points`. Worth remembering
+  that any counter incremented inside the per-point loop is now suspect.
+- **Gaps: integrating across a hole invents energy.** The docstring claimed gaps
+  were not bridged while the loop happily trapezoided between points 10h apart.
+  Now a segment wider than `--infer-max-gap-hours` ends the integration rather
+  than being bridged — and it *stops*, rather than resuming afterwards, since
+  the battery's state on the far side is unknown. One missing hourly point is
+  normal and still integrated; a real outage is not.
+- **Accuracy, measured 2026-10-01 against the live feed** (integrating from one
+  measured reading to the next, 7 units):
+
+  | Window | n | Median | Mean |
+  | --- | --- | --- | --- |
+  | 1h | 140 | 0.25% of capacity | 0.81% |
+  | ~14h | 7 | 10.4% of capacity | 7.4% |
+
+  (with `--infer-charge-efficiency=0.9`; see the loss-term note below)
+
+  Short windows are excellent; the full daytime gap is not. The drift is
+  systematically one-directional — the integral **over**-predicts stored
+  energy, consistent with conversion losses being ignored.
+- **Two different loss coefficients, one kept and one rejected.** Worth keeping
+  distinct, because the difference is the whole point.
+
+  *Rejected:* a symmetric throughput loss, `-f·∫|P|`, which discounts charging
+  and discharging identically. It was fitted against the live sample and
+  improved the 14h case by ~3 points while degrading the 1h case — it was
+  fitting 7 samples rather than a physical parameter, and a term that is wrong
+  in the *right* direction on every short window is worse than no term.
+
+  *Kept:* `--infer-charge-efficiency`, the share of grid-facing charging energy
+  that reaches the cells, applied to **charging only** — the discharge side is
+  already metered at the terminals, so there is nothing further to discount it
+  by. This is asymmetric by construction, and that asymmetry is what
+  distinguishes it from a fudge factor: it cannot be tuned to flatter a metric,
+  it either moves the estimate toward the measured one or it does not.
+
+  | Efficiency | 1h median | 14h median | 14h mean |
+  | --- | --- | --- | --- |
+  | `1.0` (no loss) | 0.3% | 14.3% | 11.3% |
+  | `0.9` | 0.3% | 10.4% | **7.4%** |
+
+  The acceptance test is the signature of a real physical term: it improves the
+  long window *and leaves the short window alone*. A fitted coefficient is
+  exactly the opposite. The value came from the operator, not from these seven
+  samples, which is what keeps the test meaningful.
+
+  Charging and discharging carrying different weights also requires splitting an
+  interval at a zero crossing (`stored_energy_delta`), because averaging across
+  the switch point would apply the charge discount to part of a segment that was
+  actually discharging.
+
+  What this still does not fix is a *per-unit* constant: cells, inverters and
+  auxiliary loads differ by unit and by site, so one fleet-wide number is a
+  simplification. The 14h error remains too large to publish over the full gap,
+  which is why `--max-infer-hours=6` stays.
+- **The clamp was hiding a real disagreement.** Waratah read exactly `1.0`
+  because the raw integral ran ~97 MWh past its 1680 MWh capacity. A clamped
+  value is indistinguishable from a genuine full battery, so
+  `oe_battery_inferred_saturated` reports it (and is flagged even with
+  `--no-infer-clamp`). Saturation across a fleet is what a units or sign bug
+  looks like, so it is worth an alert rather than a silent clamp.
+- **Not persisted on purpose: the inference anchor.** `_last_measured_*` is not
+  written to `liveness.json`, which stores liveness only — no reading, no SOC,
+  no energy. That is deliberate: a restart must never serve a stale SOC as if it
+  were current. Recovery is free instead, because the measured reading is still
+  in the API's lookback window, so the first poll after a restart re-establishes
+  the anchor on its own.
+- **The gap is ~18h; integration is good for ~6h. That mismatch is the finding.**
+  Drift from the anchor, live, 7 units: 0.9% at 1h, ~2% at 2–3h, 4.2% at 5h,
+  11.5% at 6h, 35% at 8h, 44% at 10h — and by 10h three of seven have run past
+  capacity entirely. A first deployment of `--max-infer-hours=26` "worked" in the
+  sense that it published 7/7 inferred values, and 3 of those 7 were a clamped
+  `1.0`: a chart saying three batteries are full when they are not. Setting the
+  cap to where the numbers are still good means inference now covers roughly
+  05:00–10:00 after the overnight reading and publishes nothing for the rest of
+  the day. That is a smaller win than the feature was pitched as, and it is the
+  honest one. Anyone re-tuning this should re-derive the drift curve before
+  raising the cap, not assume a longer window is free.
+- **A published metric nobody can trust is worse than a gap.** The reason
+  `--max-infer-hours` returns `None` past its cap rather than extrapolating is
+  the same reason unread series are omitted rather than zeroed: on a battery, a
+  plausible wrong number reads as a real observation.

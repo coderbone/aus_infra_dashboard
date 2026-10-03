@@ -481,6 +481,215 @@ same batteries everywhere and the table can join on `unit`:
 | `oe_battery_power_sample_timestamp_seconds` | gauge | When that power value was observed |
 | `oe_battery_power_sample_age_seconds` | gauge | Its age at export time |
 
+With `--enable-inferred`, a separate synthetic family is exported for units with
+no *fresh* measured reading. It is deliberately kept out of the table above so
+it can never be mistaken for an upstream number:
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `oe_battery_soc_inferred_ratio` | gauge | SOC 0–1, dead-reckoned from power |
+| `oe_battery_energy_inferred_mwh` | gauge | MWh behind that SOC, clamped to capacity |
+| `oe_battery_inferred_timestamp_seconds` | gauge | Newest power point integrated |
+| `oe_battery_inferred_age_seconds` | gauge | Its age at export time |
+| `oe_battery_inferred_saturated` | gauge | 1 = the raw integral left `[0, capacity]` |
+| `oe_battery_inferred_hold_hours` | gauge | hours the newest power rate has been carried forward to export time — the extrapolated share of the value above |
+| `oe_battery_anchor_age_hours` | gauge | age of the measured reading inferred SOC integrates away from — the quantity `--max-infer-hours` bounds |
+| `oe_battery_anchor_timestamp_seconds` | gauge | Unix time of that same anchor; never moves backwards, so a stalled feed reads as a frozen timestamp |
+
+Measured always wins: while the measured reading is younger than
+`--infer-fresh-hours` (default 2, deployed at 1) no inferred value is exported
+at all, so the two families never both claim the same cycle.
+
+**How accurate is it?** Measured against the live feed on 2026-10-01, integrating
+from one measured reading to the next:
+
+All figures below are with the deployed `--infer-charge-efficiency=0.9`.
+
+| Window | n | Median error | Mean error |
+| --- | --- | --- | --- |
+| 1 hour (within an overnight block) | 140 | 0.25% of capacity | 0.81% |
+| ~14 hours (the daytime gap) | 7 | 10.4% of capacity | 7.4% |
+
+Error accumulates fastest in the first hours after the anchor, where most of the
+movement is:
+
+| Hours since anchor | Mean drift from anchor | Units saturated |
+| --- | --- | --- |
+| 1h | 0.9% | 0/7 |
+| 2h | 1.9% | 0/7 |
+| 3h | 2.1% | 0/7 |
+| 4h | 1.1% | 0/7 |
+| 5h | 3.7% | 1/7 |
+| 6h | 10.3% | 1/7 |
+| 8h | 31.8% | 1/7 |
+| 10h | 43.0% | 3/7 |
+
+This is the whole story of the feature. Because `storage_battery` leaves an
+overnight gap, **integration cannot cover that gap for free**: by 10h the
+estimate has run into the capacity bound on half the fleet, and clamping it to
+100% would be a confident lie. Raising the cap buys coverage and costs accuracy
+— it will not refuse to answer, only answer badly.
+
+The deployment therefore runs `--max-infer-hours=48` with
+`--infer-fresh-hours=1`. The 48 is **not** a claim that a 48h integral is
+accurate; it is set above the worst anchor age actually observed so the estimate
+stays visible during an upstream publication failure. The fit error above is
+~5% of capacity by 14h and compounds well past that by 32h, so during an outage
+the dashed line should be read as *"batteries moved this way since 04:00"*, not
+as a state-of-charge reading.
+
+Once `storage_battery` publishes again the anchor refreshes and 48 becomes
+slack — the normal case is unaffected by the setting, so it can be dropped back
+to 24 at leisure. What must not happen is the reverse: setting it below the
+real anchor age does not degrade the estimate, it deletes it. That is exactly
+what happened at 15h on 2026-10-03, and
+[`oe_battery_anchor_age_hours`](#oe_battery_anchor_age_hours) now exists to make
+that failure mode visible rather than silent.
+
+### `--infer-charge-efficiency`
+
+Grid-facing charging energy and stored energy are not the same number: some is
+lost converting between AC and DC and never comes back. The coefficient is the
+share that reaches the cells, applied to **charging only** — the discharge side
+is already metered at the terminals, so there is nothing further to discount it
+by. That makes it a round-trip figure: at `0.9`, 100 MWh into the grid
+connection puts ~90 MWh in the cells and ~90 MWh comes back out.
+
+A segment that crosses zero is split at the crossing, because charging and
+discharging have to be weighted differently and averaging across the switch
+point would apply the wrong factor to part of the interval.
+
+Without it the integration is biased in one direction only — it consistently
+**over**-predicts stored energy — which is the signature of an ignored loss
+term. The default is `1.0`, i.e. no loss term at all, so the exporter assumes
+nothing about hardware it was not told about; the deployment sets `0.9`
+explicitly in `docker-compose.yml`.
+
+| `--infer-charge-efficiency` | 1h median | 14h median | 14h mean |
+| --- | --- | --- | --- |
+| `1.0` (no loss term) | 0.3% | 14.3% | 11.3% |
+| `0.9` (deployed) | 0.3% | 10.4% | **7.4%** |
+
+It roughly halves the error over the long gap and leaves the one-hour case
+untouched, which is what a genuine physical loss term should do. That is the
+test a coefficient *fitted* to these seven samples failed: see `NOTES.md` for
+why that version was rejected.
+
+One coefficient for the whole fleet remains a simplification, and the obvious
+next step — **a per-unit coefficient** — was tried and does not work. Fitted in
+closed form per unit over five days and validated leave-one-day-out, the values
+came out physically impossible (two units above 1.0, meaning they would store
+more energy than they drew; two negative), and held-out validation improved the
+fleet by 3% while being *worse* than a flat 0.9 on three units of seven. That is
+the signature of a model whose residual is not a loss term; `NOTES.md` records
+what the residual turns out to be. The lever that would actually move this error
+is finding out what `power` measures, not another coefficient.
+
+### `--infer-max-hold-hours`
+
+How long the newest observed power rate is carried forward to export time,
+scaled by the real elapsed time — a five-minute-old rate contributes 1/12th of
+its hourly energy, an hour-old one a full hour. Default `6`, set to `0` to
+disable.
+
+It exists because of an asymmetry that is easy to miss: `power` arrives on a
+fixed grid and Prometheus scrapes fall *between* those grid points. Integrating
+only the samples therefore produces a value that is exactly right but changes
+only when a new sample lands — hourly here. On a chart that is a staircase, and
+a staircase is indistinguishable from a battery that stopped moving. The hold
+turns it back into a line, and each real sample re-anchors it, so the error
+introduced is bounded by the time to the next sample rather than by the hold.
+
+Three bounds keep it an estimate rather than invention. `--max-infer-hours`
+still kills the whole estimate at the anchor; `--infer-max-hold-hours` caps how
+far a single unconfirmed rate is carried, so a poll that stops arriving
+degrades into a frozen line with a growing age instead of an indefinite
+extrapolation; and the capacity clamp still applies, so a held battery stops at
+full and reports `oe_battery_inferred_saturated` rather than walking off the
+panel. `oe_battery_inferred_hold_hours` publishes the held duration, because a
+value that is partly extrapolated should not look like one that was measured.
+
+### `oe_battery_anchor_age_hours`
+
+Publishes the age of the measured `storage_battery` reading that inferred SOC
+integrates away from, for every unit, whether or not an estimate exists.
+
+It exists because `--max-infer-hours` is a hard cut-off rather than a
+degradation: once the anchor is older than the setting, inference stops and
+`oe_battery_soc_inferred_ratio` is simply *absent*. An absent series and a
+battery with no data look identical on a dashboard, which is precisely when the
+cause matters most. The anchor pair turns that silence into a number:
+
+- `oe_battery_anchor_age_hours` — hours, so it reads directly against
+  `--max-infer-hours`. Above the setting, no estimate is published; that is the
+  whole rule.
+- `oe_battery_anchor_timestamp_seconds` — the underlying instant. It only ever
+  moves forward, so a stalled upstream feed is a flat line rather than a gap,
+  which is the form that survives being pasted into a support ticket.
+
+Both are emitted even when the poll that produced them returned nothing, and a
+unit whose anchor is unknown is omitted rather than zeroed — a zero would read as
+"published just now", inverting the metric's purpose.
+
+Observed on 2026-10-03: `storage_battery` stopped publishing and the anchor
+reached 31.8h, which at `--max-infer-hours=15` suppressed every inferred line
+with no other symptom. The setting was raised to 48 to prefer a visibly-degrading
+estimate over none; see the `--max-infer-hours` discussion below for what that
+costs.
+
+### `--power-history-file` and `--power-history-days`
+### `--power-history-file` and `--power-history-days`
+
+A local, self-hosted copy of the per-unit power series, held in memory and in a
+plain JSON file (`power-history.json` beside `--fleet-cache-file` by default).
+
+What it buys is **resilience, not accuracy**. Inferred SOC integrates the power
+series between two measured energy readings, and until now that series came only
+from the current cycle's API response — which quietly couples the estimator both
+to how deep a lookback the exporter asked for and to whether the API was
+reachable. A scrape that failed mid-window silently shortened the integration,
+and the result was indistinguishable from a battery that had simply stopped.
+Merging the cache with each fresh response turns that into lost freshness
+rather than lost history.
+
+It is deliberately **not** used to hold the inference anchor. `_last_measured_*`
+still re-derives from the API on every start, because a persisted anchor would
+let a restart serve a stale SOC as if it were current — the one failure mode the
+exporter refuses everywhere else. Power is a bounded, self-correcting physical
+signal; an energy anchor is a claim about the present, and a file on disk cannot
+tell whether it is still true.
+
+Bounded twice over: by `--power-history-days` (14 by default), and by keeping
+one value per (unit, timestamp), so re-polling the same lookback replaces rather
+than duplicates. At `--api-interval=5m` that is ~288 points per unit per day, so
+14 days of a 12-unit fleet is roughly 1 MB — still trivial, but no longer
+something to read with `cat`; `--power-history-days` is the knob if it ever
+matters.
+
+Storing it does **not** let you poll faster: the upstream power series is
+already fully resolved at `--api-interval`, so re-fetching returns
+byte-identical data for another request. `--api-interval=5m` is the knob that
+*does* change resolution, and it is free, being a query parameter on the same
+one request — over four days it roughly halves mean error at every horizon
+(1.47% vs 2.12% at 6h) because the hourly value is only the arithmetic mean of
+the twelve 5m samples under it. All verified, with numbers, in the sampling
+section of `NOTES.md`.
+
+`oe_battery_inferred_saturated` exists because a clamped value is otherwise
+indistinguishable from a real one: in the live run Waratah read exactly `1.0`
+because the integral ran ~97 MWh past its 1680 MWh capacity. A `1` there means
+the integration and the anchor disagree by at least a full battery.
+
+Flags: `--enable-inferred`, `--max-infer-hours` (default 24),
+`--infer-fresh-hours` (default 2), `--infer-max-gap-hours` (default 2),
+`--infer-max-hold-hours` (default 6), `--no-infer-clamp`. Inference costs no extra API requests: the full power series
+comes back in the response already being read for `oe_battery_power_mw`.
+
+Gaps are not bridged. `--infer-max-gap-hours` bounds how far apart two power
+samples may be and still be integrated across, so one missing hourly point is
+tolerated but a real outage ends the integration instead of inventing energy
+across it.
+
 Unlabelled fleet and poll gauges:
 
 | Metric | Type | Meaning |
@@ -493,6 +702,7 @@ Unlabelled fleet and poll gauges:
 | `oe_battery_monitored_capacity_mwh` | gauge | Capacity of the monitored subset |
 | `oe_battery_series_without_capacity` | gauge | Series dropped, quirk 1 (~37, expected) |
 | `oe_battery_series_too_stale` | gauge | Samples dropped for age (should be 0) |
+| `oe_batteries_inferred` | gauge | Units carrying a synthetic SOC this cycle |
 | `oe_poll_cycle_duration_seconds` | gauge | Wall time of the last cycle |
 | `oe_last_poll_timestamp_seconds` | gauge | When the last cycle finished |
 | `oe_last_fleet_refresh_timestamp_seconds` | gauge | When the metadata was last read |

@@ -27,6 +27,27 @@ charts them in Grafana:
 > day. Each is exported with its own timestamp and age, so a daytime SOC reading
 > is honestly labelled as hours old rather than looking current, and
 > `oe_battery_power_mw` keeps showing what the fleet is doing in between.
+>
+> **Inferred SOC fills the hours right after an overnight reading, and is
+> labelled as synthetic.** With `--enable-inferred` the exporter dead-reckons
+> stored energy by integrating each battery's power since its last measured
+> reading, and publishes it as a separate family
+> (`oe_battery_soc_inferred_ratio` and friends). Measured values are never
+> overwritten. It costs no extra API requests — the power series comes back in
+> the response already being read.
+>
+> The honest limit: the upstream leaves an ~18h gap between energy readings, and
+> integration only holds up for about six of them (2–3h after a reading it is
+> within ~2% of capacity; by 10h half the fleet is pinned against its capacity
+> bound). So inference covers roughly 05:00–10:00 and then publishes nothing
+> rather than a confident wrong number. `oe_battery_inferred_saturated` flags
+> when an estimate was pinned at a bound. See `scrapers/README.md`.
+>
+> The integration discounts charging by `--infer-charge-efficiency` (0.9 in
+> `docker-compose.yml`), the share of grid-facing power that reaches the cells.
+> Discharge is not discounted — it is metered at the terminals already. That
+> takes the mean error across the full daytime gap from 11.3% to 7.4% of
+> capacity and leaves the one-hour case untouched.
 
 - `docker-compose.yml` — the five services (`tbm-exporter`,
   `reservoir-exporter`, `battery-exporter`, `prometheus`, `grafana`)

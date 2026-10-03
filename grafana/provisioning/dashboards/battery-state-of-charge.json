@@ -37,7 +37,7 @@
           "showLineNumbers": false,
           "showMiniMap": false
         },
-        "content": "### NEM battery state of charge\n\n**OpenElectricity publishes no state-of-charge metric.** Every percentage here is derived in the exporter as `energy stored / registered capacity` (`oe_battery_soc_ratio` is 0-1; the panels multiply by 100). Capacity comes from the facility metadata, energy from the `storage_battery` metric, so a capacity correction upstream moves the reading. See `scrapers/oe_battery_exporter.py` for the derivation and `scrapers/NOTES.md` for the upstream quirks.\n\n**Energy and power are two different feeds, and this board keeps them apart.** State of charge comes from `storage_battery` (MWh) and charge/discharge power from `power` (MW); both arrive in the same response to the same request, so showing power costs nothing. They do *not* publish on the same schedule: `storage_battery` carries values only overnight, while `power` updates all day. So the SOC panels are stale by design for a few hours after dawn and the power panel is not, and each carries its own age metric rather than sharing one. `Read` in the table is about the energy reading alone - a battery can be publishing power and still have no SOC to show.\n\n**Scope is the NEM and WEM battery fleet.** The `NEM` facilities endpoint also returns WEM units, so the top 12 by capacity includes Collie 2 and Synergy in the west. Each facility is queried on its own `network_id`, because asking for a WEM unit on the NEM dataset returns 404 rather than empty data.\n\n**Idle batteries are rotated out, not monitored in vain.** A slot held by a battery that has published nothing - neither energy nor power - for 36h goes to the next-largest candidate, at no extra API cost, so the scope stays full. The three Collie WEM units return only nulls, so `skipped as idle` settles at 3 and the board fills up with the next-largest publishing batteries. `Batteries with a reading` counts energy readings, so it can sit below `Batteries in scope` through the afternoon without anything being wrong; watch the power panel to see that those batteries are alive.\n\n**The energy feed is sparse on purpose.** As of 2026-10-01 the upstream only carries values for roughly 18:00-04:00 Sydney time, so a daytime SOC reading is hours old by design. The `Sample age` panel is the one to read before the SOC panels: a reading older than a day means the feed went quiet, not that the battery emptied. The SOC series is **omitted** rather than zeroed when a battery cannot be read, so a missing bar means \"no reading\", never \"flat and empty\".\n\n**This is the largest N batteries that have ever reported**, not the largest N batteries in Australia. Of the ten highest-capacity units in the fleet metadata, seven are `committed` and have never dispatched - Richmond Valley (2200 MWh), Tomago (2000), Baranduda (1886) - and they publish nothing at all. Ranking over units with data is the only ranking that produces a chart.\n\nPolled hourly and scoped to 12 batteries: 13 API requests per cycle (14 on the once-daily cycle that also refreshes the fleet metadata), 313 a day, inside the free plan's 366 requests/day bucket. Both upstream metrics come back in that one request per battery. The 5m Prometheus scrape does not cost the API anything - the exporter answers it from the last completed cycle.",
+        "content": "### NEM battery state of charge\n\n**OpenElectricity publishes no state-of-charge metric.** Every percentage here is derived in the exporter as `energy stored / registered capacity` (`oe_battery_soc_ratio` is 0-1; the panels multiply by 100). Capacity comes from the facility metadata, energy from the `storage_battery` metric, so a capacity correction upstream moves the reading. See `scrapers/oe_battery_exporter.py` for the derivation and `scrapers/NOTES.md` for the upstream quirks.\n\n**Energy and power are two different feeds, and this board keeps them apart.** State of charge comes from `storage_battery` (MWh) and charge/discharge power from `power` (MW); both arrive in the same response to the same request, so showing power costs nothing. They do *not* publish on the same schedule: `storage_battery` carries values only overnight, while `power` updates all day. So the SOC panels are stale by design for a few hours after dawn and the power panel is not, and each carries its own age metric rather than sharing one. `Read` in the table is about the energy reading alone - a battery can be publishing power and still have no SOC to show.\n\n**Scope is the NEM and WEM battery fleet.** The `NEM` facilities endpoint also returns WEM units, so the top 12 by capacity includes Collie 2 and Synergy in the west. Each facility is queried on its own `network_id`, because asking for a WEM unit on the NEM dataset returns 404 rather than empty data.\n\n**Idle batteries are rotated out, not monitored in vain.** A slot held by a battery that has published nothing - neither energy nor power - for 36h goes to the next-largest candidate, at no extra API cost, so the scope stays full. The three Collie WEM units return only nulls, so `skipped as idle` settles at 3 and the board fills up with the next-largest publishing batteries. `Batteries with a reading` counts energy readings, so it can sit below `Batteries in scope` through the afternoon without anything being wrong; watch the power panel to see that those batteries are alive.\n\n**The energy feed is sparse on purpose.** As of 2026-10-01 the upstream only carries values for roughly 18:00-04:00 Sydney time, so a daytime SOC reading is hours old by design. The `Sample age` panel is the one to read before the SOC panels: a reading older than a day means the feed went quiet, not that the battery emptied. The SOC series is **omitted** rather than zeroed when a battery cannot be read, so a missing bar means \"no reading\", never \"flat and empty\".\n\n**One panel on this board is synthetic, and says so.** `State of charge: measured vs inferred` plots the measured line solid and a dead-reckoned one dashed: the exporter anchors on each battery's last measured energy and integrates its power from there. It exists because the sparse feed above leaves the board flat from dawn until the next night, but it is **not an upstream reading** and it does not last all day - it is published only for the first few hours after a measured reading, then stops rather than drift further. Every other SOC panel on this board is measured. Judge the method on that one panel before trusting it anywhere.\n\n**This is the largest N batteries that have ever reported**, not the largest N batteries in Australia. Of the ten highest-capacity units in the fleet metadata, seven are `committed` and have never dispatched - Richmond Valley (2200 MWh), Tomago (2000), Baranduda (1886) - and they publish nothing at all. Ranking over units with data is the only ranking that produces a chart.\n\nPolled hourly and scoped to 12 batteries: 13 API requests per cycle (14 on the once-daily cycle that also refreshes the fleet metadata), 313 a day, inside the free plan's 366 requests/day bucket. Both upstream metrics come back in that one request per battery. The 5m Prometheus scrape does not cost the API anything - the exporter answers it from the last completed cycle.",
         "mode": "markdown"
       },
       "targets": [],
@@ -977,6 +977,137 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
+      "description": "**Not an upstream reading.** The dashed lines are dead-reckoned by the exporter: it anchors on each battery's last *measured* energy and integrates its charge/discharge power from there, discounted by the configured charging efficiency. The solid lines are the real thing.\n\nThe two families never overlap - while a measured reading is younger than `--infer-fresh-hours` no inferred value is published at all - so the handover is a clean handoff rather than two lines competing for the same battery.\n\n**Accuracy decays with age, and the panel shows the whole window on purpose.** Each overnight reading restarts the estimate, so the dashed line is most trustworthy just after it appears and drifts from there. Measured against the live feed over four days at 5-minute resolution: ~0.4% of capacity after 1 hour, ~1.5% at 6, ~1.8% at 8, ~5% at 14 - the full overnight gap. So the line runs all day rather than stopping while the battery is still moving, trading a few percent of drift late in the window for continuous coverage. The cap is still there as a backstop: a dashed line that stops is `--max-infer-hours` working, not a fault. A line pinned flat at 0% or 100% is not a full or empty battery either - that is the estimate hitting its capacity bound.\n\n**Between polls the line is partly extrapolated.** The newest power sample is carried forward and scaled by real elapsed time, so the value tracks the clock instead of stepping once an hour; each new sample re-anchors it. `oe_battery_inferred_hold_hours` reports how much of the value is carried rather than integrated - minutes in normal operation, and it rising toward the cap means the power feed has stopped arriving rather than that the battery has.\n\n`oe_battery_inferred_saturated` and `oe_battery_inferred_age_seconds` quantify both of those, and this panel is the one to judge the method on; the SOC panel above remains the measured view.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "% full",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 1,
+          "max": 100,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "percent"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".*inferred"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 1
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 11,
+        "w": 24,
+        "x": 0,
+        "y": 36
+      },
+      "id": 11,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "100 * oe_battery_soc_ratio{name=~\"$battery\"}",
+          "instant": false,
+          "legendFormat": "{{name}} ({{facility}}) measured",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "100 * oe_battery_soc_inferred_ratio{name=~\"$battery\"}",
+          "instant": false,
+          "legendFormat": "{{name}} ({{facility}}) inferred",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "State of charge: measured vs inferred",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
       "description": "Charge and discharge power per battery in MW, from the upstream `power` metric. **Positive is discharging to the network, negative is charging** - so the parts of the chart above the line are batteries exporting and the parts below are batteries absorbing, and the zero line is the boundary between them. The axis is centred on zero so the two sides can be compared directly. Nothing upstream documents that sign; it is read off the data, where a charging battery goes negative, and it is stated here so nobody has to infer it from the shape of the chart.\n\nThis costs no extra API requests: `power` and `storage_battery` come back in the same response, one request per battery, so the request budget below is unchanged by this panel.\n\nUnlike the SOC panels above, this one is expected to be current through the afternoon - the energy series stops at 04:00 and this one does not. A battery flat at zero here is genuinely idle, and a battery missing from this panel published no power at all, which is a different thing again: absent, not zero. `Sample age` below measures the energy reading's age and `oe_battery_power_sample_age_seconds` measures this one; they are separate metrics because the two series age separately - both are plotted on that panel.",
       "fieldConfig": {
         "defaults": {
@@ -1034,9 +1165,9 @@
         "h": 10,
         "w": 24,
         "x": 0,
-        "y": 36
+        "y": 47
       },
-      "id": 11,
+      "id": 12,
       "options": {
         "legend": {
           "calcs": [],
@@ -1129,9 +1260,9 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 46
+        "y": 57
       },
-      "id": 12,
+      "id": 13,
       "options": {
         "legend": {
           "calcs": [],
@@ -1224,9 +1355,9 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 46
+        "y": 57
       },
-      "id": 13,
+      "id": 14,
       "options": {
         "legend": {
           "calcs": [],
@@ -1269,6 +1400,115 @@
         }
       ],
       "title": "Sample age",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "How far back the measured reading that inferred SOC integrates away from is, in hours. The **sawtooth** is the normal overnight publication window resetting each day - same shape as the energy line in `Sample age`, and for the same reason.\n\nThe line that matters is one that **climbs without resetting**. That is upstream `storage_battery` not publishing, and it is why the dashed line in `measured vs inferred` goes missing: `--max-infer-hours` is a hard cut-off, not a degradation, so past the threshold the exporter stops publishing an estimate entirely rather than publishing a worse one. The grey **48.0** line is that threshold. Before this panel existed, a missing dashed line was indistinguishable from a battery having no data at all.\n\nRead it as the evidence it is: the anchor is identical across units when the whole feed stalled, and staggered when individual batteries are genuinely late. Current deployment value is 48.0 hours; it is set above the worst gap seen so a missed publication yields a visibly-degrading estimate instead of no estimate.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "hours",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 1,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": 0
+              }
+            ]
+          }
+        }
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 66
+      },
+      "id": 15,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "max by (unit) (oe_battery_anchor_age_hours{name=~\"$battery\"})",
+          "instant": false,
+          "legendFormat": "{{name}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "vector(48.0)",
+          "instant": false,
+          "legendFormat": "--max-infer-hours",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Inference anchor age",
       "type": "timeseries"
     },
     {
@@ -1332,9 +1572,9 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 55
+        "y": 75
       },
-      "id": 14,
+      "id": 16,
       "options": {
         "legend": {
           "calcs": [],
@@ -1454,9 +1694,9 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 55
+        "y": 75
       },
-      "id": 15,
+      "id": 17,
       "options": {
         "legend": {
           "calcs": [],
@@ -1562,9 +1802,9 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 55
+        "y": 75
       },
-      "id": 16,
+      "id": 18,
       "options": {
         "legend": {
           "calcs": [],
@@ -1657,9 +1897,9 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 63
+        "y": 83
       },
-      "id": 17,
+      "id": 19,
       "options": {
         "legend": {
           "calcs": [],

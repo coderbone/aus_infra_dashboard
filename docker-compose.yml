@@ -148,6 +148,86 @@ services:
       # every unreadable battery gets a fresh reprieve on each deploy and the
       # rotation never converges. Liveness only - readings are never cached.
       - --liveness-file=/cache/liveness.json
+      # Synthetic SOC by integrating power since the last measured reading.
+      # Costs no extra requests: the full power series comes back in the same
+      # response that was already being read for oe_battery_power_mw. Measured
+      # metrics are untouched - inferred values are a separate metric family,
+      # emitted only once the measured reading passes --infer-fresh-hours,
+      # which is what fills the daytime hours storage_battery does not publish.
+      - --enable-inferred
+      # Resolution of that one request. A query parameter, so 5m costs exactly
+      # what 1h costs - same endpoint, same request count, same credits - and it
+      # is the single biggest accuracy lever there is: the hourly value is only
+      # the arithmetic mean of the five-minute ones under it. Measured over four
+      # days, 5m halves mean error at every horizon (0.40% vs 0.82% at 1h,
+      # 1.47% vs 2.12% at 6h) and cuts saturation threefold at 8h.
+      - --api-interval=5m
+      # storage_battery publishes overnight only, so a measured reading is
+      # ~14h old by the next nightfall - and that gap is precisely what power
+      # integration exists to fill. Measured drift from the anchor, with 5m
+      # power, is ~1.5% of capacity at 6h and ~5% by 14h. So inference runs the
+      # whole way to the next reading rather than stopping at 6h: a continuous
+      # curve is worth more than a short accurate one, and the accuracy is
+      # reported alongside it (oe_battery_inferred_age_seconds, and the panel
+      # description carries the error curve) rather than hidden. Expect a few
+      # percent of drift late in the window, and more on the two units that
+      # already saturate - see scrapers/NOTES.md.
+      - --infer-fresh-hours=1
+      # Anchor at most this far back. Sized for the NORMAL overnight gap (04:00
+      # to 18:00 Sydney is 14h) so the dashed line runs continuously.
+      #
+      # Raised to 48h on 2026-10-03 because storage_battery stopped publishing
+      # and the anchor went 31.8h old: at 15h inference refused outright and the
+      # dashed lines vanished from the dashboard entirely, with nothing to
+      # distinguish "upstream missed an update" from "no data for this battery".
+      # oe_battery_anchor_age_hours is now published for every unit whether or
+      # not an estimate exists, so that outage is legible as data.
+      #
+      # 48h buys a visibly-degrading estimate instead of no estimate, which is
+      # the right trade while waiting on openelectricity.org.au to confirm the
+      # publication gap. It is not free: the estimate is one long integral from a
+      # single anchor, and the fit error in scrapers/NOTES.md (~1.5% of capacity
+      # at 6h, ~5% at 14h) compounds well past that by 32h. Once upstream
+      # publishes again the anchor refreshes and this goes back to being slack -
+      # drop it to 24 and the normal case is unaffected either way.
+      - --max-infer-hours=48
+      # Never integrate across a hole wider than this. Note this bounds holes in
+      # *power*, which is continuous 24/7 - it is not the 14h daylight gap in
+      # storage_battery, which is expected and is what --max-infer-hours covers.
+      - --infer-max-gap-hours=2
+      # Carry the newest power rate forward to scrape time, scaled by real
+      # elapsed time, so the inferred line keeps moving between polls instead of
+      # sitting on an hour-long plateau. Exactly integrating the samples gives a
+      # staircase: the value is right but only changes when a new sample lands,
+      # which on a chart reads as a battery that stopped. The hold is what the
+      # next poll then re-anchors, so drift is bounded by the time to the next
+      # real sample, not by the hold itself. Exported as
+      # oe_battery_inferred_hold_hours so the extrapolated part is visible, and
+      # the same capacity clamp applies - a held battery stops at full rather
+      # than running off the panel. 6h is a backstop for a poll that stops
+      # arriving; steady state is minutes.
+      - --infer-max-hold-hours=6
+      # Share of grid-facing charging that actually reaches the cells; the rest
+      # is conversion loss and never comes back out. Charging only - discharge
+      # is already metered at the terminals - so this reads as a round-trip
+      # figure: 100 MWh in, ~90 MWh back out. This is the one number in this
+      # file that is an assumption about the hardware rather than something read
+      # from the upstream, so it is stated here rather than defaulted into the
+      # exporter. Validated on the live feed 2026-10-01: it cuts mean error
+      # across the overnight gap from 11.3% to 7.4% of capacity and leaves
+      # short windows unchanged. A per-unit value fitted over many nights would
+      # be better than this constant.
+      - --infer-charge-efficiency=0.9
+      # Cache the per-unit power series locally so inferred SOC can integrate
+      # across a restart or a failed scrape instead of quietly shortening the
+      # window. This buys resilience, not accuracy. The inference *anchor* is still
+      # re-read from the API on every start, so a restart can never serve a
+      # stale SOC as current. At 5m resolution the file holds ~288 points per
+      # unit per day, so 14 days of a 12-unit fleet is ~1MB rather than 11kB.
+      # Defaults beside --fleet-cache-file; spelled out here because the cache
+      # volume is what makes it survive a container rebuild.
+      - --power-history-file=/cache/power-history.json
+      - --power-history-days=14
     environment:
       # Read from the environment by the exporter, never from argv, so the key
       # cannot show up in the process table or in a `docker inspect` command

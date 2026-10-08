@@ -755,7 +755,9 @@ writes `{unit_code: epoch}` after every clean poll, atomically. The file is
 value or SOC is ever written to it, so a restart still cannot serve a stale SOC
 as current. That is the same refusal the exporter applies everywhere else, and
 `test_only_liveness_is_persisted_never_a_reading` asserts it against the file's
-actual bytes. Future-dated stamps are dropped rather than trusted, so a skewed
+actual bytes. (Energy readings *are* persisted elsewhere — see
+`--reading-cache-file` below, which is a different file for a different reason.)
+Future-dated stamps are dropped rather than trusted, so a skewed
 clock cannot pin a dead battery in scope forever. An unreadable or corrupt file
 logs a warning and starts cold, which is the first-ever-run behaviour.
 
@@ -768,6 +770,71 @@ part that costs anything — at 1 per cycle it adds ~24 requests/day, taking the
 total from 313 to 337. Probing and re-admission are separate steps, so the cycle
 that probes a unit reports the scope it actually polled and the unit is back in
 scope on the next one.
+
+### Narrow request windows (`--reading-cache-file`, `--poll-window-hours`)
+
+The exporter takes the newest non-null `storage_battery` sample *inside the
+window it asked for*, and that reading is 6–14h old by poll time. So the window
+has to be wide enough to reach back to it: 192h at `interval=5m`, which is not a
+cheap way to fetch one number. Measured against the live API, one facility:
+
+| window | response | points | fetch |
+| --- | --- | --- | --- |
+| 192h | 494 KB | 13,654 | 0.74s |
+| 48h | 120 KB | 3,288 | 0.60s |
+| 2h | 4.8 KB | 96 | 0.38s |
+
+That 494 KB was being re-sent every hour, per facility — about 5.9MB per cycle
+across the deployed 12 — mostly duplicating points already fetched.
+
+`--reading-cache-file` keeps the newest reading per unit locally
+(`readings.json` beside `--fleet-cache-file`), so a poll only has to cover the gap
+since the last one. `--poll-window-hours` (default 2) sets that minimum; against a
+1h poll interval that is 4x overlap, so a dropped poll cannot open a hole in the
+power series. `infer_soc` *drops* segments wider than `--infer-max-gap-hours` instead of
+integrating across them, so a hole is not a slightly-wrong number — it is the
+line going flat at the last good point.
+
+This does not change the API request count. The binding limit is 366
+requests/**day**, and N facilities is N requests per cycle whether the window is
+2h or 192h. What drops is bytes and server-side work per request, which is the
+scrape time that actually grew.
+
+The window returns to the full `--lookback-hours` automatically whenever it is not
+safe to narrow: no cache configured, a cold cache, a missed poll (the window
+tracks time since the last *attempt*, so a failed cycle cannot shrink the window
+that would have repaired it), or a unit **known to publish** that is no longer
+reachable. It stays wide on the first cycle after a restart even if the cache
+survived — that process has not yet proven it can fetch.
+
+A unit that has *never* published does not block narrowing. This matters in
+practice: 5 of the deployed 12 batteries never publish `storage_battery`, and
+requiring a reading from those would pin the window at 192h forever and make the
+whole mechanism dead code. The cache records which units it has seen publish
+(`seeded`), so "missing" means *regressed from an observed state*, not *absent of
+evidence*.
+
+**This does relax a safety invariant, deliberately.** Where the liveness file
+stores no readings, this one does, and a cached reading can reach a *measured*
+metric: if a narrow window returns power but no storage point inside it, the
+cached reading is exported as the measured one rather than the metric going
+blank. The bounds on that are explicit rather than assumed:
+
+- it keeps its own timestamp, so `oe_battery_sample_age_seconds` and
+  `oe_battery_anchor_age_hours` report its true age — verified to be
+  identical to the age the wide path reports;
+- `oe_battery_reading_from_cache` counts units in that state, so "the buffer has
+  become the only source of truth" is visible rather than silent;
+- it is **never** used for a facility that failed to answer — that stays
+  `scrape_success=0`, because reporting a battery as monitored during an
+  upstream outage is the one thing this exporter must not do;
+- a live reading always supersedes it, so the cache can lag but never contradict
+  what the API just said;
+- it is bounded by `--max-sample-age` and `--max-infer-hours`, and
+  future-dated stamps are dropped.
+
+To disable the whole mechanism and keep every request at the full reach, omit
+`--reading-cache-file`.
 
 ### Running
 
@@ -787,6 +854,7 @@ exclusive), `--top` (default 10, 0 for all), `--poll-interval` (default 3600s),
 `--lookback-hours` (36), `--max-sample-age` (129600s = 36h),
 `--drop-idle-hours` (36, 0 disables rotation), `--watchlist-per-cycle` (0),
 `--fleet-refresh-interval` (86400s), `--fleet-cache-file`, `--liveness-file`,
+`--reading-cache-file`, `--poll-window-hours` (2),
 `--include-undispatched`,
 `--listen-address`, `--port` (9111), `--timeout`, `--retries` (3),
 `--retry-budget` (6s), `--once`, `-v`.
@@ -795,15 +863,19 @@ The key is read from the environment or a file, **never from argv**, so it canno
 land in the process table, in shell history, or in a `docker inspect` command
 line. Do not add a `--api-key` flag to "make it easier".
 
-Two files are written to `--fleet-cache-file`'s volume, and they are not the same
+Three files are written to `--fleet-cache-file`'s volume, and they are not the same
 kind of thing. `fleet.json` is a *fallback*: it is only read when the API cannot
 be reached. `liveness.json` is *state*, and is read on every start.
+`readings.json` is an *anchor buffer* — it is read on every start and is what
+makes a narrow request window safe (see above), so omitting
+`--reading-cache-file` reverts every request to the full `--lookback-hours`.
 
-The disk cache is a *fallback*, not a second source of truth: it is only read
-when the API cannot be reached, and its `cached_at` stamp is carried over as the
-refresh time so a stale cache is replaced as soon as the API answers. There is
-deliberately no cache of readings — a cached SOC served as a current one is the
-same dishonest failure mode the other two exporters refuse.
+The *fleet* disk cache is a fallback, not a second source of truth: it is only
+read when the API cannot be reached, and its `cached_at` stamp is carried over as
+the refresh time so a stale cache is replaced as soon as the API answers.
+`liveness.json` deliberately holds no readings. `readings.json` does, and that is
+the one place this exporter knowingly gives up the refusal the other two make —
+bounded, timestamped and reported, as set out under `--reading-cache-file` above.
 
 ### Tests
 

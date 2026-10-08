@@ -467,7 +467,7 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
-      "description": "Derived state of charge for each monitored battery: stored energy divided by registered capacity. Batteries that could not be read have **no bar at all** rather than a zero-length one - the exporter omits the series instead, because an empty bar here would read as a flat battery, which is a completely different claim. The battery list comes from the capacity gauge, so an unread battery still shows up as a blank row.",
+      "description": "State of charge for each monitored battery, as a percentage. Each bar is **inferred wherever an estimate exists** and measured otherwise - the two families are never published for the same battery at the same time, so a bar is unambiguously one or the other rather than a blend. The inferred bars are dead-reckoned by the exporter from the last overnight reading plus integrated charge/discharge power, and they drift as they age; `State of charge: measured vs inferred` below has the error figures, and treat a bar that is pinned flat at 0% or 100% as the estimate hitting its capacity bound rather than as a battery that is actually empty or full. The measured bars are the upstream values, and are what you get overnight and any time no estimate is available.\n\nThe ramp is interpolated across the bar, so it runs dark red at empty, through orange and yellow across the middle, and is green from about three-quarters full. A nearly-full battery is unambiguously green and an empty one unambiguously red, with the in-between states readable at a glance instead of having to check the number.\n\nBatteries that could not be read have **no bar at all** rather than a zero-length one - the exporter omits the series instead, because an empty bar here would read as a flat battery, which is a completely different claim. The battery list comes from the capacity gauge, so an unread battery still shows up as a blank row.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -485,19 +485,19 @@
               },
               {
                 "color": "orange",
-                "value": 10
-              },
-              {
-                "color": "yellow",
                 "value": 25
               },
               {
-                "color": "green",
-                "value": 60
+                "color": "yellow",
+                "value": 50
               },
               {
-                "color": "blue",
-                "value": 95
+                "color": "green",
+                "value": 75
+              },
+              {
+                "color": "green",
+                "value": 100
               }
             ]
           },
@@ -537,7 +537,7 @@
           },
           "editorMode": "code",
           "exemplar": false,
-          "expr": "100 * last_over_time(oe_battery_soc_ratio{name=~\"$battery\"}[2h])",
+          "expr": "100 * (last_over_time(oe_battery_soc_inferred_ratio{name=~\"$battery\"}[2h]) or last_over_time(oe_battery_soc_ratio{name=~\"$battery\"}[2h]))",
           "instant": true,
           "legendFormat": "{{name}}",
           "range": false,
@@ -667,7 +667,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "Read"
+              "options": "Read OK"
             },
             "properties": [
               {
@@ -685,12 +685,136 @@
           {
             "matcher": {
               "id": "byName",
+              "options": "Unit code"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 110
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Battery"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 130
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Facility"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 110
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
               "options": "Rank"
             },
             "properties": [
               {
                 "id": "custom.width",
                 "value": 60
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Read OK"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 80
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Read OK"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "options": {
+                      "0": {
+                        "color": "red",
+                        "index": 1,
+                        "text": "No"
+                      },
+                      "1": {
+                        "color": "green",
+                        "index": 0,
+                        "text": "Yes"
+                      }
+                    },
+                    "type": "value"
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background-solid"
+                }
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Status"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "options": {
+                      "commissioning": {
+                        "color": "yellow",
+                        "index": 1,
+                        "text": "Commissioning"
+                      },
+                      "operating": {
+                        "color": "green",
+                        "index": 0,
+                        "text": "Operating"
+                      }
+                    },
+                    "type": "value"
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background-solid"
+                }
+              },
+              {
+                "id": "decimals",
+                "value": 0
               }
             ]
           }
@@ -771,7 +895,7 @@
           },
           "editorMode": "code",
           "exemplar": false,
-          "expr": "label_replace(max by (unit) (oe_battery_last_sample_timestamp_seconds{name=~\"$battery\"}), \"__name__\", \"Sampled_at\", \"\", \"\")",
+          "expr": "label_replace(1000 * max by (unit) (oe_battery_last_sample_timestamp_seconds{name=~\"$battery\"}), \"__name__\", \"Sampled_at\", \"\", \"\")",
           "format": "table",
           "instant": true,
           "legendFormat": "",
@@ -813,7 +937,7 @@
           },
           "editorMode": "code",
           "exemplar": false,
-          "expr": "label_replace(max by (unit) (oe_battery_scrape_success{name=~\"$battery\"}), \"__name__\", \"Read\", \"\", \"\")",
+          "expr": "label_replace(max by (unit) (oe_battery_scrape_success{name=~\"$battery\"}), \"__name__\", \"Read_OK\", \"\", \"\")",
           "format": "table",
           "instant": true,
           "legendFormat": "",
@@ -847,13 +971,13 @@
             },
             "includeByName": {},
             "indexByName": {
-              "Capacity_MWh": 5,
-              "Rank": 10,
-              "Read": 11,
-              "SOC_pct": 6,
-              "Sample_age": 9,
-              "Sampled_at": 8,
-              "Stored_MWh": 7,
+              "Value #A": 5,
+              "Value #B": 6,
+              "Value #C": 7,
+              "Value #D": 8,
+              "Value #E": 9,
+              "Value #F": 10,
+              "Value #G": 11,
               "facility": 2,
               "name": 1,
               "region": 3,
@@ -861,13 +985,18 @@
               "unit": 0
             },
             "renameByName": {
-              "Capacity_MWh": "Capacity, MWh",
-              "Rank": "Rank",
-              "Read": "Read",
-              "SOC_pct": "SOC, %",
-              "Sample_age": "Sample age",
-              "Sampled_at": "Sampled at",
-              "Stored_MWh": "Stored, MWh"
+              "Value #A": 0,
+              "Value #B": 1,
+              "Value #C": 1,
+              "Value #D": 0,
+              "Value #E": 0,
+              "Value #F": 0,
+              "Value #G": 0,
+              "facility": "Facility",
+              "name": "Battery",
+              "region": "Region",
+              "status": "Status",
+              "unit": "Unit code"
             }
           }
         }
@@ -1204,7 +1333,7 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
-      "description": "Stored energy, exactly as the upstream publishes it but divided by 1000 so the axis reads in GWh. Stacked, because the question this panel answers is how much the monitored fleet is holding in total, and the segments show which battery is responsible. Two decimals rather than one: the segments span 0.04 to 0.77 GWh, and at one decimal four of the seven would read 0.0. The SOC panel is stored energy divided by capacity; a battery whose energy moves while its SOC does not has had its capacity changed upstream.",
+      "description": "**Not an upstream reading.** Stored energy divided by 1000 so the axis reads in GWh, but the energy is dead-reckoned by the exporter from each battery's last *measured* energy plus integrated charge/discharge power rather than read from the feed - `State of charge: measured vs inferred` has the error figures and the method. The value is clamped to the battery's registered capacity, so a segment sitting flat at its capacity is the estimate hitting that bound, not a battery that is genuinely full. `oe_battery_inferred_saturated` flags exactly that case.\n\nStacked, because the question this panel answers is how much the monitored fleet is holding in total, and the segments show which battery is responsible. Two decimals rather than one: the segments span 0.04 to 0.77 GWh, and at one decimal four of the seven would read 0.0.\n\n**This series runs alongside the measured one rather than standing in for it**, since inference always integrates when an anchor and power exist and no longer yields to a fresh measurement (the always-integrate decision, 2026-10-06). So a gap here means inference was unavailable - no anchor, or a power series with a hole wider than `--infer-max-gap-hours` - and the bars simply stop, which is a gap in this data source rather than a fleet holding no charge. Compare against the measured series in `State of charge: measured vs inferred`; `oe_battery_energy_stored_mwh` is the measured counterpart and remains the authority on what was actually published.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1284,7 +1413,7 @@
           },
           "editorMode": "code",
           "exemplar": false,
-          "expr": "oe_battery_energy_stored_mwh{name=~\"$battery\"} / 1000",
+          "expr": "oe_battery_energy_inferred_mwh{name=~\"$battery\"} / 1000",
           "instant": false,
           "legendFormat": "{{name}} ({{facility}})",
           "range": true,
@@ -1407,7 +1536,7 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
-      "description": "How far back the measured reading that inferred SOC integrates away from is, in hours. The **sawtooth** is the normal overnight publication window resetting each day - same shape as the energy line in `Sample age`, and for the same reason.\n\nThe line that matters is one that **climbs without resetting**. That is upstream `storage_battery` not publishing, and it is why the dashed line in `measured vs inferred` goes missing: `--max-infer-hours` is a hard cut-off, not a degradation, so past the threshold the exporter stops publishing an estimate entirely rather than publishing a worse one. The grey **48.0** line is that threshold. Before this panel existed, a missing dashed line was indistinguishable from a battery having no data at all.\n\nRead it as the evidence it is: the anchor is identical across units when the whole feed stalled, and staggered when individual batteries are genuinely late. Current deployment value is 48.0 hours; it is set above the worst gap seen so a missed publication yields a visibly-degrading estimate instead of no estimate.",
+      "description": "How far back the measured reading that inferred SOC integrates away from is, in hours. The **sawtooth** is the normal overnight publication window resetting each day - same shape as the energy line in `Sample age`, and for the same reason.\n\nThe line that matters is one that **climbs without resetting**. That is upstream `storage_battery` not publishing, and it is why the dashed line in `measured vs inferred` goes missing: `--max-infer-hours` is a hard cut-off, not a degradation, so past the threshold the exporter stops publishing an estimate entirely rather than publishing a worse one. The grey **192.0** line is that threshold. Before this panel existed, a missing dashed line was indistinguishable from a battery having no data at all.\n\nRead it as the evidence it is: the anchor is identical across units when the whole feed stalled, and staggered when individual batteries are genuinely late. Current deployment value is 192.0 hours; it is set above the worst gap seen so a missed publication yields a visibly-degrading estimate instead of no estimate.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1501,7 +1630,7 @@
           },
           "editorMode": "code",
           "exemplar": false,
-          "expr": "vector(48.0)",
+          "expr": "vector(192.0)",
           "instant": false,
           "legendFormat": "--max-infer-hours",
           "range": true,

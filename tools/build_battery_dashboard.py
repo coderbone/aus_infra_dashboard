@@ -34,7 +34,7 @@ SEL = "name=~\"$battery\""
 # Kept as a constant here rather than a metric because it is deployment
 # configuration, not an observation - if the two ever disagree, this is the one
 # to change.
-MAX_INFER_HOURS = 48.0
+MAX_INFER_HOURS = 192.0
 
 
 def target(expr, refid="A", instant=True, legend="{{name}}", fmt=None):
@@ -204,6 +204,19 @@ def bargauge(title, grid, expr, description, unit="percent", min_=0, max_=100, s
 
 SYMBOL_SLUGS = {"%": "pct", ",": "", " ": "_"}
 
+# The label fields arrive from `labelsToFields` under their raw PromQL names, so
+# without this they render as `unit`, `name`, `facility`, `region`, `status` -
+# which read as column identifiers rather than as headings. Renaming them here
+# is also what makes the table's `sortBy` and the fieldConfig overrides address
+# something a person can see.
+LABEL_HEADERS = {
+    "unit": "Unit code",
+    "name": "Battery",
+    "facility": "Facility",
+    "region": "Region",
+    "status": "Status",
+}
+
 
 def slug(header):
     """Field name for a column: 'SOC, %' -> 'SOC_pct', 'Capacity, MWh' -> 'Capacity_MWh'."""
@@ -212,7 +225,7 @@ def slug(header):
     return out or "column"
 
 
-def table(title, grid, columns, description, sort_by="Rank"):
+def table(title, grid, columns, description, sort_by="Rank", badges=()):
     """One Prometheus frame per column, joined on the unit code.
 
     `columns` is a list of `(expr, header, unit, decimals)` in display order.
@@ -226,13 +239,18 @@ def table(title, grid, columns, description, sort_by="Rank"):
       the frame rather than as columns. So `joinByField` on `unit` has no field
       to join on until `labelsToFields` puts the labels back. That is the first
       transformation, and the whole table depends on it.
-    - **Every value column would be called `Value`.** After `max by (unit)`
-      the metric name is gone, so the seven frames come back as `Value`,
-      `Value #1` … `Value #6` after the join, numbered by frame order. Renaming
-      those positionally works right up until a query returns no series and the
-      numbering shifts. Instead each expression wraps itself in
-      `label_replace(…, "__name__", …)`, which PromQL honours, so every column
-      has a real name of its own and the renames are explicit.
+    - **Every value column is called `Value` and the metric name is gone.**
+      The Prometheus datasource in `format: table` returns one frame per query
+      whose numeric field is always named `Value`; the metric name only exists
+      as the `__name__` *label*. `label_replace(…, "__name__", …)` rewrites
+      that label (so `labelsToFields` shows a friendly `__name__` column, which
+      `organize` then drops) but never touches the actual field name, which is
+      what the old comment here claimed. When the seven frames are joined,
+      `joinByField` disambiguates the seven identical `Value` fields by appending
+      the query's `refId`: `Value #A` … `Value #G`. The letter is the refId, so
+      unlike the positional numbering the original version feared, it is stable
+      for a fixed column order even it a query returns no series - the surviving
+      columns keep their refId letters.
     - **Joining full label sets produces `facility #1` … `facility #6`.** Only
       the first column keeps its labels; the rest are `max by (unit)`. `max`
       rather than `sum` because there is exactly one series per unit and a `sum`
@@ -245,12 +263,19 @@ def table(title, grid, columns, description, sort_by="Rank"):
     instead of silently vanishing from the table.
     """
     named = []
-    for expr, header, unit, decimals in columns:
+    for i, (expr, header, unit, decimals) in enumerate(columns):
         field = slug(header)
+        refid = chr(ord("A") + i)
         named.append(
             (
                 'label_replace(%s, "__name__", "%s", "", "")' % (expr, field),
+                # The Prometheus table format names the numeric field `Value`,
+                # and when multiple queries are joined they collide and come
+                # back as `Value #A` … `Value #G` — the letter is the query's
+                # refId, so the suffix is stable for a fixed column order.
+                "Value #%s" % refid,
                 field,
+                refid,
                 header,
                 unit,
                 decimals,
@@ -259,7 +284,7 @@ def table(title, grid, columns, description, sort_by="Rank"):
     keep = ["unit", "name", "facility", "region", "status"]
     # Field order: the labels first (unit first, since it is the key), then the
     # value columns in the order the columns were declared.
-    order = {name: pos for pos, name in enumerate(keep + [f for _, f, _, _, _ in named])}
+    order = {name: pos for pos, name in enumerate(keep + [f for _, f, _, _, _, _, _ in named])}
     return {
         "datasource": ds_(),
         "description": description,
@@ -267,9 +292,24 @@ def table(title, grid, columns, description, sort_by="Rank"):
             "defaults": {},
             "overrides": [
                 override(by_name(header), ["unit", ("decimals", decimals)])
-                for _, _, header, unit, decimals in named
+                for _, _, _, _, header, unit, decimals in named
             ]
-            + [override(by_name("Rank"), [("custom.width", 60)])],
+            + [
+                # Widths are set per column because the table is the only place
+                # the fleet's identity is spelled out, and a truncated "WTAHB1"
+                # or "COLLIE_ESR4" makes two rows look alike. The numeric
+                # columns are left to their content except the two that are
+                # always a small integer.
+                override(by_name("Unit code"), [("custom.width", 110)]),
+                override(by_name("Battery"), [("custom.width", 130)]),
+                override(by_name("Facility"), [("custom.width", 110)]),
+                override(by_name("Rank"), [("custom.width", 60)]),
+                override(by_name("Read OK"), [("custom.width", 80)]),
+            ]
+            # Opt-in per panel: a badge is only worth a filled cell when the
+            # column has a handful of known values that mean something on their
+            # own. Applied by display name, so it lands after `renameByName`.
+            + [badge(column, options) for column, options in badges],
         },
         "gridPos": grid,
         "options": {
@@ -284,8 +324,8 @@ def table(title, grid, columns, description, sort_by="Rank"):
             "sortBy": [{"desc": False, "displayName": sort_by}],
         },
         "targets": [
-            target(expr, refid=chr(ord("A") + i), instant=True, legend="", fmt="table")
-            for i, (expr, _, _, _, _) in enumerate(named)
+            target(expr, refid=refid, instant=True, legend="", fmt="table")
+            for (expr, _, _, refid, _, _, _) in named
         ],
         "title": title,
         "transformations": [
@@ -305,7 +345,10 @@ def table(title, grid, columns, description, sort_by="Rank"):
                     },
                     "includeByName": {},
                     "indexByName": order,
-                    "renameByName": {field: header for _, field, header, _, _ in named},
+                    "renameByName": dict(
+                        LABEL_HEADERS,
+                        **{field: header for _, field, _, _, _, _, header in named},
+                    ),
                 },
             },
         ],
@@ -336,6 +379,58 @@ def by_name(name):
 def by_frame(refid):
     """Match by query refId, for styling one series of a chart."""
     return {"id": "byFrameRefID", "options": refid}
+
+
+# Named colours Grafana's value mappings accept, kept here so a typo in a
+# colour name cannot silently render as "no colour at all" - an unmapped value
+# falls back to plain text and the badge quietly disappears.
+_BADGE_COLORS = {"green", "red", "yellow", "orange", "blue", "purple", "text"}
+
+
+def badge(column, options, mode="color-background-solid"):
+    """Render a column's few known values as scannable, filled cells.
+
+    `options` maps the raw field value to `(text, color)`. The mapping supplies
+    both the label and the fill, so a column can stop showing `1`/`0` or
+    `operating`/`commissioning` without a second query.
+
+    **Why filled cells and not icons**, which was the original request: Grafana
+    13.2.2 has no icon cell type. `TableCellDisplayMode` is actions, auto,
+    basic, color-background, color-background-solid, color-text, custom,
+    data-links, gauge, geo, gradient-gauge, image, json-view, lcd-gauge,
+    markdown, pill and sparkline - icons are not among them, and the table's
+    cell renderer calls `formattedValueToString(displayValue)`, which prints the
+    mapped text and ignores `ValueMappingResult.icon` even where the data model
+    accepts one. The `pill` mode would be the closest visual, but it only
+    exists in the newer TableNG table, and this Grafana runs the classic one
+    (no tableNG feature toggle is set), so a pill setting would be ignored.
+
+    A filled cell is therefore the strongest at-a-glance signal actually
+    available, and it is honest about the data: it encodes *state*, which is
+    what these columns are. `color-background-solid` is used rather than
+    `color-background` because the latter is a gradient in Grafana and reads as
+    decoration rather than as a status.
+    """
+    for value, (text, color) in options.items():
+        if color not in _BADGE_COLORS:
+            raise ValueError("unknown badge colour %r for column %r" % (color, column))
+    mapping = [
+        {
+            "type": "value",
+            "options": {
+                value: {"index": index, "text": text, "color": color}
+                for index, (value, (text, color)) in enumerate(options.items())
+            },
+        }
+    ]
+    return override(
+        by_name(column),
+        [
+            ("mappings", mapping),
+            ("custom.cellOptions", {"type": mode}),
+            ("decimals", 0),
+        ],
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -534,19 +629,51 @@ panels.append(
     bargauge(
         "State of charge, largest batteries first",
         {"h": 12, "w": 9, "x": 0, "y": 13},
-        "100 * " + INSTANT % ("oe_battery_soc_ratio{%s}" % SEL),
-        "Derived state of charge for each monitored battery: stored energy divided "
-        "by registered capacity. Batteries that could not be read have **no bar at "
-        "all** rather than a zero-length one - the exporter omits the series "
-        "instead, because an empty bar here would read as a flat battery, which is "
-        "a completely different claim. The battery list comes from the capacity "
-        "gauge, so an unread battery still shows up as a blank row.",
+        # Inferred first, measured second, and the order is the whole point.
+        # `oe_battery_soc_ratio` is never *absent*: the API keeps returning the
+        # overnight reading all day, so the series stays exported at its stale
+        # value, and `measured or inferred` would therefore match on every
+        # battery and quietly keep the frozen number. Inference is published only
+        # while the measured reading is older than `--infer-fresh-hours`, so
+        # preferring it hands over to the live estimate for exactly the daytime
+        # hours the measured value is unusable, and falls back to the measured
+        # reading whenever no estimate exists - fresh overnight readings, a
+        # battery past `--max-infer-hours`, or inference off - so the bar is
+        # never blank just because the live number is missing.
+        "100 * (%s or %s)"
+        % (
+            INSTANT % ("oe_battery_soc_inferred_ratio{%s}" % SEL),
+            INSTANT % ("oe_battery_soc_ratio{%s}" % SEL),
+        ),
+        "State of charge for each monitored battery, as a percentage. Each bar is "
+        "**inferred wherever an estimate exists** and measured otherwise - the two "
+        "families are never published for the same battery at the same time, so a "
+        "bar is unambiguously one or the other rather than a blend. The inferred "
+        "bars are dead-reckoned by the exporter from the last overnight reading "
+        "plus integrated charge/discharge power, and they drift as they age; "
+        "`State of charge: measured vs inferred` below has the error figures, and "
+        "treat a bar that is pinned flat at 0% or 100% as the estimate hitting its "
+        "capacity bound rather than as a battery that is actually empty or full. "
+        "The measured bars are the upstream values, and are what you get overnight "
+        "and any time no estimate is available.\n\n"
+        "The ramp is interpolated across the bar, so it runs dark red at empty, "
+        "through orange and yellow across the middle, and is green from about "
+        "three-quarters full. A nearly-full battery is unambiguously green and an "
+        "empty one unambiguously red, with the in-between states readable at a "
+        "glance instead of having to check the number.\n\n"
+        "Batteries that could not be read have **no bar at all** rather than a "
+        "zero-length one - the exporter omits the series instead, because an empty "
+        "bar here would read as a flat battery, which is a completely different "
+        "claim. The battery list comes from the capacity gauge, so an unread "
+        "battery still shows up as a blank row.",
         steps=[
             {"color": "dark-red", "value": 0},
-            {"color": "orange", "value": 10},
-            {"color": "yellow", "value": 25},
-            {"color": "green", "value": 60},
-            {"color": "blue", "value": 95},
+            {"color": "orange", "value": 25},
+            {"color": "yellow", "value": 50},
+            {"color": "green", "value": 75},
+            # Held flat rather than ramping further, so full reads as solidly
+            # full instead of running into a different hue at the very top.
+            {"color": "green", "value": 100},
         ],
     )
 )
@@ -570,7 +697,11 @@ panels.append(
                 1,
             ),
             (
-                "max by (unit) (oe_battery_last_sample_timestamp_seconds{%s})" % SEL,
+                # `dateTimeAsIso` is milliseconds, and
+                # `oe_battery_last_sample_timestamp_seconds` is seconds - without
+                # the x1000 this column rendered as a 1970 date, which is worse
+                # than showing nothing because it looks like a real timestamp.
+                "1000 * max by (unit) (oe_battery_last_sample_timestamp_seconds{%s})" % SEL,
                 "Sampled at",
                 "dateTimeAsIso",
                 0,
@@ -583,8 +714,11 @@ panels.append(
             ),
             ("max by (unit) (oe_battery_capacity_rank{%s})" % SEL, "Rank", "short", 0),
             (
+                # Was "Read", which read as a past-tense verb and invited the
+                # question "read by whom?". It is the exporter's scrape_success:
+                # 1 when the last poll returned a usable reading.
                 "max by (unit) (oe_battery_scrape_success{%s})" % SEL,
-                "Read",
+                "Read OK",
                 "short",
                 0,
             ),
@@ -597,6 +731,21 @@ panels.append(
         "before reading anything into a flat SOC. A battery that has gone quiet "
         "for 36h leaves the table entirely - watch `skipped as idle` in the scope "
         "panel below, and `oe_battery_idle_seconds` for the per-unit reason.",
+        badges=[
+            # scrape_success: whether the last poll returned a usable reading.
+            # This is the column that says whether the numbers beside it mean
+            # anything, so it gets the strongest fill. A blank SOC with a
+            # green cell here cannot happen - a unit that could not be read is
+            # 0 - and a filled cell here is what makes that visible at a glance
+            # rather than by reading four columns to the left.
+            ("Read OK", {"1": ("Yes", "green"), "0": ("No", "red")}),
+            # commissioning is not a fault, it is a unit that exists and is
+            # registered but is not yet producing, so it is amber rather than
+            # red. Both states come from the fleet metadata, not from a reading,
+            # which is why this column can be populated for a row whose SOC is
+            # blank.
+            ("Status", {"operating": ("Operating", "green"), "commissioning": ("Commissioning", "yellow")}),
+        ],
     )
 )
 
@@ -714,16 +863,29 @@ panels.append(
     timeseries(
         "Energy stored, GWh",
         {"h": 9, "w": 12, "x": 0, "y": 57},
-        [target("oe_battery_energy_stored_mwh{%s} / 1000" % SEL, instant=False,
+        [target("oe_battery_energy_inferred_mwh{%s} / 1000" % SEL, instant=False,
                 legend="{{name}} ({{facility}})")],
-        "Stored energy, exactly as the upstream publishes it but divided by 1000 "
-        "so the axis reads in GWh. Stacked, because the question this panel "
-        "answers is how much the monitored fleet is holding in total, and the "
-        "segments show which battery is responsible. Two decimals rather than "
-        "one: the segments span 0.04 to 0.77 GWh, and at one decimal four of the "
-        "seven would read 0.0. The SOC panel is stored energy divided by "
-        "capacity; a battery whose energy moves while its SOC does not has had "
-        "its capacity changed upstream.",
+        "**Not an upstream reading.** Stored energy divided by 1000 so the axis "
+        "reads in GWh, but the energy is dead-reckoned by the exporter from each "
+        "battery's last *measured* energy plus integrated charge/discharge power "
+        "rather than read from the feed - `State of charge: measured vs inferred` "
+        "has the error figures and the method. The value is clamped to the "
+        "battery's registered capacity, so a segment sitting flat at its capacity "
+        "is the estimate hitting that bound, not a battery that is genuinely full. "
+        "`oe_battery_inferred_saturated` flags exactly that case.\n\n"
+        "Stacked, because the question this panel answers is how much the monitored "
+        "fleet is holding in total, and the segments show which battery is "
+        "responsible. Two decimals rather than one: the segments span 0.04 to 0.77 "
+        "GWh, and at one decimal four of the seven would read 0.0.\n\n"
+        "**This series runs alongside the measured one rather than standing in for "
+        "it**, since inference always integrates when an anchor and power exist and "
+        "no longer yields to a fresh measurement (the always-integrate decision, "
+        "2026-10-06). So a gap here means inference was unavailable - no anchor, or "
+        "a power series with a hole wider than `--infer-max-gap-hours` - and the "
+        "bars simply stop, which is a gap in this data source rather than a fleet "
+        "holding no charge. Compare against the measured series in `State of charge: "
+        "measured vs inferred`; `oe_battery_energy_stored_mwh` is the measured "
+        "counterpart and remains the authority on what was actually published.",
         axis="GWh",
         decimals=2,
         span_nulls=False,

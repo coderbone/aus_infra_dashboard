@@ -759,3 +759,568 @@ returning to ~0.
   `--max-infer-hours` returns `None` past its cap rather than extrapolating is
   the same reason unread series are omitted rather than zeroed: on a battery, a
   plausible wrong number reads as a real observation.
+
+## Inferred SOC mirrors measured SOC — 2026-10-03
+
+The inferred family used to be published **only** where no measured reading was
+fresh, so it had gaps by construction and the two families never overlapped.
+That was a deliberate honesty rule ("Measured always wins … so there is never a
+moment when the two families both claim the same cycle"). It has been reversed:
+a unit whose reading is still inside `--infer-fresh-hours` now publishes that
+reading **as its own estimate** — if the feed says X, the estimate is X. The
+family is continuous, and the daytime gap it exists to cover is now bounded by
+when upstream stops publishing rather than by when the last reading stops being
+true.
+
+Motivation was the dashboard: `Energy stored, GWh` and the SoC bargauge had to
+be written as `inferred or measured` fallbacks, because the inferred series was
+genuinely absent for hours at a stretch. Live Prometheus over 48h at the time:
+
+```
+oe_battery_energy_stored_mwh    present at all 85 sample points
+oe_battery_energy_inferred_mwh  present at only 34
+                                (10-02 07:33–10:03, 15:33–19:33, 10-03 12:33–22:03)
+```
+
+So "switch the panel to inferred" and "leave it blank for a third of the day"
+were the same change. This removes the need for the fallback entirely.
+
+### Things that are not obvious about it
+
+- **A copy cannot come out of `infer_soc()`.** It returns `None` on an empty
+  power series (`:1133`), needs ≥2 points (`:1149`), and clamps both `soc` and
+  `energy_mwh` (`:1202`, `:1206`). A fresh anchor with real power samples also
+  *moves* off the anchor via `hold_rate` (`:1189`). The copy is built by its own
+  `_copy_of_measured()`, which reads `soc`/`stored_mwh` defensively and returns
+  `None` if either is absent — a sample dict that reports a reading without an
+  SOC is not worth crashing an exposition over, and two test fixtures were
+  exactly that shape.
+- **The render refresh had to be taught to skip copies.** `_refresh_inferred_for_render`
+  re-runs `infer_soc` whenever a hold rate exists, which would have dragged a
+  copy off the measurement it is reporting while leaving `inferred_ts` naming a
+  power sample that was never used. `from_measured` marks the row and exempts it.
+- **`_rows_for_newly_stale`'s `present` guard was a live bug, not a theoretical
+  one.** It skipped any unit already holding a row. With copies, that meant a
+  battery stayed frozen at its measured value for a whole poll interval after
+  the reading aged out — reintroducing precisely the handover drift that method
+  was written to fix. The guard now excludes copies, and the caller *replaces*
+  rather than joins, since two rows for one unit is not something this family
+  can express (Grafana reads it as two batteries). Both halves are pinned by
+  `test_a_copy_is_replaced_by_an_integration_once_the_reading_goes_stale` and
+  `test_upgrading_a_copy_replaces_only_that_unit`; both were mutation-checked.
+- **`_rows_for_newly_stale` now runs on every scrape**, not only when
+  `state["inferred"]` is empty. Normally it finds no candidates and costs a
+  freshness test per unit. The exception is a unit that is stale but never
+  integrable (no anchor, or no power) — it is retried on every 5m scrape rather
+  than once an hour. No API calls, but it is no longer strictly poll-rate work.
+- **`oe_batteries_inferred` deliberately still counts integrated rows only.**
+  Counting every row would make it the monitored count under another name. What
+  is worth knowing is how much of the fleet is actually being dead-reckoned, so
+  the gauge keeps its old meaning and its old numbers.
+- **The honest cost: the family no longer self-identifies.** An absent inferred
+  value used to mean "measured is current, use that instead". It no longer does.
+  `oe_battery_scrape_success` and `oe_battery_sample_age_seconds` still carry
+  that distinction and `from_measured` exists internally, but nothing exported
+  says which kind of row you are looking at. If that matters, a
+  `oe_battery_inferred_from_measured` 1/0 gauge is the obvious addition.
+- **There is a step at the handover.** A copy is pinned to the reading's value;
+  the moment the reading goes stale the row becomes anchor + accumulated
+  integral. That discontinuity is the size of the fresh-window integration, and
+  the bargauge's `last_over_time(...[2h])` smears it over two hours.
+- **`--infer-fresh-hours` changed meaning.** It no longer decides whether an
+  inferred row exists, only whether the row copies or integrates. It is still
+  the right knob — it is the line where the estimate stops being the reading —
+  but every piece of prose describing it as a handover switch is now wrong.
+
+### Documentation deliberately left stale
+
+Left as-is at the user's request, to be swept if this is revisited. All of these
+now describe the old behaviour:
+
+- `oe_battery_exporter.py` — module docstring (`:134`, `:169-177`), the
+  `oe_battery_soc_inferred_ratio` HELP (`:1369-1373`),
+  `oe_battery_inferred_timestamp_seconds` HELP (`:1395`, "the newest power sample
+  integrated" — none is, in a copy), `oe_batteries_inferred` HELP (`:1479`),
+  and the `_compute_inferred` docstring (`:1755-1771`).
+- CLI help — `--enable-inferred` (`:2671-2677`) and `--infer-fresh-hours`
+  (`:2703-2710`, "replaced by inference").
+- `README.md:31-44` — "Measured values are never overwritten", "inference covers
+  roughly 05:00–10:00 and then publishes nothing".
+- `scrapers/README.md:484-501` — "Measured always wins … no inferred value is
+  exported at all"; `:705` for `oe_batteries_inferred`.
+- `scrapers/NOTES.md` — `:661-668` (handover on freshness), `:734`,
+  `:753-755` ("publishes nothing for the rest of the day"), and the
+  `--max-infer-hours=6` claim at `:747-757`, which the deployed value of 48
+  already outgrew.
+- `docker-compose.yml:151-157`, `:165-175` — comments describing inference as
+  filling the hours measured does not publish.
+- `tools/build_battery_dashboard.py` — panel 1 (`:386-394`, "every other SOC
+  panel is measured"), panel 8 bargauge (`:537-547` comment describing the now
+  unreachable `or` fallback; `:553-556` "never published for the same battery at
+  the same time"), panel 11 (`:671-674` "the two families never overlap", and
+  `:680-683` explaining a dashed-line gap that no longer occurs), panel 13
+  (`:763-768`, the paragraph about gaps that is now untrue), panel 15
+  (`:816-819`).
+
+Dashboard follow-ups if this is revisited: the `or` fallbacks on panels 8 and 13
+are now dead code and can be simplified to the bare inferred metric; panel 11's
+solid and dashed lines will coincide while a reading is current, which makes it
+a better agreement check than a comparison; and the inferred-only panels no
+longer need to explain their own gaps.
+
+## A sign error in `stored_energy_delta` — found 2026-10-04, while calibrating
+
+`stored_energy_delta` splits a power segment that crosses zero into a charging
+leg and a discharging leg, and discounts the charging one. It discounted the
+**first** leg unconditionally:
+
+```python
+charging   = -trapezoid(p0, t0, 0.0, cross_t) * charge_efficiency
+discharging = -trapezoid(0.0, cross_t, p1, t1)
+```
+
+The first leg keeps `p0`'s sign and the second keeps `p1`'s, so which leg is
+lossy depends on the direction of travel. As written:
+
+| direction | first leg | applied | result |
+|---|---|---|---|
+| charge → discharge (`p0<0`) | charging | efficiency | correct |
+| discharge → charge (`p0>0`) | discharging | efficiency | **inverted** |
+
+For the inverted direction the two legs came out unweighted and
+wrongly-weighted *respectively*, so the total came back as the exact negative
+of the right answer. 120 MW discharging for an hour then 30 MW charging for an
+hour reported **+3 MWh gained** where the truth is **−48 MWh lost** — a 51 MWh
+error on one hourly segment, on a 1997 MWh battery.
+
+It survived because the correct direction is the common one. A battery ramping
+into dispatch is charge → discharge, and that path was always right. The broken
+path is what happens when dispatch *ends* and the battery goes back to charging,
+which is every ordinary evening. It was not an edge case.
+
+It also cancelled. A day with as many `+→−` transitions as `−→+` transitions nets
+roughly to zero, so fleet-aggregate SOC looked plausible throughout. The
+existing test `test_a_segment_crossing_zero_is_split_at_the_crossing` covered
+only the charge → discharge direction, and passed throughout.
+
+Fix is a two-line branch on `p0 > 0`. Verified by identity against an
+independent reference implementation over 1458 combinations of sign, efficiency
+and interval length, and by asserting the physical invariant that a
+charge/discharge cycle must *lose* energy (`test_charging_after_discharging_loses_energy_not_gains_it`).
+All 497 pre-existing tests passed unchanged, so nothing had encoded the buggy
+behaviour.
+
+**Lesson worth keeping:** a sign error that cancels is not a sign error you find
+by looking at aggregates. It surfaced only because the calibration work needed
+the two legs to be individually recoverable, and `charge_discharge_split` —
+which recovers them by calling the function at efficiency 0 and 1 — returned
+0/0 for every straddling segment. A function that returns a hard zero for an
+ordinary input is telling you something about its caller.
+
+## Calibrating `--infer-charge-efficiency` — 2026-10-04
+
+`--infer-charge-efficiency=0.9` was a judgement call: taken from a backtest and
+never re-examined against the fleet. The evidence to examine it already existed
+and was unambiguous.
+
+**Prometheus cannot be the source.** `oe_battery_power_mw` exposes only the
+newest power value per scrape — 144 samples over 12h containing 12 distinct
+values — so a Prometheus-side calibration measures the sampling, not the
+batteries. It also cannot express the integral at all: no `integral()`, and
+`sum_over_time()` is not a running total. This was confirmed by building
+`tools/soc_inferred_experiment.py` and round-tripping a backfill through
+`promtool tsdb create-blocks-from openmetrics` (5313 samples → 33 blocks → 35
+series, all queryable) — the mechanics work, the *input* is wrong. Its
+`--sweep` result of ~0.96–0.98 against the deployed 0.9 was input distortion,
+not battery efficiency.
+
+**So the calibration lives in the exporter**, where `_power_for_inference`
+returns the merged series — the live API window plus `/cache/power-history.json`
+over 14 days — which is the same series inference integrates.
+
+A pair forms in `_record_readings` when a reading supersedes an earlier one: both
+ends are published by the feed, so `e1 - e0` is real measured change, and the
+power series between them says how much the grid delivered and took. That solves
+for the coefficient instead of assuming it:
+
+```
+measured = efficiency x charged - discharged
+implied  = (measured + discharged) / charged
+```
+
+`charged` and `discharged` are recovered by calling `stored_energy_delta` at
+efficiency 0 and 1 — `-delta(0)` and `delta(1) + delta(0)` — rather than by
+duplicating its zero-crossing logic. Two calls recover both legs exactly, and
+the split stays defined in one place, so calibration cannot drift away from the
+model in production. `test_the_split_inverts_stored_energy_delta_at_every_efficiency`
+holds that by identity.
+
+Pairs are keyed on `(unit, closing reading timestamp)`, so repeated polls
+replace rather than double-count, and are pruned at 90 days — much longer than
+the 14-day power history, because the pairs are the evidence and the window they
+were measured over is deliberately deleted.
+
+**Deliberately report-only.** Nothing in the exporter ever writes to
+`--infer-charge-efficiency`. The evidence accumulates slowly on purpose, and
+three gates stand between it and a number:
+
+- `DEFAULT_CALIBRATION_MIN_PAIRS = 5`, applied **per window bucket** as well as
+  overall. Five pairs of twelve hours and five pairs of two hours are not the
+  same evidence; the short ones divide by the least energy and are the noisy
+  ones.
+- A candidate must improve the **longest** window and must not make the short
+  window worse. This is the specific test the deployed coefficient was rejected
+  for, and it is why errors are stratified rather than pooled — one mean over
+  all windows shows a change that fixes long nights and wrecks short ones as an
+  improvement.
+- Sweep ties resolve to the value nearest the deployed one, and if the deployed
+  value is itself tied for best the recommendation is simply **absent**. A
+  symmetric grid ties constantly (every value between the truth and the flag is
+  equally wrong), and without that rule the output is whichever member of the
+  tie iteration met first — noise, reported as a finding.
+
+Refusals are not silent: the reason travels in the summary, and both
+`recommended_efficiency` and `recommended_efficiency: 0` are distinguished from
+"nothing measured" by absence.
+
+**What is refused, and why it is not just caution:**
+
+- *Discharge-only pairs.* `charged` is zero, so this is not a small denominator
+  but none — the common case, since a battery sits out a calm afternoon
+  publishing readings all day and saying nothing about charging losses.
+- *Truncated integrations.* Power stops early (a gap wider than
+  `--calibration-max-gap-hours`) or never reaches the reading. Scored on part of
+  its span, a pair reports a plausible number for an interval it did not cover.
+  A little slack is allowed, because readings are stamped from their own
+  timestamp and can lag the newest power sample.
+- *Implausible implied efficiencies* (>1.0 means the battery stored more than
+  the grid delivered). These are returned with `plausible=False` and **counted**
+  rather than filtered, because a run of them is the signal that the readings
+  or the power series disagree — filtering them out is how a broken feed looks
+  like a healthy calibration.
+
+**Cold start is `plausible_pairs 0` and an absent recommendation**, which is
+what the live exporter published on first start with the feed still down
+(`scrape_success=0` for all 12 units). Nothing is claimed until readings resume.
+
+### Wiring notes
+
+- Opt-in via `--efficiency-calibration`; without it the exporter emits *nothing*
+  in this family. An earlier draft published the two fleet-wide metrics
+  unconditionally, which emitted `NaN` for the pair count — a disabled feature
+  answering the question the panel asks. Pinned by
+  `test_nothing_is_published_when_calibration_is_off`.
+- `_render_calibration` was carved out of `render` so the gate is a single
+  `if calibration:` at the call site.
+- The pair is recorded *before* `_last_measured_*` is overwritten, and
+  `_record_readings` runs before `_absorb_power_history` — so the power series
+  comes from the API's lookback window plus history absorbed on earlier polls,
+  which covers the interval as long as `--lookback-hours` exceeds the gap
+  between readings.
+- Labels are captured on **every** `observe` call, including refused ones.
+  Capturing them only on a scored pair means a unit whose pairs all predate this
+  build exports without labels, and a metric without labels is invisible to
+  every Grafana variable that selects a battery.
+- `oe_battery_inferred_calibration_recommended_efficiency` is deliberately
+  **unlabelled**: a recommendation is not a per-battery claim, and per-battery
+  labels would mean several values that have to agree with each other.
+
+### Live status at time of writing
+
+`scrape_success=0` for all 12 units, so 0 pairs. There were ~3 informative 12h+
+pairs in 72h of Prometheus history before the feed went quiet — below the floor,
+correctly. The mechanism is live and verified to publish its cold-start state
+honestly; it has not yet had real data through it.
+
+## The energy feed stopped publishing — 2026-10-05
+
+Not a lag and not a missed night: `storage_battery` has published **nothing**
+fleet-wide since `2026-10-02T04:00+10:00`. Verified directly against the API for
+ERB01, WTAHB1, LDBESS1 and SNB02 plus their `G1`/`L1` series — every one cuts off
+at the same instant, so three nights (2→3, 3→4, 4→5) are empty. `power` over the
+same request, same units, same window: fully populated to `2026-10-05T19:00`.
+
+This is the *second* consequence of the overnight-only behaviour above, and it is
+the one that broke the dashboard. The two are independent: a feed can be
+overnight-sparse and healthy, or overnight-sparse and dead, and nothing in the
+response distinguishes them except the age of the newest non-null point.
+
+### Why inferred SOC disappeared entirely
+
+Not because the anchor went stale — because **the reading was never fetched**.
+
+`battery_metrics` takes the newest non-null sample *inside the requested window*
+(`latest_sample`, `:602`), and the window is `now - lookback_hours`. At the shipped
+`--lookback-hours=36` a reading 89h old was outside it, so the request that would
+have returned it was never made. Chain:
+
+```
+36h lookback → Oct 2 reading outside the window
+  → latest_sample() finds nothing → values has no "storage" key
+  → scrape_success=0 → _record_readings never seeds _last_measured_*
+  → infer_soc() returns None at :1162 (anchor_mwh is None)
+  → oe_batteries_inferred 0, and no soc_inferred_ratio series at all
+```
+
+Raising `--max-infer-hours` alone cannot fix this, and did not: it was set to 48h
+on 2026-10-03 for exactly this symptom and inference went dark again five days
+later. The anchor has to exist before any number of hours will integrate from it.
+`oe_battery_anchor_age_hours` was the metric that made this diagnosable — it
+stayed absent while every other inferred metric was absent too, which is the
+signature of "no anchor" rather than "anchor too old".
+
+### The fix: three flags, moved together
+
+| Flag | Was | Now | Why it is needed |
+| --- | --- | --- | --- |
+| `--lookback-hours` | 36 | **192** | fetches the reading at all |
+| `--max-sample-age` | 129600 | **691200** | `:950` otherwise discards it as stale on arrival |
+| `--max-infer-hours` | 48 | **192** | `:1166` otherwise refuses to integrate across the gap |
+
+192h is not arbitrary — it is the API's ceiling. `interval=5m` accepts a range of
+**8 days maximum**; 9 days returns `HTTP 400 "Date range too large for 5m
+interval. Maximum range is 8 days."` So `--lookback-hours=336` is not a larger
+window, it is a 400 on every request and a silently empty exporter. `interval=1h`
+goes to 32 days, so reach and accuracy trade against each other here and 5m was
+kept, because 5m is the larger accuracy lever (`README.md` §error table).
+
+**Cliff, dated:** the anchor is `2026-10-02T04:00+10:00`. When it passes 192h —
+about **2026-10-10** — it leaves the window and inferred SOC goes dark again for
+the identical reason. The 14-day power cache still holds every sample needed to
+integrate it; only the *fetch* is short. Fixing it then means `--api-interval=1h`
+(32d window, roughly twice the error), not a bigger `--power-history-days`.
+
+### What the estimates are worth
+
+Reproduced independently: integrating the raw API `power` series for ERB01 from
+the anchor over 88.5h at `--infer-charge-efficiency=0.9`, unclamped, gives
+**591.33 MWh** — the exporter publishes `oe_battery_energy_inferred_mwh 591.332`
+and 29.611%. So the arithmetic is doing what it claims.
+
+What that is worth is a different question, and the answer is: not much, yet.
+88.6h is one integral from a single anchor, and `README.md`'s own measured drift
+is ~1.5% of capacity at 6h and ~5% at 14h — extrapolated, that is well past any
+of it by four days. `oe_battery_inferred_saturated` is 0 for all 7 units, so
+nothing is pinned at a bound and the raw integral never left [0, capacity]; the
+clamp is not doing any work here and is not what is keeping these in range.
+
+The binding constraint on the *meaning* of the number is the denominator, not the
+integration. `oe_battery_capacity_storage_mwh` for ERB01 is **1997 MWh**, which is
+not a battery size anyone recognises — Eraring 1 is a ~470 MW / 940 MWh
+installation. If that registered capacity is the facility total rather than the
+unit's, then every SOC percentage for ERB01 is a fraction of the wrong thing, and
+no amount of integration accuracy recovers it. This is the same trap
+`capacity_registered` vs `capacity_storage` sets out in the notes above, one
+level further in, and it is worth confirming against the facility record before
+these seven numbers are read as percentages of anything.
+
+### The inferred line was flat because the hold was disconnected
+
+Found immediately after the flags above were changed: with inference live on 7
+units, Liddell sat at exactly 483.417 MWh while discharging at 156 MW.
+
+**The integration was correct.** Replaying the cached power offline through
+`infer_soc` gives 658.9 MWh at 20:18, 511.4 MWh at 21:18, 486.5 MWh at the
+newest sample — a clean ~147 MWh/hour fall. Nothing was wrong with the maths,
+the sign, the efficiency term or the clamp.
+
+The value was frozen because `infer_soc` is only ever exact up to the newest
+power sample it was given, and that sample arrives with the **hourly poll**.
+Between polls `now` advances but `used_ts` does not, so every 5m Prometheus
+scrape republished the same number while `oe_battery_inferred_age_seconds` grew
+0.23 → 0.31 → 0.48h. That is the whole bug: a battery moving at 150 MW looked
+identical to one at rest, because the hold that was supposed to carry the last
+observed rate across the gap was never running.
+
+`hold_rate=None` was hardcoded at both call sites — `:2216` in
+`_compute_inferred` and again inside `_refresh_inferred_for_render` — while
+`_hold_rate` (`:2426`) sat unused directly above them. Fixed to pass
+`self._hold_rate(series, now)` at both. `oe_battery_inferred_hold_hours` was also
+being overwritten with a literal `0.0` in the refresh path, discarding the
+figure even once a hold did occur; it now carries `again["hold_hours"]`.
+
+Verified live after restart: Liddell 374.31 → 361.75 MWh over the five minutes
+between two Prometheus scrapes, i.e. **2.512 MWh/min = 150.7 MW against a
+reported 150.76 MW**, with `oe_battery_inferred_hold_hours` stepping 0.23 → 0.31
+in step. `--infer-max-hold-hours` is no longer inert.
+
+### Resolved: always integrate, never copy a fresh reading
+
+Decided 2026-10-05 — **inferred is computed from power whenever an anchor and a
+power series exist, and `--infer-fresh-hours` no longer gates that**. The test
+suite had encoded both answers:
+
+- `ZeroOrderHoldTest` (3 tests) wanted a reading inside the freshness window
+  published verbatim as a *copy* (`from_measured=True`), so the dashed line would
+  sit exactly on the measured one and only diverge as it aged.
+- `ScraperTest` (3 tests) wanted it integrated anyway — its comments had already
+  been rewritten to say so explicitly.
+
+These could not both hold. Always-integrate won, on three grounds:
+
+1. A copy makes the two series carry the same number for different reasons at the
+   same moment: it lies on the measured line while claiming to be an estimate,
+   then bends away from it as it ages, so the handover shows a kink in the chart.
+2. The copy has to be replaced later regardless, since it stops being the best
+   estimate as the reading ages. That replacement is a second code path plus a
+   window where the published value is up to a full poll interval out of date —
+   the `oe_batteries_inferred` counting ambiguity and the `_rows_for_newly_stale`
+   pass both exist only to serve it.
+3. `inferred_ts` on a copy names the *measurement*, not a power sample, so
+   `oe_battery_inferred_age_seconds` would report the age of a value that was
+   never integrated — the age metric describing work that did not happen.
+
+The 3 copy tests were rewritten rather than deleted, keeping the invariants that
+were actually about correctness:
+
+- `test_an_integrated_row_keeps_moving_as_the_reading_ages` — was
+  `test_a_copy_is_replaced_by_an_integration_once_the_reading_goes_stale`. There
+  is no handover to get wrong now, so it asserts the refresh advances the value
+  and that `inferred_ts`/`inferred_age` move with the integral.
+- `test_refreshing_one_unit_neither_duplicates_nor_drops_the_other` — was
+  `test_upgrading_a_copy_replaces_only_that_unit`. The one-row-per-unit invariant
+  it protected still matters (two rows read as two batteries in Grafana), so it
+  is kept, with the two units given *different* power so a leaked series or a
+  single-unit rebuild fails on a wrong value rather than only on a wrong count.
+- `ClientTest.test_a_fresh_measurement_is_still_integrated_rather_than_copied` —
+  asserts `from_measured` is false and that the scraper's own anchor wins over
+  the sample's claim, which pins which anchor the row is built from.
+
+`_measured_is_current`, `_copy_of_measured` and the `from_measured` branch in
+`_refresh_inferred_for_render` are now **retained but dead**, and marked as such.
+They are kept so the alternative stays reversible, but switching it back on is not
+a one-line change: it is that branch plus these tests plus the metric HELP text,
+which documents the always-integrate behaviour. Treat them as a record of the
+rejected design rather than a dormant feature.
+
+### A real bug found while settling it: stale `inferred_ts` after a refresh
+
+`_refresh_inferred_for_render` re-ran the integral and copied back `soc`,
+`energy_mwh`, `saturated` and `hold_hours` — but **not** `inferred_ts`. The age
+restamp above it therefore measured from the *poll-time* timestamp while the
+energy had been integrated through later samples, so `oe_battery_inferred_age_seconds`
+described a different timestamp than the one the number came from: two
+disagreeing clocks inside one row, which is the precise symptom that method
+exists to remove.
+
+Cause: samples that were future-dated at poll time are correctly not integrated
+then (`nothing past now is integrated`, so a future sample cannot pull the
+estimate forward), but become integrable as the clock advances to them. Between
+scrape and poll the set of integrated samples genuinely changes, so the stamp has
+to move with the value.
+
+In production this is inert — a poll's power series ends at the poll clock, so the
+integral endpoint is the same on every scrape and only the hold advances. It
+surfaced only because the test fixture carries samples an hour past the poll
+clock. Fixed by writing back `again["inferred_ts"]` and recomputing the age from
+it (`:2367`), which makes the two fields consistent for any input rather than
+only for well-behaved ones.
+
+### Unrelated, found nearby
+
+`DEFAULT_POLL_INTERVAL` is `600.0` (`:321`) while `test_default_top_is_ten`
+expected `3600.0`. Resolved by moving the test to `600.0`, since the constant is
+not wrong to be 10-minute — but it is not safe at full fleet either way: 12
+batteries at 600s is ~1728 requests/day against a 366/day bucket, ~5x over. The
+deployment passes `--poll-interval=3600` explicitly (288 requests/day), so it is
+the *default* rather than the deployed value that is the trap.
+
+A default that overran the budget by 5x was worth pinning in a test, so the
+assertion now carries that reasoning: anyone reading `600` as "the budgeted
+figure" and dropping the compose flag discovers the overage as HTTP 429s at
+runtime instead of in review. Raising the constant to 3600 remains a reasonable
+change, just not one to make silently while resolving an unrelated test.
+
+## Narrow request windows — 2026-10-06
+
+Scrape time had grown to ~8.5s per cycle (the `/metrics` render itself is ~30ms,
+so the cost was never Prometheus-facing). Traced to the request, not the
+exposition: `battery_metrics` takes the newest non-null `storage_battery` sample
+*inside the window it asked for*, and that sample is 6-14h old at poll time, so
+the window has to reach 192h to find it. At `interval=5m` that is 494 KB and
+~13.6k points for one facility, re-fetched hourly to pick up a few new points —
+~5.9MB per cycle across the deployed 12.
+
+Measured live, one facility, `interval=5m`:
+
+| window | bytes | points | fetch |
+| --- | --- | --- | --- |
+| 192h | 494041 | 13654 | 0.74s |
+| 48h | 119925 | 3288 | 0.60s |
+| 2h | 4798 | 96 | 0.38s |
+| 1h | 2960 | 48 | 0.38s |
+
+`interval` is a query parameter and costs the same at 5m and 1h; the *response*
+is what grows.
+
+### Note this does not buy any request budget
+
+The binding limit is 366 requests/**day**. N facilities is N requests per cycle
+whether the window is 2h or 192h, so the 313/day arithmetic in the compose file is
+unchanged. What drops is bytes and server-side work per request. Worth stating
+because "make the poll cheap" invites the assumption that it relieves the rate
+limit, and it does not.
+
+### The rule that would have made this dead code
+
+First version required *every* in-scope unit to hold a cached reading, else the
+cycle went wide. The deployed fleet has 12 batteries in scope and only 7 that
+ever publish `storage_battery` (the four COLLIE units and KWINANA_ESR2 publish
+none), so 5 units could never satisfy it and the window would have stayed at 192h
+forever — the mechanism shipping as decorative code. Caught by comparing the
+in-scope unit list against the seeded readings, not by a test: the unit tests all
+passed first, because they only ever built a fleet where every unit publishes.
+
+The cache now records which units it has *seen* publish (`seeded`), and only those
+have to be reachable. "Missing" then means regressed-from-observed rather than
+absent-of-evidence, which is the distinction that matters. A cold cache has an
+empty seed set and so goes wide, which is why the seed list is persisted rather
+than inferred from `readings`.
+
+A cache file written before `seeded` existed reads as an empty seed set, so it
+takes exactly one wide cycle to self-heal. Verified live: restart produced
+`seeded: [7 units]` and `missing: none`.
+
+### This gives up the liveness file's refusal, on purpose
+
+`liveness.json` holds timestamps only, and there is a test asserting that no
+reading is ever written to it (`test_the_anchor_is_never_persisted` for power
+history, `test_only_liveness_is_persisted_never_a_reading` for liveness). That
+property still holds for both files. But `readings.json` *does* store an energy
+reading, and when a narrow window returns power with no storage point inside it,
+that cached reading is exported as the *measured* one rather than
+`oe_battery_soc_ratio` going blank. That is the user's stated intent — a buffer so
+the metrics stay continuous — so the behaviour was kept and the docstring
+corrected, rather than the reverse.
+
+The bounds are checked rather than asserted:
+
+- it keeps its own timestamp, so the age is reported, not hidden. Verified against
+  the live API: wide and narrow paths produce an identical `sampled_at` (now-6.24h
+  on ERB01) and identical resulting SOC (0.055 / 0.000), so the narrow path is not
+  quietly serving something older than it claims;
+- `oe_batteries_reading_from_cache` counts units in that state, so "the buffer has
+  become the only source of truth" is visible. Watch this gauge;
+- it is never used for a facility that *failed to answer* — that stays
+  `scrape_success=0`, because reporting a battery as monitored during an upstream
+  outage is the one thing the exporter must not do. Pinned by
+  `test_a_failed_facility_is_never_papered_over_with_a_cached_reading`;
+- bounded by `--max-sample-age`, same limit a live sample is held to.
+
+### What is still wide
+
+- First cycle after any restart, even with a warm cache: the new process has not
+  proven it can fetch, and sizing its first request from a previous process's
+  claim is how a bad restore becomes a silent outage.
+- Any cycle after a missed poll. `infer_soc` drops power segments wider than
+  `--infer-max-gap-hours` rather than bridging them, so a hole is not a
+  slightly-wrong number, it is the line going flat. The window tracks time since
+  the last *attempt* so a failed cycle cannot shrink the window that would have
+  repaired it.
+
+### Still a full series, not one newest sample
+
+`--poll-window-hours` narrows the *range*; `full_series` is unchanged and a 2h
+window at 5m still returns 96 points. Going to literally one newest sample would
+need the local power history to backfill the integration, and that trades
+integration resolution for request size in a way worth deciding separately.

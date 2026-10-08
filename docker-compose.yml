@@ -146,14 +146,52 @@ services:
       - --fleet-cache-file=/cache/fleet.json
       # Persisted so a restart does not reset the 36h idle clock. Without it,
       # every unreadable battery gets a fresh reprieve on each deploy and the
-      # rotation never converges. Liveness only - readings are never cached.
+      # rotation never converges. Liveness only - this file stores timestamps,
+      # never a reading. The energy readings that --reading-cache-file below now
+      # persists are a separate file with a separate justification.
       - --liveness-file=/cache/liveness.json
+      # The overnight storage_battery reading, kept locally so the poll window
+      # can be narrow instead of 192h.
+      #
+      # WHY: the exporter takes the newest non-null storage_battery sample
+      # *inside the requested window*, and that reading is ~6-14h old at poll
+      # time. So --lookback-hours=192 below is not headroom, it is the only way
+      # to reach that one sample - and at interval=5m it costs 494 KB and ~13.6k
+      # points for ONE facility, re-fetched hourly to pick up a handful of new
+      # points. 12 facilities is ~5.9MB per cycle for data that is mostly
+      # re-sent. Measured against the live API: 192h = 0.74s/facility, 2h =
+      # 0.38s and identical resulting SoC.
+      #
+      # This file holds that reading per unit (one entry, ~400 bytes for the
+      # 7 that publish), so a poll only has to cover the gap since the last one.
+      # 2h against a 1h poll interval is 4x overlap, which is what makes the
+      # narrow fetch safe: a dropped poll cannot open a hole.
+      #
+      # This DOES change a safety argument, unlike the liveness file, so it is
+      # worth knowing: when a narrow window returns power but no storage point,
+      # the cached reading is exported as the measured one rather than the metric
+      # going blank. It keeps its own timestamp (oe_battery_sample_age_seconds
+      # and oe_battery_anchor_age_hours report the true age - verified identical
+      # to the wide path), and oe_batteries_reading_from_cache counts the units
+      # in that state. It is NEVER used for a facility that failed to answer -
+      # that stays scrape_success=0, because reporting a battery as monitored
+      # during an upstream outage is the one thing this exporter must not do.
+      #
+      # The window goes wide again, automatically, if a unit that is *known* to
+      # publish stops being reachable, if a poll was missed, or if the cache is
+      # cold. A unit that has never published does not block narrowing - 5 of
+      # the deployed 12 never do, and treating them as missing would pin the
+      # window at 192h forever.
+      - --reading-cache-file=/cache/readings.json
+      - --poll-window-hours=2
       # Synthetic SOC by integrating power since the last measured reading.
       # Costs no extra requests: the full power series comes back in the same
       # response that was already being read for oe_battery_power_mw. Measured
       # metrics are untouched - inferred values are a separate metric family,
-      # emitted only once the measured reading passes --infer-fresh-hours,
-      # which is what fills the daytime hours storage_battery does not publish.
+      # integrated from the last measured reading and published whenever an
+      # anchor and power exist (see --infer-fresh-hours below, which no longer
+      # gates this), which is what fills the daytime hours storage_battery does
+      # not publish.
       - --enable-inferred
       # Resolution of that one request. A query parameter, so 5m costs exactly
       # what 1h costs - same endpoint, same request count, same credits - and it
@@ -172,25 +210,83 @@ services:
       # description carries the error curve) rather than hidden. Expect a few
       # percent of drift late in the window, and more on the two units that
       # already saturate - see scrapers/NOTES.md.
+      #
+      # DEAD FLAG as of 2026-10-05: this no longer gates anything, by decision
+      # rather than by accident. _measured_is_current has no callers and
+      # _copy_of_measured is not on the poll path, so _compute_inferred
+      # integrates whenever an anchor and power exist regardless of how fresh
+      # the measured reading is.
+      #
+      # That was a choice between two test suites asserting opposite behaviour.
+      # Always-integrate won: a copy makes the dashed line lie exactly on the
+      # measured one and then bend away from it, it has to be replaced later
+      # anyway, and its inferred_ts names a measurement rather than a power
+      # sample, so the age metric would describe an integration that never
+      # happened. The 3 copy tests were rewritten to the chosen semantics and the
+      # full suite is green.
+      #
+      # Kept in the compose file so the dead path stays visible rather than
+      # quietly rotting - anyone flipping inference back to copy semantics has to
+      # come here and reconnect it deliberately. See NOTES.md, "Resolved:
+      # always integrate, never copy a fresh reading".
       - --infer-fresh-hours=1
       # Anchor at most this far back. Sized for the NORMAL overnight gap (04:00
       # to 18:00 Sydney is 14h) so the dashed line runs continuously.
       #
-      # Raised to 48h on 2026-10-03 because storage_battery stopped publishing
-      # and the anchor went 31.8h old: at 15h inference refused outright and the
-      # dashed lines vanished from the dashboard entirely, with nothing to
-      # distinguish "upstream missed an update" from "no data for this battery".
-      # oe_battery_anchor_age_hours is now published for every unit whether or
-      # not an estimate exists, so that outage is legible as data.
+      # 24 (default) -> 48 on 2026-10-03, when the anchor went 31.8h old and
+      # inference refused outright. -> 336 on 2026-10-05, once the cause turned
+      # out to be a feed that stopped publishing rather than one publishing late;
+      # see the note on --lookback-hours below, which is what actually unblocked
+      # it. 48h only bought two more days.
       #
-      # 48h buys a visibly-degrading estimate instead of no estimate, which is
-      # the right trade while waiting on openelectricity.org.au to confirm the
-      # publication gap. It is not free: the estimate is one long integral from a
-      # single anchor, and the fit error in scrapers/NOTES.md (~1.5% of capacity
-      # at 6h, ~5% at 14h) compounds well past that by 32h. Once upstream
-      # publishes again the anchor refreshes and this goes back to being slack -
+      # The honest cost: past a few hours this is one long integral from a single
+      # anchor, and the fit error in scrapers/NOTES.md (~1.5% of capacity at 6h,
+      # ~5% at 14h) compounds well past that. At 90h of anchor age it is a
+      # dead-reckoning, not a measurement, and it should be read as one. It is
+      # clamped to [0, capacity] and saturation is published, so a drifted
+      # estimate pins at a bound and says so rather than running away. Once
+      # upstream publishes again the anchor refreshes and this is slack again -
       # drop it to 24 and the normal case is unaffected either way.
-      - --max-infer-hours=48
+      - --max-infer-hours=192
+      # Fetch and accept readings this far back. 192h = the API's 8-day maximum
+      # at --api-interval=5m, so this is the widest window 5m can ask for.
+      #
+      # Raised from the 36h default on 2026-10-05. storage_battery stopped
+      # publishing fleet-wide at 2026-10-02T04:00+10:00 - verified against the
+      # API for ERB, WTAHB, LDBESS and SNB02, all with the same cut-off, so
+      # three nights have published nothing. The exporter takes the newest
+      # non-null sample *inside the requested window*
+      # (oe_battery_exporter.py latest_sample), so a 36h lookback never even
+      # fetched that last reading: scrape_success stayed 0, the inference anchor
+      # was never seeded, and oe_batteries_inferred was 0 - inferred SOC vanished
+      # from the dashboard entirely. These three flags are the whole fix, and
+      # they have to move together: lookback fetches the reading, max-sample-age
+      # stops it being discarded as stale on arrival, max-infer-hours allows
+      # inference to integrate across the gap.
+      #
+      # Cost, stated plainly: the API caps the requested range by interval -
+      # "Date range too large for 5m interval. Maximum range is 8 days." at
+      # 9 days, HTTP 400, measured - so 192h is the widest 5m window that exists
+      # and 336h is simply not fetchable. Verified: 5m 8d -> 200, 5m 9d -> 400;
+      # 1h goes to 32d, so switching --api-interval to 1h buys 4x the reach at
+      # roughly twice the inference error (scrapers/README.md has both curves).
+      # 8 days of 5m is ~2300 points per metric per request (~245kB, 0.6s) and
+      # free - the budget counts requests, not points.
+      #
+      # What it does weaken is the staleness signal: a feed that stops dead now
+      # keeps publishing its last reading for 8 days instead of dropping its
+      # series, so oe_battery_sample_age_seconds is now the only thing that
+      # distinguishes "old" from "current". Read it.
+      #
+      # CLIFF: the anchor is 2026-10-02T04:00+10:00. When it passes 192h - about
+      # 2026-10-10 - it falls out of this window and inferred SOC goes dark again
+      # for the same reason it went dark this time. The power cache at 14d still
+      # has the samples to integrate it; only the API's fetch window is short.
+      # Options then: --api-interval=1h (32d window, more error), or a wider
+      # --power-history-days plus nothing (does not help - the reading has to be
+      # fetched from the API to exist as an anchor).
+      - --lookback-hours=192
+      - --max-sample-age=691200
       # Never integrate across a hole wider than this. Note this bounds holes in
       # *power*, which is continuous 24/7 - it is not the 14h daylight gap in
       # storage_battery, which is expected and is what --max-infer-hours covers.
@@ -206,6 +302,14 @@ services:
       # the same capacity clamp applies - a held battery stops at full rather
       # than running off the panel. 6h is a backstop for a poll that stops
       # arriving; steady state is minutes.
+      #
+      # This flag did nothing until 2026-10-05: hold_rate=None was hardcoded at
+      # both call sites while _hold_rate() sat unused above them. The symptom
+      # was not subtle and not a display problem - Liddell sat at exactly
+      # 483.417 MWh while discharging at 156 MW, because infer_soc is only exact
+      # up to the newest power sample and that arrives with the hourly poll.
+      # After wiring hold_rate through, Liddell falls 2.512 MWh/min against a
+      # reported 150.76 MW. Do not remove this without re-reading that.
       - --infer-max-hold-hours=6
       # Share of grid-facing charging that actually reaches the cells; the rest
       # is conversion loss and never comes back out. Charging only - discharge
@@ -228,6 +332,19 @@ services:
       # volume is what makes it survive a container rebuild.
       - --power-history-file=/cache/power-history.json
       - --power-history-days=14
+      # Score 0.9 above against the fleet as it actually behaves. Every time a
+      # reading supersedes an earlier one, the change between the two is real
+      # measured ground truth and the power series in between says how much the
+      # grid delivered and took, which is enough to solve for the loss term
+      # instead of assuming it. Opt-in and read-only: the exporter publishes what
+      # the evidence supports and never changes the flag above itself. The
+      # evidence is deliberately slow to accumulate - a recommendation needs
+      # enough independent pairs that a bad night cannot decide it - which is
+      # appropriate, given that 0.9 was itself adopted on a sweep like this one
+      # and then reverted.
+      - --efficiency-calibration
+      - --efficiency-calibration-file=/cache/efficiency-calibration.json
+      - --efficiency-calibration-days=90
     environment:
       # Read from the environment by the exporter, never from argv, so the key
       # cannot show up in the process table or in a `docker inspect` command
@@ -298,6 +415,14 @@ services:
       GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:-admin}"
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_ANALYTICS_REPORTING_ENABLED: "false"
+      # Headless rendering, used to capture what a panel actually draws. The
+      # renderer's own network name is the callback target, so the two must
+      # share a network; the key is only trusted from inside the compose net.
+      GF_RENDERING_SERVER_URL: "http://grafana-image-renderer:8081/render"
+      GF_RENDERING_CALLBACK_URL: "http://grafana:3000/"
+      # Grafana 13 renamed this from renderer_key to renderer_token; leaving it
+      # at the default is a hard startup failure in production mode.
+      GF_RENDERING_RENDERER_TOKEN: "${GRAFANA_RENDER_KEY:-local-render-key}"
     volumes:
       - grafana-storage:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
@@ -314,6 +439,22 @@ services:
       timeout: 5s
       retries: 5
       start_period: 20s
+
+  grafana-image-renderer:
+    # Pinned by digest: this one is new, so there is no upgrade to opt into
+    # later. Chromium needs more than the default 64MB of shared memory or it
+    # dies mid-render, and --no-sandbox is required inside a container.
+    image: grafana/grafana-image-renderer@sha256:76542ccc4c045e5ff9f80f87b25de6fcc71b31222172de5031a8ceba33772ee1
+    container_name: grafana-image-renderer
+    shm_size: "256mb"
+    command: ["server", "--browser.sandbox=false"]
+    # Must match Grafana's GF_RENDERING_RENDERER_TOKEN: the renderer rejects
+    # anything without a matching X-Auth-Token, which is Grafana's half of the
+    # shared secret, not a credential of its own.
+    environment:
+      AUTH_TOKEN: "${GRAFANA_RENDER_KEY:-local-render-key}"
+    networks: [monitoring]
+    restart: unless-stopped
 
 networks:
   monitoring:

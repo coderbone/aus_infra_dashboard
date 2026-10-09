@@ -2,12 +2,12 @@
 
 Working notes for whoever picks this up next (including future me).
 
-## 1. Layout as of 2026-09-30
+## 1. Layout as of 2026-10-08
 
 ```
 ~/src/monitoring/                                    # this project
-~/src/monitoring/docker-compose.yml                  # 5 services, project name "aus_infra_dashboard"
-~/src/monitoring/prometheus.yml                      # scrape configs: tbm-exporter:9109, reservoir-exporter:9110, battery-exporter:9111
+~/src/monitoring/docker-compose.yml                  # 6 services, project name "aus_infra_dashboard"
+~/src/monitoring/prometheus.yml                      # scrape configs: tbm-exporter:9109, reservoir-exporter:9110, battery-exporter:9111, aemobattery-exporter:9112
 ~/src/monitoring/.env.example                        # tracked template for the secrets below
 ~/src/monitoring/.env                                # UNTRACKED, mode 600, holds GRAFANA_ADMIN_PASSWORD + OPENEA_API_KEY
 ~/src/monitoring/grafana/provisioning/datasources/prometheus.yml
@@ -16,6 +16,7 @@ Working notes for whoever picks this up next (including future me).
 ~/src/monitoring/scrapers/wht_tbm_exporter.py        # the WHT scraper (stdlib only, no image build)
 ~/src/monitoring/scrapers/snowy_tantangara_exporter.py  # the Snowy Hydro reservoir scraper
 ~/src/monitoring/scrapers/oe_battery_exporter.py     # the NEM battery scraper (OpenElectricity, bearer token)
+~/src/monitoring/scrapers/aemo_battery_exporter.py   # the AEMO NEMWEB battery storage scraper
 ~/src/monitoring/scrapers/README.md                  # metrics + run instructions
 ~/src/monitoring/scrapers/NOTES.md                   # upstream endpoints
 ~/src/monitoring/scrapers/TASKS.md                   # original task list
@@ -31,26 +32,28 @@ Docker objects (not files, survive any file move):
 
 | Thing | Name |
 | --- | --- |
-| containers | `wht-tbm-exporter`, `snowy-tantangara-exporter`, `openelectricity-battery-exporter`, `prometheus`, `grafana` |
+| containers | `wht-tbm-exporter`, `snowy-tantangara-exporter`, `openelectricity-battery-exporter`, `aemonemweb-battery-exporter`, `prometheus`, `grafana` |
 | compose project | `aus_infra_dashboard` (pinned via `name:` in the compose file) |
 | network | `aus_infra_dashboard_monitoring` (bridge) |
-| volumes | `prometheus-data`, `grafana-storage` (external, pre-existing), `exporter-cache`, `battery-fleet-cache` (compose-created) |
+| volumes | `prometheus-data`, `grafana-storage` (external, pre-existing), `exporter-cache`, `battery-fleet-cache`, `aemo-state` (compose-created) |
 
 `exporter-cache` belongs to `tbm-exporter` alone — it holds that exporter's
 discovered ArcGIS layer config. `battery-fleet-cache` holds only the battery
 exporter's fleet metadata, and is a *separate* volume rather than a second file
 in `exporter-cache`: two exporters sharing a volume means one of them
 clobbering the other's file, and there is nothing to gain from the coupling.
-`snowy-tantangara-exporter` deliberately mounts **no** volume: it has no
-discovery step, and a persistent cache of reservoir levels would be a way to
-serve a stale reading as a current one.
+`aemo-state` is the same arrangement for `aemobattery-exporter`'s state file
+(`/cache/state.json`), kept separate so the AEMO and OE exporters cannot
+clobber each other. `snowy-tantangara-exporter` deliberately mounts **no**
+volume: it has no discovery step, and a persistent cache of reservoir levels
+would be a way to serve a stale reading as a current one.
 
-Note the container/service naming asymmetry, now three deep: the service is
-short (`battery-exporter`) and the container is spelled out
-(`openelectricity-battery-exporter`). All `container_name`s are pinned outright
-rather than derived from the project name, which is why renaming the project
-leaves them alone — and why a second stack cannot run alongside this one under
-any name.
+Note the container/service naming asymmetry, now four deep: the service is
+short (`battery-exporter`, `aemobattery-exporter`) and the container is spelled
+out (`openelectricity-battery-exporter`, `aemonemweb-battery-exporter`). All
+`container_name`s are pinned outright rather than derived from the project
+name, which is why renaming the project leaves them alone — and why a second
+stack cannot run alongside this one under any name.
 
 ## 2. If files have moved
 
@@ -65,9 +68,9 @@ grep -rl 'wht_tbm_exporter' ~ 2>/dev/null
 
 Then fix, in this order:
 
-1. **The three bind mounts in `docker-compose.yml`** — paths are resolved
-   relative to the compose file, not the CWD:
-   `./scrapers/wht_tbm_exporter.py`, `./prometheus.yml`,
+1. **The bind mounts in `docker-compose.yml`** — paths are resolved
+   relative to the compose file, not the CWD: the four
+   `./scrapers/*_exporter.py` scripts, `./prometheus.yml`,
    `./grafana/provisioning`.
 2. **The project name.** It defaults to the compose file's directory name, so
    moving the file changes the project name and the network name — and the
@@ -1329,3 +1332,44 @@ future claim about whether a 304 is billed needs a batched measurement over many
 requests, not one probe.
 - The `--top 12` scope is a guess, made for a request budget rather than from
   anything the user asked for. It is one flag in `docker-compose.yml`.
+
+## 10. AEMO NEMWEB battery exporter added (2026-10-08)
+
+`aemobattery-exporter` on 9112, scraped as job `aemo_battery` — the same per-DUID
+energy storage the dispatch chart is built from, straight from AEMO's
+`Next_Day_Dispatch` archive (no key, no request budget). Same decision as
+section 9: its own service with its own volume (`aemo-state`) rather than sharing
+the OE exporter's, because the two answer different questions (measured with a
+trend vs. as-dispatched with one daily timestamp) and must not be able to clobber
+each other's caches. Unlike the OE exporter it scales with *all* storage units
+AEMO publishes (67 at the audit) rather than a `--top N`.
+
+### Why a second battery feed
+
+Worth being explicit, because both words start with "battery". The OE exporter
+is the answer to "what did the batteries actually do" — stored energy from the
+`storage_battery` series, with dead-reckoned SOC in between, limited to the
+largest facilities that publish. The AEMO exporter is the answer to "what were
+the batteries dispatched to hold today" — the whole storage fleet at its newest
+reported interval per the daily dispatch file, which is the number the market
+actually operated against. They agree on the same units, so a dashboard that
+plots both is a consistency check across suppliers rather than a duplicate.
+
+### The load problem is the same shape, and the answer is the same
+
+A full day's `Next_Day_Dispatch` is ~126MB — no 30s scrape can carry it, so the
+background poll loop returns, hourly by default, and the ~90KB directory listing
+decides whether the big file has actually changed (lexicographic max name =
+newest, same-day corrections included). The state file on `aemo-state` caches
+the last parsed report; it is only trusted after the live listing re-verifies
+the cached file is still the newest, and it is never overwritten by a failed
+cycle. A failed poll publishes an empty report — series dropped, never stale —
+just like the OE convention.
+
+### What to watch
+
+`aemo_battery_units_reporting` (67 at the audit — a dip is the file being
+mid-upload), `aemo_battery_report_reused` (cache answering), and
+`aemo_battery_report_generated_age_seconds` (a daily value, so it legitimately
+reaches ~24-27h before today's file lands). See `scrapers/NOTES.md` for the
+audit, the column layout, and the traps.

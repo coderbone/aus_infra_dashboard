@@ -3,9 +3,10 @@
 Working notes for whoever picks the scrapers up next. The WHT sections are about
 `wht_tbm_exporter.py`; the Snowy Hydro 2.0 section is about
 `snowy_tantangara_exporter.py`, which was added on 2026-09-29 from the audit
-recorded there. Everything here is about the exporters and the upstream data
-they read; the Docker/Prometheus/Grafana stack they run in is documented one
-level up in `../README.md` and `../NOTES.md`.
+recorded there; `oe_battery_exporter.py` and `aemo_battery_exporter.py` each
+have their own audit section below. Everything here is about the exporters and
+the upstream data they read; the Docker/Prometheus/Grafana stack they run in is
+documented one level up in `../README.md` and `../NOTES.md`.
 
 ## Upstream data — durable facts
 
@@ -1324,3 +1325,161 @@ The bounds are checked rather than asserted:
 window at 5m still returns 96 points. Going to literally one newest sample would
 need the local power history to backfill the integration, and that trades
 integration resolution for request size in a way worth deciding separately.
+
+## AEMO `Next_Day_Dispatch` batteries — audited 2026-10-08
+
+`aemo_battery_exporter.py` reads AEMO's NEMWEB `Next_Day_Dispatch` archive rather
+than the OpenElectricity API, because it reports energy storage for *all* NEM
+storage units (67 as of the audit) on the day's published dispatch chart, with
+no API key and no request budget. The OE exporter and this one answer
+different questions: OE gives measured-with-a-trend, AEMO gives
+as-dispatched-with-a-single-timestamp.
+
+### Durable facts
+
+- Source: <https://nemweb.com.au/Reports/Current/Next_Day_Dispatch/> — a plain
+  directory listing. Newest file is the lexicographic maximum of the listing:
+  names are `<report type (PUBLIC_NEXT_DAY_DISPATCH)>_<YYYYMMDD>_<000000NNN>`,
+  so same-day corrected re-publishes carry a larger `NNN` and sort last. Verified
+  against the live listing (~790 entries at the time; the max was the newest).
+- The file of interest is `<name>.zip`, which contains one `<name>.CSV`.
+  A full day is ~126MB — read it streaming (200-row preview to find the
+  `UNIT_SOLUTION` table, then `csv.reader`), never whole.
+- `UNIT_SOLUTION` row layout (0-indexed): 4 `SETTLEMENTDATE`, 6 `DUID`,
+  14 `TOTALCLEARED` (cleared dispatch MW; negative = charging/absorbing),
+  69 `INITIAL_ENERGY_STORAGE`, 70 `ENERGY_STORAGE` (MWh). Header preview, not a
+  fixed table position, selects the table; `IntervalLength`-sampled to end-of-day
+  is 288 intervals, and a day's report has 288 per unit except an occasional
+  truncated one (e.g. 287 of 288 for 4 units in the audited day).
+- 67 battery storage units in the audited day (a handful under 40MW qualify as
+  "storage"; most DUIDs in the table are generators and no `INITIAL_ENERGY_STORAGE`).
+- `TOTALCLEARED` carries the per-interval **cleared dispatch in MW**: negative =
+  charging/absorbing, positive = discharging/generating, near-zero = idle
+  (verified: WTAHB1 +119 while its energy 1123.5→1113.3, ERB01 −8 while charging,
+  SNB01 −4). Exported as `aemo_battery_total_cleared_mw` at the same newest
+  interval as the storage columns — the "charge/discharge rate" figure.
+- `SETTLEMENTDATE` is AEST, pinned UTC+10, no DST. Filename date is the dispatch
+  day; the report is published the evening before that day. So for the current
+  day the newest file's `SETTLEMENTDATE` max is *that* day's — the value being
+  exported is the next-day dispatch, published a day earlier.
+- The CSV body is ~64K lines for a full day and ~126MB across the 288-interval
+  tables; the listing itself is tiny (~90KB), so a per-hour poll that finds no
+  new file costs almost nothing.
+
+### Design decisions (the ones a reviewer will question)
+
+- **Newest reported interval per DUID, not the full 288.** Prometheus ignores
+  OpenMetrics timestamps, so all 288 intervals cannot be backfilled by a 30s
+  scrape anyway; a daily step function from the newest SETTLEMENTDATE is the
+  honest representation, with `aemo_battery_last_sample_timestamp_seconds`,
+  `aemo_battery_sample_age_seconds` to separate age-of-reading from
+  age-of-scrape. (The file is ~126MB; a scrape cannot carry it.)
+- **Background poll loop, hour default, not the `/metrics` handler.** Same
+  reasoning as the OE exporter and same safe default for the same reason.
+- **State file reused only after the live listing re-verifies the cached report
+  is still the newest file.** A restart never trusts a cached verdict; the
+  listing is re-fetched and the cached file name compared. `report_reused=1`
+  marks cache-served reports; reused reports also re-check `report_generated`
+  vs. the listing, so a re-publish the listing reveals forces a re-download.
+- **A failed poll publishes an empty report** (`units_reporting 0`, success 0),
+  so a unit fails closed — dropped, never a stale number — matching the OE
+  convention. The state file is *not* updated on failure, so a transient error
+  cannot poison a good cache.
+- **A render guard `if units and success:`** asserts the invariant that no
+  reading from a failed poll is ever printed (the report is `{}` on failure).
+- **The publication stamp comes from the control line** `C,NEMP.WORLD,...` (the
+  lists' header row: fields 5, 6), not from mtime — the file's mtime is when
+  NEMWEB copied it, not when the data was generated.
+
+### Traps
+
+- **AEST is UTC+10 and AEMO does not do DST**; parsing timestamps with `datetime`
+  defaults would silently shift a winter reading by an hour. The exporter pins
+  `+10:00` explicitly.
+- **`ENERGY_STORAGE` is reported for units that are not storage** — filter on the
+  presence of the energy-storage columns, don't take every DUID row.
+- **The 288-interval day only holds the current day**; a `Next_Day` file at 23:59
+  its own day would contain *next* day's numbers and none of today's, so never
+  assume the newest interval has any relation to `now` beyond the published day
+  boundary. Alert on report age, not on scrape freshness.
+- **Two very similar column families** (`INITIAL_ENERGY_STORAGE`,
+  `ENERGY_STORAGE`) — grab the wrong index and the exporter reads a generator's
+  `0` for every battery. The parser reports the first DUID's two values verbatim
+  in the vector; the test asserts exact values from a real capture.
+
+## AEMO intraday live feed — audited 2026-10-08
+
+NEMPulse shows charge/discharge and SOC moving through the day while our
+`Next_Day_Dispatch` panels step once a day. The audit asked whether that
+"live" view comes from a registered/commercial AEMO API. It does not — it
+comes from two *intraday* archives under `/Reports/Current/`, free and
+anonymous like the daily file, each publishing a small file every 5-minute
+dispatch interval. Verified against the live site on 2026-10-08:
+
+- **`Dispatch_SCADA`** — `PUBLIC_DISPATCHSCADA_<YYYYMMDDHHMM>_<seq>.zip`,
+  ~4KB, one interval per file. `UNIT_SCADA` table, 8 columns; layout
+  (0-indexed): 4 `SETTLEMENTDATE`, 5 `DUID`, 6 `SCADAVALUE` (measured MW),
+  7 `LASTCHANGED`. Negative = charging/absorbing (verified: ERB01 −120.0,
+  NESBESS1 −90.0, SNB02 −150.0, WTAHB1 −34.1 charging; ERB02 +48.0, LIMBESS1
+  +0.9 discharging at 15:20). This is the per-unit live charge/discharge rate,
+  and every mid-afternoon file on the listing carried every scheduled unit,
+  so the exporter filters rows to the storage units the daily report has
+  learned (seeded from the state file at startup).
+- **`DispatchIS_Reports`** — `PUBLIC_DISPATCHIS_<YYYYMMDDHHMM>_<seq>.zip`,
+  ~23KB, one interval per file. `DISPATCH,REGIONSUM` table carries
+  `BDU_INITIAL_ENERGY_STORAGE` at column 124 and `BDU_ENERGY_STORAGE` at
+  column 129 (of 130): the reported aggregate stored MWh of all battery
+  dispatch units per region (verified 15:20: NSW1 5063.4→5084.6 MWh, QLD1
+  4207.2→4238.3, SA1 1967.2→1973.3, VIC1 3881.4→3881.8; TAS1 blanks, no BDU
+  storage — skipped). The file also carries `DISPATCH,PRICE` (live 5-min RRP).
+- **There is no public per-DUID live SOC.** `UNIT_SOLUTION` `ENERGY_STORAGE`
+  exists only in the daily file; the intraday `PUBLIC_DISPATCH`/`DispatchIS`
+  files have no per-unit solution table. NEMPulse's own docs say their live SOC
+  is the daily reported anchor plus an integration of the 5-minute SCADA output
+  at ~85% round-trip efficiency — i.e. their per-unit SOC is inferred, the same
+  job the OE exporter does, while the only AEMO figure that is both live and
+  measured is the region-level `BDU_ENERGY_STORAGE`.
+
+### Design decisions (intraday)
+
+- **One poller thread, two feeds, two success gauges.** The SCADA and DispatchIS
+  halves fail independently (`aemo_battery_scada_success`,
+  `aemo_battery_dispatchis_success`) and each drops only its own series on
+  failure. A shared thread keeps the cadence and jitter uniform at
+  `--intraday-poll-interval` (default 300s — one 5-min interval per poll).
+- **Reuse only ever skips a re-download, never re-verification.** Each cycle
+  re-reads both listings; a list whose newest file is the one already held is
+  served without re-downloading — genuinely rare here (the files advance every
+  5 minutes), but it absorbs a poll that lands inside the same interval.
+- **Filter at poll time, learn from the daily report.** Only the daily report
+  knows which DUIDs are storage units (67 of 572). Startup seeds the set from
+  the state file so a restart filters correctly before the first daily poll
+  completes; every cycle then refreshes it from the live daily scraper state.
+- **Per-unit inferred stored MWh.** Since no public per-DUID live SOC exists,
+  the intraday poller anchors each storage unit at the daily report's
+  `ENERGY_STORAGE` and integrates the measured `Dispatch_SCADA` MW across each
+  5-minute interval (`charge_efficiency×|MW|×dt` when charging, `MW×dt` when
+  discharging). Units absent from SCADA for more than `MAX_INFER_GAP_HOURS` are
+  dropped until a fresh daily report re-anchors them. The integrated state may
+  be persisted to `--infer-state-file` (a restart cache only), so a restart does
+  not roll the day's drift back to the previous anchor. Inference is only served
+  when SCADA is live this cycle and a daily anchor exists (see
+  `aemo_battery_infer_success`).
+- **No intraday state file for the SCADA/DispatchIS parses.** The files are ~30KB
+  a cycle; a restart rebuilds the view in one poll. Only the battery set is seeded
+  across restarts, from the daily state file, which is why `main()` reads it before
+  constructing the intraday poller.
+
+### Traps (intraday)
+
+- **SCADA `SCADAVALUE` is signed by AEMO's screen convention** — negative
+  while charging — matching `TOTALCLEARED`, not OE's sign. Do not "correct"
+  it to positive-when-absorbing.
+- **REGIONSUM rows exist only for regions with BDU storage**, and the BDU
+  columns are blank (not zero) for TAS1; skip on *blank*, not on zero, so a
+  region that drains to 0 MWh stays reported.
+- **`Dispatch_Reports` (`PUBLIC_DISPATCH_*.zip`) is NOT the SCADA feed.** Its
+  ~13KB files carry only DREGION/P5MIN-type tables — no UNIT_SCADA, no
+  UNIT_SOLUTION, no energy storage (checked an intraday capture byte-for-byte).
+  Nothing per-DUID lives in the intraday dispatch file; the measured output is
+  in `Dispatch_SCADA` and the region storage in `DispatchIS_Reports`.

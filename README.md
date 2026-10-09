@@ -1,14 +1,24 @@
 # monitoring
 
-Docker stack that exposes three public data feeds as Prometheus metrics and
+Docker stack that exposes four public data feeds as Prometheus metrics and
 charts them in Grafana:
 
 - the Transport for NSW **Western Harbour Tunnel TBM tracker** (tunnel boring
   machine progress),
 - **Snowy Hydro reservoir levels**, focused on Tantangara Reservoir — the upper
-  storage of the Snowy Hydro 2.0 pumped scheme, and
+  storage of the Snowy Hydro 2.0 pumped scheme,
 - **NEM battery state of charge** for the largest batteries that publish data,
-  from OpenElectricity.
+  from OpenElectricity, and
+- **AEMO-reported battery energy storage**, the per-DUID values every NEM
+  battery dispatches against, straight from the `Next_Day_Dispatch` archive.
+
+> The AEMO exporter is the *second* battery feed, purposely: OpenElectricity
+> reports what batteries were measured to have done (`storage_battery`, with
+> inferred SOC in between); AEMO reports what they were dispatched to hold and
+> what they entered the day with, on a single daily timestamp. They cover the
+> same units and answer different questions, so `aemo_battery_*` and
+> `oe_battery_*` belong side by side on the same board rather than either
+> replacing the other.
 
 > The Snowy series are **water levels, not construction progress.** Snowy Hydro
 > 2.0 publishes no machine-readable project status of any kind; see
@@ -49,10 +59,12 @@ charts them in Grafana:
 > takes the mean error across the full daytime gap from 11.3% to 7.4% of
 > capacity and leaves the one-hour case untouched.
 
-- `docker-compose.yml` — the five services (`tbm-exporter`,
-  `reservoir-exporter`, `battery-exporter`, `prometheus`, `grafana`)
+- `docker-compose.yml` — the six services (`tbm-exporter`,
+  `reservoir-exporter`, `battery-exporter`, `aemobattery-exporter`,
+  `prometheus`, `grafana`)
 - `prometheus.yml` — scrape configs, targets `tbm-exporter:9109`,
-  `reservoir-exporter:9110` and `battery-exporter:9111`
+  `reservoir-exporter:9110`, `battery-exporter:9111` and
+  `aemobattery-exporter:9112`
 - `grafana/provisioning/` — Grafana datasource and dashboard provisioning.
   Three dashboards, all loaded from files at boot: `Western Harbour TBM`
   (`adr468z`), `Snowy Hydro reservoir levels` (`snowy-tantangara`) and
@@ -84,6 +96,7 @@ The stack is on the `aus_infra_dashboard_monitoring` bridge network:
 | `tbm-exporter` | not published — only Prometheus needs it |
 | `reservoir-exporter` | not published — only Prometheus needs it |
 | `battery-exporter` | not published — only Prometheus needs it |
+| `aemobattery-exporter` | not published — only Prometheus needs it |
 | `prometheus` | `http://192.168.1.100:9090` |
 | `grafana` | `http://192.168.1.100:3000` |
 
@@ -93,26 +106,30 @@ The stack is on the `aus_infra_dashboard_monitoring` bridge network:
   They run in `python:3.12-alpine` with each script bind-mounted read-only from
   `./scrapers`. The WHT exporter's layer config cache lives in the
   `exporter-cache` volume; the battery exporter's fleet-metadata cache lives in
-  its own `battery-fleet-cache` volume rather than sharing one, because two
-  exporters sharing a volume means one clobbering the other's file; the Snowy
+  its own `battery-fleet-cache` volume and the AEMO exporter's resume cache in
+  `aemo-state`, each rather than sharing, because two exporters sharing a
+  volume means one clobbering the other's file; the Snowy
   exporter mounts **no** volume, because it has no discovered configuration to
   cache and its level gauges must never be served from a stored copy.
-- They are three separate services rather than one container running all of
+- They are four separate services rather than one container running all of
   them: they have nothing to share — different upstreams, different retry and
   health semantics, and separate failure isolation.
 - Prometheus scrapes them over the compose network, so each is started with
   `--listen-address 0.0.0.0`. A `127.0.0.1` bind only works while Prometheus
   shares the host network namespace.
-- 9109, 9110 and 9111 are deliberately **not** published.
+- 9109, 9110, 9111 and 9112 are deliberately **not** published.
 - Scrape intervals differ because the upstreams differ: 5m for the TBM tracker,
   which publishes survey lines every few hours; 1h for the reservoir levels,
   which are published once a day around 07:00 Sydney time; and 5m for the
-  batteries, which is *not* how often the API is polled. That exporter answers
+  batteries, which is *not* how often the API is polled. The OE exporter answers
   every scrape from its last completed hourly cycle, so a 5m scrape costs the
   upstream nothing and exists only to land the new value promptly and to make
   the target's freshness visible. `time() - oe_last_poll_timestamp_seconds` is
-  the panel that catches a stopped poll loop.
-- All three containers override `dns:` to public resolvers. The measured failure
+  the panel that catches a stopped poll loop. The AEMO exporter polls hourly too,
+  but its upstream is a daily archive that changes once a day, so the value it
+  re-serves is the same until the next dispatch file lands — judge it by
+  `aemo_battery_report_generated_timestamp_seconds`, not by scrape age.
+- All four containers override `dns:` to public resolvers. The measured failure
   mode is Docker's embedded resolver intermittently returning `EAI_AGAIN` after
   ~5s; see `NOTES.md` §3.
 - Grafana's Prometheus datasource is provisioned from
@@ -199,7 +216,7 @@ to be cloned should read its own key from the cloner. That is what
 ## Verify
 
 ```bash
-docker compose ps                                   # all five (healthy)
+docker compose ps                                   # all six (healthy)
 curl -s localhost:9090/api/v1/targets | grep -o '"health":"[a-z]*"'
 curl -s --get --data-urlencode 'query=up{job="wht_tbm"}' localhost:9090/api/v1/query
 # snowy_tantangara is scraped hourly but an instant query only looks back 5
@@ -211,6 +228,7 @@ curl -s -u admin:admin 'localhost:3000/api/search?type=dash-db'   # three dashbo
 docker compose logs --tail 20 tbm-exporter          # upstream errors land here
 docker compose logs --tail 20 reservoir-exporter
 docker compose logs --tail 20 battery-exporter
+docker compose logs --tail 20 aemobattery-exporter
 ```
 
 For the batteries, the two numbers worth checking are the poll age and the
@@ -232,6 +250,9 @@ Alert on `wht_tbm_scrape_success == 0`, on
 `snowy_tantangara_scrape_success == 0`, on
 `time() - snowy_tantangara_last_sample_timestamp_seconds` (the feed publishes
 daily, so a threshold of ~36h catches a stopped feed without firing overnight),
-on `time() - oe_last_poll_timestamp_seconds` (hourly, so red past ~3h), and on
-`oe_api_credits_remaining` dropping faster than the cycle explains.
+on `time() - oe_last_poll_timestamp_seconds` (hourly, so red past ~3h), on
+`oe_api_credits_remaining` dropping faster than the cycle explains, and on
+`aemo_battery_scrape_success == 0` / a
+`aemo_battery_report_generated_age_seconds` past ~48h (next-day dispatch, so the
+value legitimately ages to ~24h before it refreshes).
 Full metric lists in `scrapers/README.md`.

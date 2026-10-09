@@ -64,6 +64,46 @@ def thresholds(steps, mode="absolute"):
 def text_color_step():
     return [{"color": "text", "value": 0}]
 
+def gauge(title, grid, targets, description, unit=None, decimals=None, threshold_steps=None, orientation="auto"):
+    options = {
+        "legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": True},
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": False},
+        "showThresholdLabels": False,
+        "showThresholdMarkers": True,
+        "orientation": orientation,
+        "sizing": "auto",
+        "minVizHeight": 75,
+        "minVizWidth": 75,
+        "textMode": "auto",
+        "sparkline": True,
+        "barWidthFactor": 0.54,
+        "barShape": "flat",
+        "segmentSpacing": 0.3,
+        "segmentCount": 1,
+        "shape": "gauge",
+        "endpointMarker": "point",
+        "effects": {"gradient": False, "barGlow": False, "centerGlow": False},
+    }
+    defaults = {
+        "color": {"mode": "palette-classic"},
+        "thresholds": thresholds(threshold_steps or [{"color": "red", "value": 0}, {"color": "#EAB839", "value": 60}, {"color": "green", "value": 80}]),
+    }
+    if unit:
+        defaults["unit"] = unit
+    if decimals is not None:
+        defaults["decimals"] = decimals
+    return {
+        "datasource": ds_(),
+        "description": description,
+        "fieldConfig": {"defaults": defaults},
+        "gridPos": grid,
+        "options": options,
+        "pluginVersion": "13.2.2",
+        "targets": targets,
+        "title": title,
+        "type": "gauge",
+    }
+
 
 def stat(title, grid, expr, description, unit=None, decimals=None, steps=None,
          text_mode="value_and_name", calc="lastNotNull", instant=True, legend="{{name}}",
@@ -494,6 +534,18 @@ seven are `committed` and have never dispatched - Richmond Valley (2200 MWh), \
 Tomago (2000), Baranduda (1886) - and they publish nothing at all. Ranking over \
 units with data is the only ranking that produces a chart.
 
+**The two live AEMO panels answer "what is happening right now".** They read \
+AEMO's 5-minute `Dispatch_SCADA` and `DispatchIS_Reports` archives: per-unit \
+*measured* MW and the region-level reported stored MWh (`BDU_ENERGY_STORAGE`). \
+AEMO publishes no per-unit live SOC - per-DUID storage only exists in the daily \
+snapshot - so the live charge/discharge panel is measured output, and the \
+region panel is the only AEMO storage figure that is both live and measured \
+across the whole fleet. This is the mechanism behind any NEMPulse-style "live" \
+battery view; a NEMPulse per-unit SOC is the daily anchor plus an integration \
+of these same 5-minute numbers at ~85% round-trip efficiency (an inference, \
+like the OE exporter's). Both live panels carry their feed's age and `/success` \
+metric so a stalled interval is visible rather than silent.
+
 Polled hourly and scoped to 12 batteries: 13 API requests per cycle (14 on the \
 once-daily cycle that also refreshes the fleet metadata), 313 a day, inside the \
 free plan's 366 requests/day bucket. Both upstream metrics come back in that one \
@@ -851,7 +903,7 @@ panels.append(
         "reading's age and `oe_battery_power_sample_age_seconds` measures this "
         "one; they are separate metrics because the two series age separately - "
         "both are plotted on that panel.",
-        unit="megawatt",
+        unit="mwatth",
         axis="MW",
         decimals=0,
         span_nulls=False,
@@ -1048,6 +1100,145 @@ panels.append(
     )
 )
 
+# --- AEMO Next_Day_Dispatch panels ---------------------------------------- #
+#
+# AEMO publishes stored energy in MWh and no capacity, while the OE exporter's
+# `unit` label *is* the AEMO DUID attached to the registered capacity. So the
+# AEMO state of charge is derived where the two overlap: divide AEMO's reported
+# `ENERGY_STORAGE` by the OE capacity of the same DUID. The `on(duid)` join
+# works because both sides are keyed by the same identifier; only units both
+# sides know survive, which is the twelve in OE scope, and that is the honest
+# limit of the derivation rather than a filter hiding units.
+
+panels.append(
+    timeseries(
+        "Charge/discharge rate: live SCADA (5-min)",
+        {"h": 11, "w": 24, "x": 0, "y": 91},
+        [target("aemo_battery_power_mw", instant=False, legend="{{duid}}")],
+        "Each unit's **measured** output from AEMO's `Dispatch_SCADA` archive, "
+        "polled every 5-minute interval and served with the interval's age. "
+        "**Negative (below zero) is charging, positive (above) is discharging** - "
+        "above the line is exporting, below is absorbing - and the axis is "
+        "centred on zero so the two sides compare directly. Verified off real "
+        "data at 15:20 on 2026-10-08: Eraring BESS −120 MW (charging), WTAHB1 "
+        "−34, LIMBESS1 +0.9.\n\n"
+        "This is the \"live\" view: AEMO publishes no public per-DUID live SOC, "
+        "so the charge/discharge is this measured MW, and the \"SoC\" a NEMPulse "
+        "shows is the daily reported anchor plus an integration of these 5-minute "
+        "numbers (an inference, like the OE exporter's). Compare against the "
+        "meter-verified OE `Charge and discharge power` panel; this one is "
+        "measured at the same cadence but straight from the dispatch archive. A "
+        "flat line here is a unit actually idle; a *gap* plus a growing "
+        "`aemo_battery_power_age_seconds`, or `aemo_battery_scada_success == 0`, "
+        "is a missing feed.",
+        unit="mwatth",
+        axis="MW",
+        decimals=1,
+        span_nulls=False,
+        center_zero=True,
+    )
+)
+
+# Inferred per-unit SoC (SCADA-integrated)
+panels.append(
+    timeseries(
+        "State of charge: live inferred (SCADA)",
+        {"h": 10, "w": 24, "x": 0, "y": 102},
+        [
+            target(
+                "100 * aemo_battery_inferred_stored_mwh / on(duid) "
+                "label_replace(max by (unit) (oe_battery_capacity_storage_mwh), "
+                "\"duid\", \"$1\", \"unit\", \"(.*)\")",
+                instant=False,
+                legend="{{duid}}",
+            )
+        ],
+        "Per-unit state of charge dead-reckoned from the daily "
+        "`Next_Day_Dispatch` ENERGY_STORAGE anchor and integrated 5-minute "
+        "`Dispatch_SCADA` MW, using the same charging-leg convention as the OE "
+        "exporter's inference (`charge_efficiency × |MW|×dt` when charging, "
+        "`MW×dt` when discharging). Only units present in the daily anchor and "
+        "within `MAX_INFER_GAP_HOURS` of their last SCADA reading are shown "
+        "(`aemo_battery_infer_success == 1` when the feed is live). "
+        "Join to capacity is by DUID (only OE-scope units have capacity in the "
+        "fleet). This is a complement to the region-reported aggregate, not a "
+        "replacement.",
+        unit="percent",
+        axis="SoC (%)",
+        decimals=1,
+        span_nulls=False,
+        center_zero=False,
+    )
+)
+
+# Cross-check: NEM-total inferred vs reported region BDU
+panels.append(
+    timeseries(
+        "Inferred vs reported storage (NEM total)",
+        {"h": 9, "w": 24, "x": 0, "y": 112},
+        [
+            target("sum(aemo_battery_inferred_stored_mwh)", refid="A", instant=False, legend="inferred total (MWh)"),
+            target("sum(aemo_battery_region_stored_mwh)", refid="B", instant=False, legend="reported region total (MWh)"),
+        ],
+        "Cross-check of the live inference: sum of per-unit inferred stored MWh "
+        "(anchored + SCADA-integrated) versus the sum of AEMO's region-level "
+        "`BDU_ENERGY_STORAGE` from `DispatchIS_Reports`. The comparison is "
+        "**NEM-total only** because AEMO publishes no `REGIONID` on UNIT_SOLUTION "
+        "or any per-DUID→region mapping in these intraday feeds, so per-region "
+        "attribution of inferred per-unit storage is not possible without an "
+        "upstream mapping (e.g. MLF/connection point data). When `aemo_battery_infer_success` "
+        "drops to 0, the inferred line will span gaps or disappear; when "
+        "`aemo_battery_dispatchis_success` drops to 0, the reported line will."
+        " Divergence is expected at boundaries (anchor publication) and during "
+        "large gaps or feed regressions.",
+        axis="MWh",
+        unit="mwatth",
+        decimals=1,
+        span_nulls=False,
+    )
+)
+
+panels.append(
+    timeseries(
+        "Stored energy by region: live (BDU)",
+        {"h": 9, "w": 24, "x": 0, "y": 121},
+        [target("aemo_battery_region_stored_mwh", instant=False, legend="{{region}}")],
+        "The region-level aggregate stored MWh from AEMO's `DispatchIS_Reports` "
+        "archive, `DISPATCH,REGIONSUM` `BDU_ENERGY_STORAGE`, polled every "
+        "5-minute interval. Stacked so the top of the stack reads as the NEM's "
+        "live total battery storage and the segments attribute it by region. "
+        "**Reported, not inferred**: this is AEMO's own aggregate, and the only "
+        "storage figure that is both live and measured across the whole fleet. "
+        "Verified 15:20 on 2026-10-08: NSW1 5063.4 → 5084.6 MWh, QLD1 4238.3, "
+        "SA1 1973.3, VIC1 3881.8; TAS1 has no BDU storage and publishes blanks, "
+        "so it is absent by design.\n\n"
+        "It is an aggregate on purpose: AEMO reports no per-unit storage "
+        "intraday, so this panel cannot be unwound into per-DUID MWh - the "
+        "per-unit shares only exist in the daily snapshot. A missing segment is "
+        "`aemo_battery_dispatchis_success == 0` or "
+        "`aemo_battery_region_storage_interval_timestamp_seconds` drifting away "
+        "from `now`.",
+        axis="MWh",
+        unit="mwatth",
+        decimals=1,
+        span_nulls=False,
+        draw="bars",
+        stack=True,
+    )
+)
+
+
+panels.append(
+    gauge(
+        "Stored energy by region: live (BDU) gauges",
+        {"h": 9, "w": 24, "x": 0, "y": 130},
+        [target("aemo_battery_region_stored_mwh", instant=False, legend="{{region}}")],
+        "Gauges showing current stored energy per region (reactive units).",
+        unit="mwatth",
+        decimals=1,
+    )
+)
+
 # Panel ids and y offsets have to be unique and monotonic; the gridPos values
 # above are authored by hand, so assert the invariants rather than trusting them.
 for index, panel in enumerate(panels, start=1):
@@ -1080,7 +1271,9 @@ dashboard = {
         "fleet that publish data, from OpenElectricity. SOC is derived, not "
         "published: stored energy divided by registered capacity. The NEM facilities "
         "list also returns WEM units, so one of the units in scope may be WEM and is "
-        "queried against its own network. Hourly poll, free-plan request budget."
+        "queried against its own network. Hourly poll, free-plan request budget. "
+        "The lower half adds the same batteries as reported by AEMO Next_Day_Dispatch "
+        "(dispatched values, full storage fleet), joined to capacity by DUID."
     ),
     "editable": True,
     "fiscalYearStartMonth": 0,
@@ -1091,7 +1284,7 @@ dashboard = {
     "preload": False,
     "refresh": "5m",
     "schemaVersion": 42,
-    "tags": ["battery", "storage", "openelectricity", "nem"],
+    "tags": ["battery", "storage", "openelectricity", "nem", "aemo"],
     "templating": {
         "list": [
             {

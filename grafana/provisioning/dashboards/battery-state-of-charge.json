@@ -15,7 +15,7 @@
       }
     ]
   },
-  "description": "State of charge for the largest N battery storage units in the NEM and WEM fleet that publish data, from OpenElectricity. SOC is derived, not published: stored energy divided by registered capacity. The NEM facilities list also returns WEM units, so one of the units in scope may be WEM and is queried against its own network. Hourly poll, free-plan request budget.",
+  "description": "State of charge for the largest N battery storage units in the NEM and WEM fleet that publish data, from OpenElectricity. SOC is derived, not published: stored energy divided by registered capacity. The NEM facilities list also returns WEM units, so one of the units in scope may be WEM and is queried against its own network. Hourly poll, free-plan request budget. The lower half adds the same batteries as reported by AEMO Next_Day_Dispatch (dispatched values, full storage fleet), joined to capacity by DUID.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -37,7 +37,7 @@
           "showLineNumbers": false,
           "showMiniMap": false
         },
-        "content": "### NEM battery state of charge\n\n**OpenElectricity publishes no state-of-charge metric.** Every percentage here is derived in the exporter as `energy stored / registered capacity` (`oe_battery_soc_ratio` is 0-1; the panels multiply by 100). Capacity comes from the facility metadata, energy from the `storage_battery` metric, so a capacity correction upstream moves the reading. See `scrapers/oe_battery_exporter.py` for the derivation and `scrapers/NOTES.md` for the upstream quirks.\n\n**Energy and power are two different feeds, and this board keeps them apart.** State of charge comes from `storage_battery` (MWh) and charge/discharge power from `power` (MW); both arrive in the same response to the same request, so showing power costs nothing. They do *not* publish on the same schedule: `storage_battery` carries values only overnight, while `power` updates all day. So the SOC panels are stale by design for a few hours after dawn and the power panel is not, and each carries its own age metric rather than sharing one. `Read` in the table is about the energy reading alone - a battery can be publishing power and still have no SOC to show.\n\n**Scope is the NEM and WEM battery fleet.** The `NEM` facilities endpoint also returns WEM units, so the top 12 by capacity includes Collie 2 and Synergy in the west. Each facility is queried on its own `network_id`, because asking for a WEM unit on the NEM dataset returns 404 rather than empty data.\n\n**Idle batteries are rotated out, not monitored in vain.** A slot held by a battery that has published nothing - neither energy nor power - for 36h goes to the next-largest candidate, at no extra API cost, so the scope stays full. The three Collie WEM units return only nulls, so `skipped as idle` settles at 3 and the board fills up with the next-largest publishing batteries. `Batteries with a reading` counts energy readings, so it can sit below `Batteries in scope` through the afternoon without anything being wrong; watch the power panel to see that those batteries are alive.\n\n**The energy feed is sparse on purpose.** As of 2026-10-01 the upstream only carries values for roughly 18:00-04:00 Sydney time, so a daytime SOC reading is hours old by design. The `Sample age` panel is the one to read before the SOC panels: a reading older than a day means the feed went quiet, not that the battery emptied. The SOC series is **omitted** rather than zeroed when a battery cannot be read, so a missing bar means \"no reading\", never \"flat and empty\".\n\n**One panel on this board is synthetic, and says so.** `State of charge: measured vs inferred` plots the measured line solid and a dead-reckoned one dashed: the exporter anchors on each battery's last measured energy and integrates its power from there. It exists because the sparse feed above leaves the board flat from dawn until the next night, but it is **not an upstream reading** and it does not last all day - it is published only for the first few hours after a measured reading, then stops rather than drift further. Every other SOC panel on this board is measured. Judge the method on that one panel before trusting it anywhere.\n\n**This is the largest N batteries that have ever reported**, not the largest N batteries in Australia. Of the ten highest-capacity units in the fleet metadata, seven are `committed` and have never dispatched - Richmond Valley (2200 MWh), Tomago (2000), Baranduda (1886) - and they publish nothing at all. Ranking over units with data is the only ranking that produces a chart.\n\nPolled hourly and scoped to 12 batteries: 13 API requests per cycle (14 on the once-daily cycle that also refreshes the fleet metadata), 313 a day, inside the free plan's 366 requests/day bucket. Both upstream metrics come back in that one request per battery. The 5m Prometheus scrape does not cost the API anything - the exporter answers it from the last completed cycle.",
+        "content": "### NEM battery state of charge\n\n**OpenElectricity publishes no state-of-charge metric.** Every percentage here is derived in the exporter as `energy stored / registered capacity` (`oe_battery_soc_ratio` is 0-1; the panels multiply by 100). Capacity comes from the facility metadata, energy from the `storage_battery` metric, so a capacity correction upstream moves the reading. See `scrapers/oe_battery_exporter.py` for the derivation and `scrapers/NOTES.md` for the upstream quirks.\n\n**Energy and power are two different feeds, and this board keeps them apart.** State of charge comes from `storage_battery` (MWh) and charge/discharge power from `power` (MW); both arrive in the same response to the same request, so showing power costs nothing. They do *not* publish on the same schedule: `storage_battery` carries values only overnight, while `power` updates all day. So the SOC panels are stale by design for a few hours after dawn and the power panel is not, and each carries its own age metric rather than sharing one. `Read` in the table is about the energy reading alone - a battery can be publishing power and still have no SOC to show.\n\n**Scope is the NEM and WEM battery fleet.** The `NEM` facilities endpoint also returns WEM units, so the top 12 by capacity includes Collie 2 and Synergy in the west. Each facility is queried on its own `network_id`, because asking for a WEM unit on the NEM dataset returns 404 rather than empty data.\n\n**Idle batteries are rotated out, not monitored in vain.** A slot held by a battery that has published nothing - neither energy nor power - for 36h goes to the next-largest candidate, at no extra API cost, so the scope stays full. The three Collie WEM units return only nulls, so `skipped as idle` settles at 3 and the board fills up with the next-largest publishing batteries. `Batteries with a reading` counts energy readings, so it can sit below `Batteries in scope` through the afternoon without anything being wrong; watch the power panel to see that those batteries are alive.\n\n**The energy feed is sparse on purpose.** As of 2026-10-01 the upstream only carries values for roughly 18:00-04:00 Sydney time, so a daytime SOC reading is hours old by design. The `Sample age` panel is the one to read before the SOC panels: a reading older than a day means the feed went quiet, not that the battery emptied. The SOC series is **omitted** rather than zeroed when a battery cannot be read, so a missing bar means \"no reading\", never \"flat and empty\".\n\n**One panel on this board is synthetic, and says so.** `State of charge: measured vs inferred` plots the measured line solid and a dead-reckoned one dashed: the exporter anchors on each battery's last measured energy and integrates its power from there. It exists because the sparse feed above leaves the board flat from dawn until the next night, but it is **not an upstream reading** and it does not last all day - it is published only for the first few hours after a measured reading, then stops rather than drift further. Every other SOC panel on this board is measured. Judge the method on that one panel before trusting it anywhere.\n\n**This is the largest N batteries that have ever reported**, not the largest N batteries in Australia. Of the ten highest-capacity units in the fleet metadata, seven are `committed` and have never dispatched - Richmond Valley (2200 MWh), Tomago (2000), Baranduda (1886) - and they publish nothing at all. Ranking over units with data is the only ranking that produces a chart.\n\n**The two live AEMO panels answer \"what is happening right now\".** They read AEMO's 5-minute `Dispatch_SCADA` and `DispatchIS_Reports` archives: per-unit *measured* MW and the region-level reported stored MWh (`BDU_ENERGY_STORAGE`). AEMO publishes no per-unit live SOC - per-DUID storage only exists in the daily snapshot - so the live charge/discharge panel is measured output, and the region panel is the only AEMO storage figure that is both live and measured across the whole fleet. This is the mechanism behind any NEMPulse-style \"live\" battery view; a NEMPulse per-unit SOC is the daily anchor plus an integration of these same 5-minute numbers at ~85% round-trip efficiency (an inference, like the OE exporter's). Both live panels carry their feed's age and `/success` metric so a stalled interval is visible rather than silent.\n\nPolled hourly and scoped to 12 batteries: 13 API requests per cycle (14 on the once-daily cycle that also refreshes the fleet metadata), 313 a day, inside the free plan's 366 requests/day bucket. Both upstream metrics come back in that one request per battery. The 5m Prometheus scrape does not cost the API anything - the exporter answers it from the last completed cycle.",
         "mode": "markdown"
       },
       "targets": [],
@@ -1287,7 +1287,7 @@
               }
             ]
           },
-          "unit": "megawatt"
+          "unit": "mwatth"
         }
       },
       "gridPos": {
@@ -2124,6 +2124,495 @@
       ],
       "title": "Batteries enumerated, in scope, monitored",
       "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "Each unit's **measured** output from AEMO's `Dispatch_SCADA` archive, polled every 5-minute interval and served with the interval's age. **Negative (below zero) is charging, positive (above) is discharging** - above the line is exporting, below is absorbing - and the axis is centred on zero so the two sides compare directly. Verified off real data at 15:20 on 2026-10-08: Eraring BESS \u2212120 MW (charging), WTAHB1 \u221234, LIMBESS1 +0.9.\n\nThis is the \"live\" view: AEMO publishes no public per-DUID live SOC, so the charge/discharge is this measured MW, and the \"SoC\" a NEMPulse shows is the daily reported anchor plus an integration of these 5-minute numbers (an inference, like the OE exporter's). Compare against the meter-verified OE `Charge and discharge power` panel; this one is measured at the same cadence but straight from the dispatch archive. A flat line here is a unit actually idle; a *gap* plus a growing `aemo_battery_power_age_seconds`, or `aemo_battery_scada_success == 0`, is a missing feed.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": true,
+            "axisColorMode": "text",
+            "axisLabel": "MW",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "mwatth"
+        }
+      },
+      "gridPos": {
+        "h": 11,
+        "w": 24,
+        "x": 0,
+        "y": 91
+      },
+      "id": 20,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "aemo_battery_power_mw",
+          "instant": false,
+          "legendFormat": "{{duid}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Charge/discharge rate: live SCADA (5-min)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "Per-unit state of charge dead-reckoned from the daily `Next_Day_Dispatch` ENERGY_STORAGE anchor and integrated 5-minute `Dispatch_SCADA` MW, using the same charging-leg convention as the OE exporter's inference (`charge_efficiency \u00d7 |MW|\u00d7dt` when charging, `MW\u00d7dt` when discharging). Only units present in the daily anchor and within `MAX_INFER_GAP_HOURS` of their last SCADA reading are shown (`aemo_battery_infer_success == 1` when the feed is live). Join to capacity is by DUID (only OE-scope units have capacity in the fleet). This is a complement to the region-reported aggregate, not a replacement.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "SoC (%)",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "percent"
+        }
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 102
+      },
+      "id": 21,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "100 * aemo_battery_inferred_stored_mwh / on(duid) label_replace(max by (unit) (oe_battery_capacity_storage_mwh), \"duid\", \"$1\", \"unit\", \"(.*)\")",
+          "instant": false,
+          "legendFormat": "{{duid}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "State of charge: live inferred (SCADA)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "Cross-check of the live inference: sum of per-unit inferred stored MWh (anchored + SCADA-integrated) versus the sum of AEMO's region-level `BDU_ENERGY_STORAGE` from `DispatchIS_Reports`. The comparison is **NEM-total only** because AEMO publishes no `REGIONID` on UNIT_SOLUTION or any per-DUID\u2192region mapping in these intraday feeds, so per-region attribution of inferred per-unit storage is not possible without an upstream mapping (e.g. MLF/connection point data). When `aemo_battery_infer_success` drops to 0, the inferred line will span gaps or disappear; when `aemo_battery_dispatchis_success` drops to 0, the reported line will. Divergence is expected at boundaries (anchor publication) and during large gaps or feed regressions.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "MWh",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "mwatth"
+        }
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 112
+      },
+      "id": 22,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "sum(aemo_battery_inferred_stored_mwh)",
+          "instant": false,
+          "legendFormat": "inferred total (MWh)",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "sum(aemo_battery_region_stored_mwh)",
+          "instant": false,
+          "legendFormat": "reported region total (MWh)",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Inferred vs reported storage (NEM total)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "The region-level aggregate stored MWh from AEMO's `DispatchIS_Reports` archive, `DISPATCH,REGIONSUM` `BDU_ENERGY_STORAGE`, polled every 5-minute interval. Stacked so the top of the stack reads as the NEM's live total battery storage and the segments attribute it by region. **Reported, not inferred**: this is AEMO's own aggregate, and the only storage figure that is both live and measured across the whole fleet. Verified 15:20 on 2026-10-08: NSW1 5063.4 \u2192 5084.6 MWh, QLD1 4238.3, SA1 1973.3, VIC1 3881.8; TAS1 has no BDU storage and publishes blanks, so it is absent by design.\n\nIt is an aggregate on purpose: AEMO reports no per-unit storage intraday, so this panel cannot be unwound into per-DUID MWh - the per-unit shares only exist in the daily snapshot. A missing segment is `aemo_battery_dispatchis_success == 0` or `aemo_battery_region_storage_interval_timestamp_seconds` drifting away from `now`.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "MWh",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "mwatth"
+        }
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 121
+      },
+      "id": 23,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "aemo_battery_region_stored_mwh",
+          "instant": false,
+          "legendFormat": "{{region}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Stored energy by region: live (BDU)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "Gauges showing current stored energy per region (reactive units).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": 0
+              },
+              {
+                "color": "#EAB839",
+                "value": 60
+              },
+              {
+                "color": "green",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "mwatth"
+        }
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 130
+      },
+      "id": 24,
+      "options": {
+        "barShape": "flat",
+        "barWidthFactor": 0.54,
+        "effects": {
+          "barGlow": false,
+          "centerGlow": false,
+          "gradient": false
+        },
+        "endpointMarker": "point",
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "minVizHeight": 75,
+        "minVizWidth": 75,
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "segmentCount": 1,
+        "segmentSpacing": 0.3,
+        "shape": "gauge",
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true,
+        "sizing": "auto",
+        "sparkline": true,
+        "textMode": "auto"
+      },
+      "pluginVersion": "13.2.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "aemo_battery_region_stored_mwh",
+          "instant": false,
+          "legendFormat": "{{region}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Stored energy by region: live (BDU) gauges",
+      "type": "gauge"
     }
   ],
   "preload": false,
@@ -2133,7 +2622,8 @@
     "battery",
     "storage",
     "openelectricity",
-    "nem"
+    "nem",
+    "aemo"
   ],
   "templating": {
     "list": [

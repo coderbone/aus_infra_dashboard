@@ -25,16 +25,18 @@
 # Prometheus can reach it over the compose network - do NOT put it back on
 # 127.0.0.1, that only works while Prometheus shares the host network namespace.
 #
-# There are now three exporters on the same pattern, `tbm-exporter` (Western
+# There are now four exporters on the same pattern: `tbm-exporter` (Western
 # Harbour Tunnel, 9109), `reservoir-exporter` (Snowy Hydro reservoir levels,
-# 9110) and `battery-exporter` (OpenElectricity NEM battery state of charge,
-# 9111). They are separate services rather than one container running all of
-# them because they have nothing to share: different upstreams, different retry
-# and health semantics, and separate failure isolation. Note the naming
-# asymmetry - the service is short (`tbm-exporter`) and the container is spelled
-# out (`wht-tbm-exporter`). All container_names are pinned outright, NOT derived
-# from the project name, which is why renaming the project leaves them alone and
-# why a second stack cannot run alongside this one under any name.
+# 9110), `battery-exporter` (OpenElectricity NEM battery state of charge,
+# 9111) and `aemobattery-exporter` (AEMO NEMWEB next-day dispatch battery
+# energy storage, 9112). They are separate services rather than one container
+# running all of them because they have nothing to share: different upstreams,
+# different retry and health semantics, and separate failure isolation. Note
+# the naming asymmetry - the service is short (`tbm-exporter`) and the
+# container is spelled out (`wht-tbm-exporter`). All container_names are pinned
+# outright, NOT derived from the project name, which is why renaming the
+# project leaves them alone and why a second stack cannot run alongside this
+# one under any name.
 
 name: aus_infra_dashboard
 
@@ -379,6 +381,57 @@ services:
       retries: 3
       start_period: 15s
 
+  aemobattery-exporter:
+    image: python:3.12-alpine
+    container_name: aemonemweb-battery-exporter
+    command:
+      - python
+      - /app/aemo_battery_exporter.py
+      - --listen-address=0.0.0.0
+      - --port=9112
+      # The archive publishes once a day (~04:11 AEST), so the poll cadence only
+      # decides how quickly a new file is noticed - each unchanged check costs
+      # one ~90 KB listing, and the ~126 MB zip is downloaded only when the
+      # listing shows a file we do not already hold. --state-file is a restart
+      # cache: the last processed report is reloaded only after the live listing
+      # re-verifies that it is still the newest file, so a restart never forces
+      # a 126 MB re-download and never serves an unverified file either (see
+      # aemo_battery_report_reused).
+      - --state-file=/cache/state.json
+      # The intraday feed (Dispatch_SCADA + DispatchIS_Reports) publishes a tiny
+      # file every 5-minute dispatch interval, so the default 300s cadence tracks
+      # one interval per poll. These supply the live charge/discharge and
+      # region-stored-MWh panels.
+      - --intraday-poll-interval=300
+      - --infer-state-file=/cache/intraday-state.json
+      - --infer-charge-efficiency=1.0
+    # Same resolver override as the other three exporters, for the same reason:
+    # Docker's embedded resolver intermittently gives up with EAI_AGAIN, and the
+    # fault is in the resolver, not the destination.
+    dns:
+      - 1.1.1.1
+      - 9.9.9.9
+    volumes:
+      - ./scrapers/aemo_battery_exporter.py:/app/aemo_battery_exporter.py:ro
+      # A state file and nothing else. NOT the battery-fleet-cache volume: two
+      # exporters sharing a volume means one of them clobbering the other's file.
+      - aemo-state:/cache
+    networks: [monitoring]
+    restart: unless-stopped
+    # TCP probe only, same reasoning as the other exporters: /healthz answers
+    # from the last completed cycle and probing the upstream every 30s would
+    # hammer a listing that only changes once a day.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import socket; socket.create_connection(('127.0.0.1', 9112), 3).close()"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
   prometheus:
     image: prom/prometheus
     container_name: prometheus
@@ -400,6 +453,8 @@ services:
       reservoir-exporter:
         condition: service_healthy
       battery-exporter:
+        condition: service_healthy
+      aemobattery-exporter:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:9090/-/healthy"]
@@ -474,3 +529,8 @@ volumes:
   # this holds a cache that is rebuilt from the API on the first poll anyway, so
   # there is nothing in it worth preserving by hand.
   battery-fleet-cache:
+  # One JSON state file for the AEMO exporter; created by compose for the same
+  # reason as battery-fleet-cache - it is a restart cache, rebuilt on the next
+  # poll if it is ever lost, and kept separate so two exporters never share a
+  # volume.
+  aemo-state:

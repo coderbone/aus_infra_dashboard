@@ -1,6 +1,6 @@
 # Prometheus exporters
 
-Three independent, stdlib-only exporters live here. All are single files that
+Four independent, stdlib-only exporters live here. All are single files that
 `docker-compose.yml` bind-mounts into `python:3.12-alpine`; none needs an image
 build.
 
@@ -9,11 +9,14 @@ build.
 | [`wht_tbm_exporter.py`](#whtp2-tbm-tracker-exporter) | Transport for NSW Western Harbour Tunnel TBM tracker (ArcGIS) | 9109 | `wht_tbm_` |
 | [`snowy_tantangara_exporter.py`](#snowy-hydro-reservoir-levels-exporter) | Snowy Hydro scheme reservoir levels (`getData.php`) | 9110 | `snowy_tantangara_` |
 | [`oe_battery_exporter.py`](#nembattery-state-of-charge-exporter) | OpenElectricity NEM battery storage (`api.openelectricity.org.au`) | 9111 | `oe_battery_`, `oe_batteries_`, `oe_api_`, `oe_poll_`, `oe_last_` |
+| [`aemo_battery_exporter.py`](#aemo-reported-battery-energy-storage-exporter) | AEMO NEMWEB `Next_Day_Dispatch` (`nemweb.com.au`) | 9112 | `aemo_battery_` |
 
 They share the retry-with-time-budget approach, the `--once` mode, the
-`/metrics` + `/healthz` + index handler, and the "never serve a measurement
-from a cache" rule — but they are separate processes with separate upstreams and
-separate failure isolation. `NOTES.md` has the upstream details for all three.
+`/metrics` + `/healthz` + index handler, and the "never serve a measurement you
+did not just verify" rule (the two battery exporters add a background poll loop,
+for upstreams far too big or too metered to fetch per scrape) — but they are
+separate processes with separate upstreams and separate failure isolation.
+`NOTES.md` has the upstream details for all four.
 
 ## WHTP2 TBM tracker exporter
 
@@ -134,7 +137,7 @@ python3 -m unittest discover -s scrapers -t scrapers -v
 ./scrapers/test_wht_tbm_exporter.py                         # equivalent
 ```
 
-136 tests in this file (345 for all three exporters), about 12 seconds, **no network
+136 tests in this file (689 for all four exporters), about 15 seconds, **no network
 access** — every upstream response is
 replayed from `scrapers/fixtures/`, captured verbatim from ArcGIS on
 2026-09-29. Verified offline by re-running with `socket.getaddrinfo` and every
@@ -291,7 +294,7 @@ Alert on `snowy_tantangara_scrape_success == 0` and on
 ### Tests
 
 ```bash
-python3 -m unittest discover -s scrapers -t scrapers    # all three, 366 tests
+python3 -m unittest discover -s scrapers -t scrapers    # all four, 684 tests
 ./scrapers/test_snowy_tantangara_exporter.py            # 121 tests, this one only
 ```
 
@@ -880,8 +883,8 @@ bounded, timestamped and reported, as set out under `--reading-cache-file` above
 ### Tests
 
 ```bash
-python3 -m unittest discover -s scrapers -t scrapers    # all three, 366 tests
-./scrapers/test_oe_battery_exporter.py                  # 109 tests, this one only
+python3 -m unittest discover -s scrapers -t scrapers    # all four, 684 tests
+./scrapers/test_oe_battery_exporter.py                  # 335 tests, this one only
 ```
 
 **No network access** — the fleet metadata, a real Eraring storage response, an
@@ -923,6 +926,131 @@ The regressions worth naming, because each is a quiet failure:
 - **A unit that recovers only being re-admitted a cycle late** — the probe runs
   after the scope is chosen, so the exposition reports the scope that was
   actually polled. Correct, and asserted as such.
+
+## AEMO reported battery energy storage exporter
+
+Two feeds from AEMO's NEMWEB archive, both free and anonymous, exposing
+`aemo_battery_` metrics:
+
+- **Daily** — `Next_Day_Dispatch`, the file the NEM batteries report against,
+  per-DUID measured `ENERGY_STORAGE`/`INITIAL_ENERGY_STORAGE` and the dispatched
+  power `TOTALCLEARED` (negative = charging). It states the *next day's*
+  dispatch, so the values are the quoted battery energy levels for the current
+  day, published the previous evening; use the freshness metrics, not the scrape
+  timestamp, to judge age.
+- **Intraday** — `Dispatch_SCADA` (measured output MW per unit, every 5-minute
+  interval) and `DispatchIS_Reports` (region-level `BDU_ENERGY_STORAGE`, every
+  5-minute interval). These are the feeds that move a charge/discharge chart
+  through the day. There is **no** public per-DUID live SOC: the daily report is
+  the only per-unit storage, and AEMO's only live *measured* storage number is
+  the region-level BDU figure.
+
+### How it gets the numbers — the daily file
+
+1. `https://nemweb.com.au/Reports/Current/Next_Day_Dispatch/` lists the current
+   day's files. Each file is `PUBLIC_NEXT_DAY_DISPATCH_YYYYMMDD_000000NNN` in a
+   same-named `.zip`; the newest is the lexicographic maximum of the listing
+   (verified against live data — at browse time the archive had ~790 entries and
+   the max was indeed the newest, including same-day corrected re-publishes with
+   a larger sequence number).
+2. The zip contains one `<name>.CSV` — a full day is ~126MB, so it is read
+   streaming (header preview to choose the `UNIT_SOLUTION` table, then
+   `csv.reader`), never loaded whole. Rows that don't parse are counted and
+   warned, and a subsequent cycle with the same file skips the download because
+   the state file says it already has this one.
+3. The table's columns that matter: `SETTLEMENTDATE` (idx 4), `DUID` (idx 6),
+   `TOTALCLEARED` (idx 14, cleared dispatch MW; negative = charging),
+   `INITIAL_ENERGY_STORAGE` (idx 69), `ENERGY_STORAGE` (idx 70), both MWh. There
+   are 288 intervals/day and ~67 battery storage units (a few report 287 of 288).
+   Each unit is reported at its newest available interval. All timestamps are
+   AEST, pinned to UTC+10 (AEMO publishes no DST and nothing corrects for it).
+
+### How it gets the numbers — the intraday live feed
+
+A second thread polls two tiny archives on `--intraday-poll-interval` (default
+300s), which is what tracks the 5-minute dispatch intervals:
+
+1. `https://nemweb.com.au/Reports/Current/Dispatch_SCADA/` lists
+   `PUBLIC_DISPATCHSCADA_<YYYYMMDDHHMM>_<seq>.zip`, a ~4KB single-interval
+   snapshot whose `UNIT_SCADA` table carries, per DUID, the *measured*
+   `SCADAVALUE` in MW (negative = charging/absorbing). Verified live
+   2026-10-08 15:20: ERB01 −120, WTAHB1 −34, LIMBESS1 +0.9. Rows are filtered to
+   the units the daily report has learned are storage units (the battery set is
+   seeded from the state file at startup so a restart does not wait for the
+   daily poll); a DUID the daily file has never clocked as storage is ignored.
+2. `https://nemweb.com.au/Reports/Current/DispatchIS_Reports/` lists
+   `PUBLIC_DISPATCHIS_<YYYYMMDDHHMM>_<seq>.zip`, a ~23KB interim-solution
+   snapshot whose `DISPATCH,REGIONSUM` table carries `BDU_INITIAL_ENERGY_STORAGE`
+   (idx 129) and `BDU_ENERGY_STORAGE` (idx 124) — the reported aggregate stored
+   MWh of all battery dispatch units per region (NSW1 5063.4 → 5084.6 MWh at
+   15:20). Regions with no storage publish blanks (TAS1) and are skipped.
+
+Both files are one interval each and advance every 5 minutes, so a cycle costs
+two tiny listings plus ~30KB of zips; the reuse check absorbs a poll that lands
+inside the same interval (the newest file is unchanged, so it is served without
+a re-download). The two sides fail independently — `aemo_battery_scada_success`
+and `aemo_battery_dispatchis_success` — and a failed side drops its own series
+rather than repeating the last one, the same rule as the daily file.
+
+### Freshness and the poll loop
+
+The daily value changes once a day, and the file is large, so the exporter
+background-polls (hourly by default, `--poll-interval`) and only downloads a zip
+when the listing shows a new file; otherwise it re-serves the last parsed report
+(`aemo_battery_report_reused=1` when the answer came from the state-file cache).
+Like the sibling exporters, a failed poll publishes an empty report, so a series
+is dropped rather than frozen on stale data — a dead feed loses its series. The
+intraday feed is the inverse: small files, so it polls every 5 minutes and its
+series are genuinely live (age = the 5-minute interval behind the reading).
+
+### Metrics
+
+| Metric | Meaning |
+| --- | --- |
+| `aemo_battery_energy_stored_mwh{duid}` | battery energy storage from `ENERGY_STORAGE`, MWh (daily) |
+| `aemo_battery_initial_energy_stored_mwh{duid}` | from `INITIAL_ENERGY_STORAGE`, MWh (daily) |
+| `aemo_battery_total_cleared_mw{duid}` | cleared dispatch for the newest interval, MW (negative = charging/absorbing; daily) |
+| `aemo_battery_last_sample_timestamp_seconds{duid}` | SETTLEMENTDATE AEST→UTC of the reported interval |
+| `aemo_battery_sample_age_seconds{duid}` | now − last_sample (age of the reading, *not* the scrape) |
+| `aemo_battery_report_info{file}` | filename, values 1; `report_generated_timestamp_seconds`, `report_generated_age_seconds`, `report_newest_interval_timestamp_seconds` give the file's own timestamps |
+| `aemo_battery_units_reporting` | units in the report |
+| `aemo_battery_report_reused` | 1 if served from the state-file cache this poll |
+| `aemo_battery_scrape_success` | 1 on success, 0 on failure (daily only) |
+| `aemo_battery_poll_duration_seconds`, `aemo_battery_last_poll_timestamp_seconds` | poll timing |
+| `aemo_battery_power_mw{duid}` | live measured output from `UNIT_SCADA` `SCADAVALUE`, MW (negative = charging) |
+| `aemo_battery_power_timestamp_seconds{duid}` | the 5-minute interval behind the power reading |
+| `aemo_battery_power_age_seconds{duid}` | its age at export time |
+| `aemo_battery_power_report_info{file}` | the processed `PUBLIC_DISPATCHSCADA` file |
+| `aemo_battery_power_interval_timestamp_seconds` | its interval |
+| `aemo_battery_units_with_power` | storage units with a reading in the SCADA snapshot |
+| `aemo_battery_region_stored_mwh{region}` | live region aggregate from `BDU_ENERGY_STORAGE`, MWh |
+| `aemo_battery_region_initial_stored_mwh{region}` | from `BDU_INITIAL_ENERGY_STORAGE`, MWh |
+| `aemo_battery_region_storage_timestamp_seconds{region}` | the 5-minute interval behind the region reading |
+| `aemo_battery_region_storage_report_info{file}` | the processed `PUBLIC_DISPATCHIS` file |
+| `aemo_battery_region_storage_interval_timestamp_seconds` | its interval |
+| `aemo_battery_scada_success`, `aemo_battery_dispatchis_success` | 1 on success, 0 on failure, per intraday feed |
+| `aemo_battery_intraday_poll_duration_seconds`, `aemo_battery_intraday_last_poll_timestamp_seconds` | intraday poll timing |
+
+### Running
+
+```bash
+python3 scrapers/aemo_battery_exporter.py --listen-address 0.0.0.0 --port 9112 \
+    --state-file /cache/state.json
+python3 scrapers/aemo_battery_exporter.py --once --state-file /cache/state.json
+python3 scrapers/aemo_battery_exporter.py --intraday-poll-interval=300
+```
+
+### Tests
+
+92 tests in this file, **no network access** — upstream responses are synthetic
+zips built in-test against the real column indices, and the parsers have been run
+against real captures (details in `NOTES.md`). Alert on `aemo_battery_scrape_success
+== 0` or `time() - aemo_battery_report_newest_interval_timestamp_seconds` being
+older than the ~24h next-day gap; remember the value is the *next* day's, so a
+forty-hour-old scalar is normal. The intraday feeds have their own health in
+`aemo_battery_scada_success`/`aemo_battery_dispatchis_success`, and a gap on the
+live power panel that keeps `aemo_battery_power_age_seconds` growing past a few
+minutes points at the SCADA feed before anything else.
 
 ## How it is deployed here
 

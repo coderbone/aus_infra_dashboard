@@ -37,3 +37,18 @@ scrape_configs:
     metrics_path: /metrics
     static_configs:
       - targets: ['battery-exporter:9111']
+
+  - job_name: aemo_battery
+    # Next-day data published once a day, so the *value* only steps daily - but
+    # 5m is still right, for the same reason as openelectricity_battery: the
+    # exporter answers from its last completed cycle (a download cannot fit a
+    # 30s scrape), and 5m makes the poll's freshness visible in the UI instead
+    # of hiding a stopped poll loop for an hour. Each unchanged poll costs one
+    # ~90 KB listing; the ~126 MB zip is downloaded only when it actually
+    # changes. A daily scrape would drag the value's defect (next-day freshness)
+    # into the monitoring of the poll itself.
+    scrape_interval: 5m
+    scrape_timeout: 30s
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['aemobattery-exporter:9112']

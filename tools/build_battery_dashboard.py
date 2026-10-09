@@ -64,7 +64,7 @@ def thresholds(steps, mode="absolute"):
 def text_color_step():
     return [{"color": "text", "value": 0}]
 
-def gauge(title, grid, targets, description, unit=None, decimals=None, threshold_steps=None, orientation="horizontal", max_per_row=6):
+def gauge(title, grid, targets, description, unit=None, decimals=None, threshold_steps=None, orientation="auto", max_per_row=6):
     options = {
         "legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": True},
         "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": False},
@@ -1247,12 +1247,19 @@ panels.append(
         {"h": 9, "w": 24, "x": 0, "y": 139},
         [
             target(
-                "aemo_battery_inferred_stored_mwh / on(duid) label_replace(max by (unit) (oe_battery_capacity_storage_mwh), \"duid\", \"$1\", \"unit\", \"(.*)\") * 100",
+                "100 * aemo_battery_inferred_stored_mwh / on(duid) "
+                "label_replace(max by (unit) (oe_battery_capacity_storage_mwh), "
+                "\"duid\", \"$1\", \"unit\", \"(.*)\") "
+                "and on(duid) topk(12, abs(aemo_battery_power_mw))",
                 instant=False,
                 legend="{{duid}} (%% of cap)",
             )
         ],
-        "Gauges for the 10 most active batteries by |MW|, showing % of capacity stored. Max=100%.",
+        "Gauges for the 12 most active batteries by |MW|, showing % of "
+        "capacity stored. The top 12 are selected live by the measured "
+        "charge/discharge rate - `abs(aemo_battery_power_mw)` - not by the "
+        "stored share, and only units with capacity in the OE fleet qualify. "
+        "Max=100%.",
         unit="percent",
         decimals=1,
     )
@@ -1350,38 +1357,3 @@ with open(OUT, "w", encoding="utf-8") as handle:
     json.dump(dashboard, handle, indent=2, sort_keys=True)
     handle.write("\n")
 print("wrote %s (%d panels)" % (OUT, len(panels)))
-
-panels.append(
-    gauge(
-        "Most active batteries (by |power|): stored energy vs capacity",
-        {"h": 9, "w": 24, "x": 0, "y": 139},
-        [
-            target(
-                "aemo_battery_inferred_stored_mwh / on(duid) label_replace(max by (unit) (oe_battery_capacity_storage_mwh), \"duid\", \"$1\", \"unit\", \"(.*)\") * 100",
-                instant=False,
-                legend="{{duid}} (%% of cap)",
-            )
-        ],
-        "Gauges for the 10 most active batteries by |MW|, showing % of capacity stored. Max=100%%.",
-        unit="percent",
-        decimals=1,
-    )
-)
-
-
-panels.append(
-    gauge(
-        "Most active batteries (by |power|): stored energy vs capacity",
-        {"h": 9, "w": 24, "x": 0, "y": 139},
-        [
-            target(
-                "aemo_battery_inferred_stored_mwh / on(duid) label_replace(max by (unit) (oe_battery_capacity_storage_mwh), \"duid\", \"$1\", \"unit\", \"(.*)\") * 100",
-                instant=False,
-                legend="{{duid}} (%% of cap)",
-            )
-        ],
-        "Gauges for the 10 most active batteries by |MW|, showing %% of capacity stored. Max=100%%.",
-        unit="percent",
-        decimals=1,
-    )
-)

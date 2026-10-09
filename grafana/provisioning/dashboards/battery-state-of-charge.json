@@ -2579,7 +2579,7 @@
         "maxPerRow": 6,
         "minVizHeight": 75,
         "minVizWidth": 75,
-        "orientation": "horizontal",
+        "orientation": "auto",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
@@ -2620,7 +2620,7 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
-      "description": "Gauges for the 10 most active batteries by |MW|, showing % of capacity stored. Max=100%.",
+      "description": "Gauges for the 12 most active batteries by |MW|, showing % of capacity stored. The top 12 are selected live by the measured charge/discharge rate - `abs(aemo_battery_power_mw)` - not by the stored share, and only units with capacity in the OE fleet qualify. Max=100%.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2672,7 +2672,7 @@
         "maxPerRow": 6,
         "minVizHeight": 75,
         "minVizWidth": 75,
-        "orientation": "horizontal",
+        "orientation": "auto",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
@@ -2698,7 +2698,7 @@
           },
           "editorMode": "code",
           "exemplar": false,
-          "expr": "aemo_battery_inferred_stored_mwh / on(duid) label_replace(max by (unit) (oe_battery_capacity_storage_mwh), \"duid\", \"$1\", \"unit\", \"(.*)\") * 100",
+          "expr": "100 * aemo_battery_inferred_stored_mwh / on(duid) label_replace(max by (unit) (oe_battery_capacity_storage_mwh), \"duid\", \"$1\", \"unit\", \"(.*)\") and on(duid) topk(12, abs(aemo_battery_power_mw))",
           "instant": false,
           "legendFormat": "{{duid}} (%% of cap)",
           "range": true,

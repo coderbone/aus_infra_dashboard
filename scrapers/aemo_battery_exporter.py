@@ -148,15 +148,28 @@ NEMPulse-style dead-reckoning the OE exporter already does: anchor at the daily
 report's per-unit ENERGY_STORAGE and integrate the measured SCADA output each
 5-minute interval. Charging stores `charge_efficiency x |MW| x dt`, discharging
 deducts MW x dt in full, and a unit absent from SCADA longer than
-MAX_INFER_GAP_HOURS is dropped until a fresh daily report re-anchors it
+MAX_INFER_GAP_HOURS is dropped until a fresh daily report re-anchors it. The
+integral is floored at zero - stored energy cannot go negative - so an
+estimate a stale or mis-sign-conventioned anchor drives below zero is pinned at
+empty and flagged rather than silently showing a negative MWh.
 
     aemo_battery_inferred_stored_mwh{duid}       anchor + integrated SCADA (MWh)
+    aemo_battery_inferred_clamped{duid}          1 = raw integral fell below 0
     aemo_battery_inferred_timestamp_seconds{duid}  the integrated interval
     aemo_battery_inferred_age_seconds{duid}      its age at export time
     aemo_battery_inferred_units                  inferred units being served
+    aemo_battery_inferred_clamped_units          ... of them pinned at the zero floor
     aemo_battery_infer_success                   1/0 (anchor present AND SCADA live)
     aemo_battery_infer_charge_efficiency         the stored share of charging energy
     aemo_battery_inferred_report_info{file}      the daily report anchoring it
+
+The pinned flag is the OE exporter's `--infer-clamp` convention: it reports the
+raw integral going negative whether or not clamping is applied, so a battery
+held at empty is distinguishable from one genuinely empty. `--no-infer-clamp`
+serves the raw drift instead, for inspecting the estimate rather than reading
+it. The OE exporter clamps the top end too, against registered capacity; this
+exporter has no capacity in scope (that is OpenElectricity data), so it can
+only floor.
 
 A unit is a "storage" unit if it reports a non-empty INITIAL_ENERGY_STORAGE in
 any interval; everything else in UNIT_SOLUTION is a generator and is skipped.
@@ -175,6 +188,7 @@ Usage
     aemo_battery_exporter.py --intraday-poll-interval=300
     aemo_battery_exporter.py --intraday-poll-interval=300 \
         --infer-charge-efficiency=0.9 --infer-state-file=/cache/infer-state.json
+    aemo_battery_exporter.py --no-infer-clamp    # serve raw drift below zero
 
 Standard library only.
 """
@@ -232,6 +246,15 @@ DEFAULT_INFER_CHARGE_EFFICIENCY = 1.0
 # is a guess (a retag, a maintenance cycle, a feed regression), and the inferred
 # line is dropped until the next daily report re-anchors it.
 MAX_INFER_GAP_HOURS = 6.0
+
+# Stored energy cannot be negative, so the SCADA-integrated estimate is floored
+# at zero by default, the same envelope the OE exporter clamps to (its
+# --infer-clamp). This exporter has no capacity in scope to clamp the top end
+# against, so it can only floor; --no-infer-clamp serves the raw drift instead.
+# Either way `aemo_battery_inferred_clamped` reports a raw integral that went
+# negative, so a battery pinned at empty is never mistaken for a genuinely empty
+# one - the OE exporter's reported-rather-than-hidden convention.
+DEFAULT_INFER_CLAMP = True
 
 # The zip download is the only large transfer (8 MB), so the defaults are roomier
 # than the sibling exporters': a listing that hangs is rare, and a retry budget
@@ -947,6 +970,11 @@ def render_intraday(
             "SCADA-integrated change, MWh (charge_efficiency x charging energy is "
             "stored; discharging is deducted in full).",
             "# TYPE aemo_battery_inferred_stored_mwh gauge",
+            "# HELP aemo_battery_inferred_clamped Whether the raw SCADA-"
+            "integrated stored MWh went below zero and was floored at 0. "
+            "Reported whether or not clamping is applied, so a battery pinned "
+            "at empty is distinguishable from one genuinely empty.",
+            "# TYPE aemo_battery_inferred_clamped gauge",
             "# HELP aemo_battery_inferred_timestamp_seconds Integrated interval "
             "behind the inferred stored MWh.",
             "# TYPE aemo_battery_inferred_timestamp_seconds gauge",
@@ -959,6 +987,8 @@ def render_intraday(
             lines += [
                 'aemo_battery_inferred_stored_mwh{duid="%s"} %s'
                 % (escape_label(duid), fmt(u["mwh"])),
+                'aemo_battery_inferred_clamped{duid="%s"} %s'
+                % (escape_label(duid), fmt(u.get("clamped", 0.0))),
                 'aemo_battery_inferred_timestamp_seconds{duid="%s"} %s'
                 % (escape_label(duid), fmt(u["ts"])),
                 'aemo_battery_inferred_age_seconds{duid="%s"} %s'
@@ -968,6 +998,11 @@ def render_intraday(
             "# HELP aemo_battery_inferred_units Inferred units being served.",
             "# TYPE aemo_battery_inferred_units gauge",
             "aemo_battery_inferred_units %d" % len(infer_units),
+            "# HELP aemo_battery_inferred_clamped_units Inferred units held at "
+            "the zero floor because the raw integral went negative.",
+            "# TYPE aemo_battery_inferred_clamped_units gauge",
+            "aemo_battery_inferred_clamped_units %d"
+            % sum(1 for u in infer_units.values() if float(u.get("clamped", 0.0)) > 0.0),
             "# HELP aemo_battery_inferred_report_info Daily report anchoring the "
             "inferred series.",
             "# TYPE aemo_battery_inferred_report_info gauge",
@@ -1279,6 +1314,7 @@ class IntradayPoller:
         storage_duids_fn=None,
         daily_report_fn=None,
         charge_efficiency: float = DEFAULT_INFER_CHARGE_EFFICIENCY,
+        infer_clamp: bool = DEFAULT_INFER_CLAMP,
         infer_state_file: str | None = None,
     ) -> None:
         self.scada_url = scada_url.rstrip("/") + "/"
@@ -1296,6 +1332,7 @@ class IntradayPoller:
         # integrate measured SCADA output between anchors.
         self._daily_report_fn = daily_report_fn
         self.charge_efficiency = charge_efficiency
+        self.infer_clamp = infer_clamp
         self.infer_state_file = infer_state_file
         self._anchor_file: str | None = None
         self._inferred: dict[str, dict] = {}
@@ -1442,7 +1479,8 @@ class IntradayPoller:
                 continue
             if ts <= 0:
                 continue
-            anchored[duid] = {"ts": ts, "mwh": float(energy)}
+            mwh, clamped = self._clamp_inferred(float(energy))
+            anchored[duid] = {"ts": ts, "mwh": mwh, "clamped": clamped}
         if not anchored:
             return False
         self._inferred = anchored
@@ -1453,6 +1491,20 @@ class IntradayPoller:
     def _prune_stale(self, now: float) -> None:
         limit = now - MAX_INFER_GAP_HOURS * 3600.0
         self._inferred = {d: u for d, u in self._inferred.items() if u["ts"] > limit}
+
+    def _clamp_inferred(self, raw: float) -> tuple[float, float]:
+        """Floor the inferred stored MWh at zero; returns (mwh, clamped_flag).
+
+        Stored energy cannot go negative, so a raw integral below zero is pinned
+        at empty. The flag reports the raw integral going negative whether or
+        not clamping is actually applied, so a battery held at empty is
+        distinguishable from one genuinely empty - the OE exporter's
+        `saturated` convention, here without a capacity ceiling because this
+        exporter has no capacity in scope.
+        """
+        clamped = 1.0 if raw < 0.0 else 0.0
+        mwh = max(0.0, raw) if self.infer_clamp else raw
+        return mwh, clamped
 
     def _advance_inference(self, scada_units: dict, now: float) -> None:
         """Integrate one 5-minute SCADA snapshot into the inferred state."""
@@ -1476,7 +1528,8 @@ class IntradayPoller:
                     and isinstance(entry.get("ts"), (int, float))
                     and float(entry["ts"]) > 0
                 ):
-                    self._inferred[duid] = {"ts": ts, "mwh": float(entry["energy"])}
+                    mwh, clamped = self._clamp_inferred(float(entry["energy"]))
+                    self._inferred[duid] = {"ts": ts, "mwh": mwh, "clamped": clamped}
                 continue
             delta_hours = (ts - current["ts"]) / 3600.0
             if delta_hours <= 0:
@@ -1488,7 +1541,8 @@ class IntradayPoller:
                 delta = -power * delta_hours
             else:
                 delta = -power * delta_hours * self.charge_efficiency
-            self._inferred[duid] = {"ts": ts, "mwh": current["mwh"] + delta}
+            mwh, clamped = self._clamp_inferred(current["mwh"] + delta)
+            self._inferred[duid] = {"ts": ts, "mwh": mwh, "clamped": clamped}
         self._prune_stale(now)
 
     def _infer_view(self, now: float) -> dict:
@@ -1497,7 +1551,7 @@ class IntradayPoller:
         with self._lock:
             anchor = self._anchor_file
             inferred = {
-                d: {"ts": u["ts"], "mwh": u["mwh"]}
+                d: {"ts": u["ts"], "mwh": u["mwh"], "clamped": u.get("clamped", 0.0)}
                 for d, u in self._inferred.items()
                 if u["ts"] > limit
             }
@@ -1529,7 +1583,8 @@ class IntradayPoller:
             except (TypeError, ValueError, KeyError):
                 continue
             if ts > 0:
-                clean[duid] = {"ts": ts, "mwh": mwh}
+                mwh, clamped = self._clamp_inferred(mwh)
+                clean[duid] = {"ts": ts, "mwh": mwh, "clamped": clamped}
         if not clean:
             return
         self._anchor_file = anchor
@@ -1545,7 +1600,7 @@ class IntradayPoller:
                 "anchor_file": self._anchor_file,
                 "saved_at": self.now_fn(),
                 "units": {
-                    d: {"ts": u["ts"], "mwh": u["mwh"]}
+                    d: {"ts": u["ts"], "mwh": u["mwh"], "clamped": u.get("clamped", 0.0)}
                     for d, u in self._inferred.items()
                 },
             }
@@ -1707,6 +1762,19 @@ def main(argv: list[str] | None = None) -> int:
         "on the charging leg)." % DEFAULT_INFER_CHARGE_EFFICIENCY,
     )
     parser.add_argument(
+        "--infer-clamp",
+        action="store_true",
+        default=DEFAULT_INFER_CLAMP,
+        help="floor the inferred stored MWh at zero (default true)",
+    )
+    parser.add_argument(
+        "--no-infer-clamp",
+        action="store_false",
+        dest="infer_clamp",
+        help="serve the raw SCADA-integrated drift below zero instead of "
+        "floored; the clamped flag keeps reporting it either way",
+    )
+    parser.add_argument(
         "--infer-state-file",
         help="JSON file persisting the integrated per-unit stored MWh, so a "
         "restart does not re-anchor the day's drift to the daily report.",
@@ -1774,6 +1842,7 @@ def main(argv: list[str] | None = None) -> int:
         storage_duids_fn=scraper.storage_duids,
         daily_report_fn=scraper.daily_report,
         charge_efficiency=args.infer_charge_efficiency,
+        infer_clamp=args.infer_clamp,
         infer_state_file=args.infer_state_file,
     )
 

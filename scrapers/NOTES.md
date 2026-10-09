@@ -1465,6 +1465,15 @@ dispatch interval. Verified against the live site on 2026-10-08:
   not roll the day's drift back to the previous anchor. Inference is only served
   when SCADA is live this cycle and a daily anchor exists (see
   `aemo_battery_infer_success`).
+- **The inferred MWh is floored at zero.** Stored energy cannot go negative, so
+  a raw integral a stale or mis-signed anchor drives below zero is pinned at 0
+  (default `--infer-clamp`; `--no-infer-clamp` serves the raw drift instead),
+  and `aemo_battery_inferred_clamped{duid}` reports 1 whenever the raw integral
+  went negative — reported whether or not clamping is applied, so a battery held
+  at empty is distinguishable from a genuinely empty one (`..._clamped_units`
+  counts them). This is the OE exporter's `saturated` convention; there is no
+  capacity in scope here to clamp the top end against (that is OpenElectricity
+  data).
 - **No intraday state file for the SCADA/DispatchIS parses.** The files are ~30KB
   a cycle; a restart rebuilds the view in one poll. Only the battery set is seeded
   across restarts, from the daily state file, which is why `main()` reads it before

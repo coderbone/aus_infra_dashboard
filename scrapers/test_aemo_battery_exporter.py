@@ -28,6 +28,8 @@ plausible one rather than an obvious failure:
   3. An unchanged newest file is re-served without a re-download, but only
      after the live listing is re-read - the listing is the verification.
   4. A failed poll publishes no per-unit series at all, never stale leftovers.
+  5. The inferred stored MWh cannot go negative: a raw integral below zero is
+     floored at empty and flagged, the flag surviving `--no-infer-clamp`.
 """
 
 from __future__ import annotations
@@ -397,6 +399,10 @@ def make_intraday(**kwargs):
         kwargs.pop("retry_budget", 0.0),
         battery_duids=kwargs.pop("battery_duids", None),
         storage_duids_fn=kwargs.pop("storage_duids_fn", None),
+        daily_report_fn=kwargs.pop("daily_report_fn", None),
+        charge_efficiency=kwargs.pop("charge_efficiency", exporter.DEFAULT_INFER_CHARGE_EFFICIENCY),
+        infer_clamp=kwargs.pop("infer_clamp", exporter.DEFAULT_INFER_CLAMP),
+        infer_state_file=kwargs.pop("infer_state_file", None),
     )
     poller.now_fn = lambda: now
     return poller
@@ -1380,6 +1386,75 @@ class InferenceTest(unittest.TestCase):
         self.assertIn("aemo_battery_infer_success 1", text)
         self.assertIn("aemo_battery_infer_charge_efficiency 0.9", text)
         self.assertIn('aemo_battery_inferred_report_info{file="DAILY.zip"} 1', text)
+
+    def test_raw_integral_below_zero_is_floored_and_flagged(self):
+        poller = make_intraday(battery_duids={"ERB01"})
+        poller._daily_report_fn = lambda: self.daily
+        # Anchor at 130 MWh, then discharge 400 MW for 1h = 400 MWh out,
+        # driving the raw integral to -270.
+        poller._advance_inference(self.scada_at("ERB01", 400.0, 1791396000.0 + 3600.0)["units"], NOW)
+        v = poller._infer_view(NOW)
+        self.assertEqual(v["units"]["ERB01"]["mwh"], 0.0)
+        self.assertEqual(v["units"]["ERB01"]["clamped"], 1.0)
+
+    def test_no_infer_clamp_serves_the_raw_drift_but_keeps_the_flag(self):
+        poller = make_intraday(battery_duids={"ERB01"}, infer_clamp=False)
+        poller._daily_report_fn = lambda: self.daily
+        poller._advance_inference(self.scada_at("ERB01", 400.0, 1791396000.0 + 3600.0)["units"], NOW)
+        v = poller._infer_view(NOW)
+        self.assertEqual(v["units"]["ERB01"]["mwh"], -270.0)
+        self.assertEqual(v["units"]["ERB01"]["clamped"], 1.0)
+
+    def test_a_negative_anchor_is_floored_and_flagged(self):
+        poller = make_intraday(battery_duids={"ERB01"})
+        poller._daily_report_fn = lambda: make_daily_report(
+            {"ERB01": {"ts": 1791396000.0, "initial": -5.0, "energy": -5.0}},
+            file_name="NEG.zip",
+        )
+        poller._advance_inference(self.scada_at("ERB01", 0.0, 1791396000.0)["units"], NOW)
+        v = poller._infer_view(NOW)
+        self.assertEqual(v["file"], "NEG.zip")
+        self.assertEqual(v["units"]["ERB01"]["mwh"], 0.0)
+        self.assertEqual(v["units"]["ERB01"]["clamped"], 1.0)
+
+    def test_legacy_negative_state_is_floored_on_load(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "infer.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({
+                    "anchor_file": "A.zip",
+                    "units": {"ERB01": {"ts": 1791396000.0, "mwh": -5.0}},
+                }, handle)
+            poller = make_intraday(
+                battery_duids={"ERB01"}, infer_state_file=path, now=NOW
+            )
+        v = poller._infer_view(NOW)
+        self.assertEqual(v["units"]["ERB01"]["mwh"], 0.0)
+        self.assertEqual(v["units"]["ERB01"]["clamped"], 1.0)
+
+    def test_render_intraday_reports_clamped_flags(self):
+        scada = exporter.parse_dispatch_scada(SCADA_SAMPLE_ZIP)
+        scada["file"] = SCADA_ZIP
+        isr = exporter.parse_dispatchis_region_storage(IS_SAMPLE_ZIP)
+        isr["file"] = IS_ZIP
+        infer = {
+            "file": "DAILY.zip",
+            "units": {
+                "ERB01": {"ts": SCADA_TS, "mwh": 0.0, "clamped": 1.0},
+                "LIMBESS1": {"ts": SCADA_TS, "mwh": 51.2, "clamped": 0.0},
+            },
+            "efficiency": 0.9,
+        }
+        now = NOW + 40000.0
+        text = exporter.render_intraday(scada, True, isr, True, 1.5, now, infer, True)
+        self.assertIn('aemo_battery_inferred_clamped{duid="ERB01"} 1', text)
+        self.assertIn('aemo_battery_inferred_clamped{duid="LIMBESS1"} 0', text)
+        self.assertIn("aemo_battery_inferred_clamped_units 1", text)
+        self.assertIn(
+            "# HELP aemo_battery_inferred_clamped Whether the raw SCADA-", text
+        )
+        self.assertIn("# TYPE aemo_battery_inferred_clamped gauge", text)
+        self.assertIn("# TYPE aemo_battery_inferred_clamped_units gauge", text)
 
 
 if __name__ == "__main__":

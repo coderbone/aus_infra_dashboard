@@ -64,14 +64,14 @@ def thresholds(steps, mode="absolute"):
 def text_color_step():
     return [{"color": "text", "value": 0}]
 
-def gauge(title, grid, targets, description, unit=None, decimals=None, threshold_steps=None, orientation="auto"):
+def gauge(title, grid, targets, description, unit=None, decimals=None, threshold_steps=None, orientation="horizontal", max_per_row=6):
     options = {
         "legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": True},
         "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": False},
         "showThresholdLabels": False,
         "showThresholdMarkers": True,
         "orientation": orientation,
-        "sizing": "auto",
+        "sizing": "fit",
         "minVizHeight": 75,
         "minVizWidth": 75,
         "textMode": "auto",
@@ -83,6 +83,7 @@ def gauge(title, grid, targets, description, unit=None, decimals=None, threshold
         "shape": "gauge",
         "endpointMarker": "point",
         "effects": {"gradient": False, "barGlow": False, "centerGlow": False},
+        "maxPerRow": max_per_row,
     }
     defaults = {
         "color": {"mode": "palette-classic"},

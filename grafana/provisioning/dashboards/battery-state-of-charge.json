@@ -2576,9 +2576,10 @@
           "placement": "bottom",
           "showLegend": true
         },
+        "maxPerRow": 6,
         "minVizHeight": 75,
         "minVizWidth": 75,
-        "orientation": "auto",
+        "orientation": "horizontal",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
@@ -2591,7 +2592,7 @@
         "shape": "gauge",
         "showThresholdLabels": false,
         "showThresholdMarkers": true,
-        "sizing": "auto",
+        "sizing": "fit",
         "sparkline": true,
         "textMode": "auto"
       },
@@ -2668,9 +2669,10 @@
           "placement": "bottom",
           "showLegend": true
         },
+        "maxPerRow": 6,
         "minVizHeight": 75,
         "minVizWidth": 75,
-        "orientation": "auto",
+        "orientation": "horizontal",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
@@ -2683,7 +2685,7 @@
         "shape": "gauge",
         "showThresholdLabels": false,
         "showThresholdMarkers": true,
-        "sizing": "auto",
+        "sizing": "fit",
         "sparkline": true,
         "textMode": "auto"
       },

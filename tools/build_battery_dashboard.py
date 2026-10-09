@@ -1239,6 +1239,25 @@ panels.append(
     )
 )
 
+
+panels.append(
+    gauge(
+        "Most active batteries (by |power|): stored energy vs capacity",
+        {"h": 9, "w": 24, "x": 0, "y": 139},
+        [
+            target(
+                "aemo_battery_inferred_stored_mwh / on(duid) label_replace(max by (unit) (oe_battery_capacity_storage_mwh), \"duid\", \"$1\", \"unit\", \"(.*)\") * 100",
+                instant=False,
+                legend="{{duid}} (%% of cap)",
+            )
+        ],
+        "Gauges for the 10 most active batteries by |MW|, showing % of capacity stored. Max=100%.",
+        unit="percent",
+        decimals=1,
+    )
+)
+
+
 # Panel ids and y offsets have to be unique and monotonic; the gridPos values
 # above are authored by hand, so assert the invariants rather than trusting them.
 for index, panel in enumerate(panels, start=1):
@@ -1330,3 +1349,38 @@ with open(OUT, "w", encoding="utf-8") as handle:
     json.dump(dashboard, handle, indent=2, sort_keys=True)
     handle.write("\n")
 print("wrote %s (%d panels)" % (OUT, len(panels)))
+
+panels.append(
+    gauge(
+        "Most active batteries (by |power|): stored energy vs capacity",
+        {"h": 9, "w": 24, "x": 0, "y": 139},
+        [
+            target(
+                "aemo_battery_inferred_stored_mwh / on(duid) label_replace(max by (unit) (oe_battery_capacity_storage_mwh), \"duid\", \"$1\", \"unit\", \"(.*)\") * 100",
+                instant=False,
+                legend="{{duid}} (%% of cap)",
+            )
+        ],
+        "Gauges for the 10 most active batteries by |MW|, showing % of capacity stored. Max=100%%.",
+        unit="percent",
+        decimals=1,
+    )
+)
+
+
+panels.append(
+    gauge(
+        "Most active batteries (by |power|): stored energy vs capacity",
+        {"h": 9, "w": 24, "x": 0, "y": 139},
+        [
+            target(
+                "aemo_battery_inferred_stored_mwh / on(duid) label_replace(max by (unit) (oe_battery_capacity_storage_mwh), \"duid\", \"$1\", \"unit\", \"(.*)\") * 100",
+                instant=False,
+                legend="{{duid}} (%% of cap)",
+            )
+        ],
+        "Gauges for the 10 most active batteries by |MW|, showing %% of capacity stored. Max=100%%.",
+        unit="percent",
+        decimals=1,
+    )
+)

@@ -2226,6 +2226,102 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
+      "description": "The same measured `Dispatch_SCADA` output as the per-unit panel above, summed by region. `aemo_battery_power_mw_region` is a Prometheus recording rule (`prometheus_rules.yml`) that attaches a `region` label to each unit's power by joining to the OE fleet info gauge (`oe_battery_fleet_info`), so any panel can group by region without restating the join. **Negative is charging, positive is discharging.** As a cross-check this mirrors (sign-inverted) the derivative of the published per-region `aemo_battery_region_stored_mwh` - see the panel's notes above; the two disagree by whatever AEMO's reported regional storage and per-unit SCADA do.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": true,
+            "axisColorMode": "text",
+            "axisLabel": "MW",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "mwatth"
+        }
+      },
+      "gridPos": {
+        "h": 11,
+        "w": 24,
+        "x": 0,
+        "y": 102
+      },
+      "id": 21,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "sum by (region) (aemo_battery_power_mw_region)",
+          "instant": false,
+          "legendFormat": "{{region}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Charge/discharge rate by region: live SCADA (5-min)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
       "description": "Per-unit state of charge dead-reckoned from the daily `Next_Day_Dispatch` ENERGY_STORAGE anchor and integrated 5-minute `Dispatch_SCADA` MW, using the same charging-leg convention as the OE exporter's inference (`charge_efficiency \u00d7 |MW|\u00d7dt` when charging, `MW\u00d7dt` when discharging). Only units present in the daily anchor and within `MAX_INFER_GAP_HOURS` of their last SCADA reading are shown (`aemo_battery_infer_success == 1` when the feed is live). Join to capacity is by DUID (only OE-scope units have capacity in the fleet). This is a complement to the region-reported aggregate, not a replacement.",
       "fieldConfig": {
         "defaults": {
@@ -2283,9 +2379,9 @@
         "h": 10,
         "w": 24,
         "x": 0,
-        "y": 102
+        "y": 113
       },
-      "id": 21,
+      "id": 22,
       "options": {
         "legend": {
           "calcs": [],
@@ -2379,9 +2475,9 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 112
+        "y": 123
       },
-      "id": 22,
+      "id": 23,
       "options": {
         "legend": {
           "calcs": [],
@@ -2488,9 +2584,9 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 121
+        "y": 132
       },
-      "id": 23,
+      "id": 24,
       "options": {
         "legend": {
           "calcs": [],
@@ -2527,13 +2623,15 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
-      "description": "Gauges showing current stored energy per region (reactive units).",
+      "description": "Gauges showing current stored energy per region (reactive units). Scaled from a fixed 0 floor to each region's own maximum (`fieldMinMax`), so a smaller region is not dwarfed by the largest one's range.",
       "fieldConfig": {
         "defaults": {
           "color": {
             "mode": "palette-classic"
           },
           "decimals": 1,
+          "fieldMinMax": true,
+          "min": 0,
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -2558,9 +2656,9 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 130
+        "y": 141
       },
-      "id": 24,
+      "id": 25,
       "options": {
         "barShape": "flat",
         "barWidthFactor": 0.54,
@@ -2620,7 +2718,7 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
-      "description": "Gauges for the 12 most active batteries by |MW|, showing % of capacity stored. The top 12 are selected live by the measured charge/discharge rate - `abs(aemo_battery_power_mw)` - not by the stored share, and only units with capacity in the OE fleet qualify. Max=100%.",
+      "description": "The 12 batteries charging fastest right now, showing % of capacity stored. Sign follows AEMO: `aemo_battery_power_mw < 0` is charging/absorbing, so the selection is `topk(12, -power)` - only units with capacity in the OE fleet qualify.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2651,9 +2749,9 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 139
+        "y": 150
       },
-      "id": 25,
+      "id": 26,
       "options": {
         "barShape": "flat",
         "barWidthFactor": 0.54,
@@ -2698,14 +2796,107 @@
           },
           "editorMode": "code",
           "exemplar": false,
-          "expr": "100 * aemo_battery_inferred_stored_mwh / on(duid) label_replace(max by (unit) (oe_battery_capacity_storage_mwh), \"duid\", \"$1\", \"unit\", \"(.*)\") and on(duid) topk(12, abs(aemo_battery_power_mw))",
-          "instant": false,
-          "legendFormat": "{{duid}} (%% of cap)",
-          "range": true,
+          "expr": "100 * aemo_battery_inferred_stored_mwh / on(duid) label_replace(max by (unit) (oe_battery_capacity_storage_mwh), \"duid\", \"$1\", \"unit\", \"(.*)\") and on(duid) topk(12, -aemo_battery_power_mw) and on(duid) (aemo_battery_power_mw < 0)",
+          "instant": true,
+          "legendFormat": "{{duid}}",
+          "range": false,
           "refId": "A"
         }
       ],
-      "title": "Most active batteries (by |power|): stored energy vs capacity",
+      "title": "Most active batteries (charging): stored energy vs capacity",
+      "type": "gauge"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "The 12 batteries discharging fastest right now, showing % of capacity stored. Sign follows AEMO: `aemo_battery_power_mw > 0` is discharging, so the selection is `topk(12, power)` - only units with capacity in the OE fleet qualify.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": 0
+              },
+              {
+                "color": "#EAB839",
+                "value": 60
+              },
+              {
+                "color": "green",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "percent"
+        }
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 159
+      },
+      "id": 27,
+      "options": {
+        "barShape": "flat",
+        "barWidthFactor": 0.54,
+        "effects": {
+          "barGlow": false,
+          "centerGlow": false,
+          "gradient": false
+        },
+        "endpointMarker": "point",
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "maxPerRow": 6,
+        "minVizHeight": 75,
+        "minVizWidth": 75,
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "segmentCount": 1,
+        "segmentSpacing": 0.3,
+        "shape": "gauge",
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true,
+        "sizing": "fit",
+        "sparkline": true,
+        "textMode": "auto"
+      },
+      "pluginVersion": "13.2.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "100 * aemo_battery_inferred_stored_mwh / on(duid) label_replace(max by (unit) (oe_battery_capacity_storage_mwh), \"duid\", \"$1\", \"unit\", \"(.*)\") and on(duid) topk(12, aemo_battery_power_mw) and on(duid) (aemo_battery_power_mw > 0)",
+          "instant": true,
+          "legendFormat": "{{duid}}",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Most active batteries (discharging): stored energy vs capacity",
       "type": "gauge"
     }
   ],

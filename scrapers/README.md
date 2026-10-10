@@ -484,6 +484,14 @@ same batteries everywhere and the table can join on `unit`:
 | `oe_battery_power_sample_timestamp_seconds` | gauge | When that power value was observed |
 | `oe_battery_power_sample_age_seconds` | gauge | Its age at export time |
 
+A labelled **info** gauge accompanies the whole fleet, value 1 with the data in
+the labels, and covers *every* battery unit in the metadata — committed and
+never-built units included, not just the polling set:
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `oe_battery_fleet_info{duid, facility, facility_name, region, network, status, capacity_storage_mwh, capacity_registered_mw, data_last_seen}` | gauge | Registration metadata for one unit. `duid` is the join key: AEMO per-unit dispatch series carry `duid`, so `aemo_battery_power_mw * on(duid) group_left(region) oe_battery_fleet_info` enriches them with region/network/status with no lookup table. Capacity figures ride as label strings for display and filtering; `data_last_seen` is empty for units that have never published. Absent entirely until the fleet metadata is first read. |
+
 With `--enable-inferred`, a separate synthetic family is exported for units with
 no *fresh* measured reading. It is deliberately kept out of the table above so
 it can never be mistaken for an upstream number:

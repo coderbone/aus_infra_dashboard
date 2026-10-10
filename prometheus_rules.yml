@@ -1,0 +1,29 @@
+# Recording rules for the NEM battery stack.
+#
+# Enrich per-unit AEMO metrics with a `region` label at query time, so any
+# Grafana panel can group by region (`sum by (region)`, `$region` variables)
+# without restating a join in every expression.
+#
+# Why a join rather than a region label on the AEMO exporter: its source
+# (`Dispatch_SCADA`) carries no per-duid region - region only appears
+# aggregated in `REGIONSUM` - so the exporter would need a maintained
+# duid->region table. The OpenElectricity exporter already publishes one per
+# fleet battery: `oe_battery_fleet_info{duid, region, ...}`, an always-1 info
+# metric covering the *whole* battery fleet metadata (committed units
+# included). PromQL's join operator is `*`, but the info metric already sits
+# at 1, so no value-pinning is needed - `aemo_battery_power_mw` routes through
+# unchanged and `group_left(region)` just renames the carrier.
+#
+# Units with no OE metadata carry no region and drop out of any region
+# grouping - same "OE fleet qualifies" scoping the dashboards already use. As
+# of 2026-10 an AEMO dispatch duid (e.g. TB3B1, Tasmania) with no OE
+# facility in the fleet metadata will silently drop; that is the flag for
+# `oe_battery_fleet_info` to learn about the unit.
+groups:
+  - name: aemo_battery_region
+    rules:
+      - record: aemo_battery_power_mw_region
+        expr: |-
+          aemo_battery_power_mw
+            * on(duid) group_left(region)
+              oe_battery_fleet_info

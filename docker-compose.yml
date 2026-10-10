@@ -438,10 +438,17 @@ services:
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
+      # Retain at least two years. Unset, Prometheus defaults to 15 days - and
+      # some of these exporters publish a value only once a day (Next_Day_Dispatch,
+      # reservoir levels), so two-week retention would erase every reading long
+      # before a yearly trend is visible. The write rate is tiny (a handful of
+      # series, ≤30 KB/h), so the cost is negligible.
+      - --storage.tsdb.retention.time=2y
       - --web.enable-lifecycle
       - --web.listen-address=0.0.0.0:9090
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus_rules.yml:/etc/prometheus/prometheus_rules.yml:ro
       - prometheus-data:/prometheus
     ports:
       - "9090:9090"

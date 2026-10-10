@@ -64,7 +64,7 @@ def thresholds(steps, mode="absolute"):
 def text_color_step():
     return [{"color": "text", "value": 0}]
 
-def gauge(title, grid, targets, description, unit=None, decimals=None, threshold_steps=None, orientation="auto", max_per_row=6):
+def gauge(title, grid, targets, description, unit=None, decimals=None, threshold_steps=None, orientation="auto", max_per_row=6, min_=None, max_=None, field_min_max=False):
     options = {
         "legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": True},
         "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": False},
@@ -93,6 +93,16 @@ def gauge(title, grid, targets, description, unit=None, decimals=None, threshold
         defaults["unit"] = unit
     if decimals is not None:
         defaults["decimals"] = decimals
+    # Standard options. `min`/`max` fix the scale ends; leave `max_` unset to
+    # keep it auto. `field_min_max` makes Grafana derive the range per field
+    # (per series) instead of across the whole panel - the only way a gauge for
+    # one region can top out at that region's own max when regions differ.
+    if min_ is not None:
+        defaults["min"] = min_
+    if max_ is not None:
+        defaults["max"] = max_
+    if field_min_max:
+        defaults["fieldMinMax"] = True
     return {
         "datasource": ds_(),
         "description": description,
@@ -1140,11 +1150,42 @@ panels.append(
     )
 )
 
+# Region-grouped charge/discharge rate (sum of the per-unit SCADA panel above)
+panels.append(
+    timeseries(
+        "Charge/discharge rate by region: live SCADA (5-min)",
+        {"h": 11, "w": 24, "x": 0, "y": 102},
+        [
+            target(
+                "sum by (region) (aemo_battery_power_mw_region)",
+                instant=False,
+                legend="{{region}}",
+            )
+        ],
+        "The same measured `Dispatch_SCADA` output as the per-unit panel "
+        "above, summed by region. `aemo_battery_power_mw_region` is a "
+        "Prometheus recording rule (`prometheus_rules.yml`) that attaches a "
+        "`region` label to each unit's power by joining to the OE fleet "
+        "info gauge (`oe_battery_fleet_info`), so any panel can group by "
+        "region without restating the join. **Negative is charging, positive "
+        "is discharging.** As a "
+        "cross-check this mirrors (sign-inverted) the derivative of the "
+        "published per-region `aemo_battery_region_stored_mwh` - see the "
+        "panel's notes above; the two disagree by whatever AEMO's reported "
+        "regional storage and per-unit SCADA do.",
+        unit="mwatth",
+        axis="MW",
+        decimals=1,
+        span_nulls=False,
+        center_zero=True,
+    )
+)
+
 # Inferred per-unit SoC (SCADA-integrated)
 panels.append(
     timeseries(
         "State of charge: live inferred (SCADA)",
-        {"h": 10, "w": 24, "x": 0, "y": 102},
+        {"h": 10, "w": 24, "x": 0, "y": 113},
         [
             target(
                 "100 * aemo_battery_inferred_stored_mwh / on(duid) "
@@ -1176,7 +1217,7 @@ panels.append(
 panels.append(
     timeseries(
         "Inferred vs reported storage (NEM total)",
-        {"h": 9, "w": 24, "x": 0, "y": 112},
+        {"h": 9, "w": 24, "x": 0, "y": 123},
         [
             target("sum(aemo_battery_inferred_stored_mwh)", refid="A", instant=False, legend="inferred total (MWh)"),
             target("sum(aemo_battery_region_stored_mwh)", refid="B", instant=False, legend="reported region total (MWh)"),
@@ -1202,7 +1243,7 @@ panels.append(
 panels.append(
     timeseries(
         "Stored energy by region: live (BDU)",
-        {"h": 9, "w": 24, "x": 0, "y": 121},
+        {"h": 9, "w": 24, "x": 0, "y": 132},
         [target("aemo_battery_region_stored_mwh", instant=False, legend="{{region}}")],
         "The region-level aggregate stored MWh from AEMO's `DispatchIS_Reports` "
         "archive, `DISPATCH,REGIONSUM` `BDU_ENERGY_STORAGE`, polled every "
@@ -1232,10 +1273,39 @@ panels.append(
 panels.append(
     gauge(
         "Stored energy by region: live (BDU) gauges",
-        {"h": 9, "w": 24, "x": 0, "y": 130},
+        {"h": 9, "w": 24, "x": 0, "y": 141},
         [target("aemo_battery_region_stored_mwh", instant=False, legend="{{region}}")],
-        "Gauges showing current stored energy per region (reactive units).",
+        "Gauges showing current stored energy per region (reactive units). "
+        "Scaled from a fixed 0 floor to each region's own maximum (`fieldMinMax`), "
+        "so a smaller region is not dwarfed by the largest one's range.",
         unit="mwatth",
+        decimals=1,
+        min_=0,
+        field_min_max=True,
+    )
+)
+
+
+panels.append(
+    gauge(
+        "Most active batteries (charging): stored energy vs capacity",
+        {"h": 9, "w": 24, "x": 0, "y": 150},
+        [
+            target(
+                "100 * aemo_battery_inferred_stored_mwh / on(duid) "
+                "label_replace(max by (unit) (oe_battery_capacity_storage_mwh), "
+                "\"duid\", \"$1\", \"unit\", \"(.*)\") "
+                "and on(duid) topk(12, -aemo_battery_power_mw) "
+                "and on(duid) (aemo_battery_power_mw < 0)",
+                instant=True,
+                legend="{{duid}}",
+            )
+        ],
+        "The 12 batteries charging fastest right now, showing % of capacity "
+        "stored. Sign follows AEMO: `aemo_battery_power_mw < 0` is "
+        "charging/absorbing, so the selection is `topk(12, -power)` - only "
+        "units with capacity in the OE fleet qualify.",
+        unit="percent",
         decimals=1,
     )
 )
@@ -1243,23 +1313,23 @@ panels.append(
 
 panels.append(
     gauge(
-        "Most active batteries (by |power|): stored energy vs capacity",
-        {"h": 9, "w": 24, "x": 0, "y": 139},
+        "Most active batteries (discharging): stored energy vs capacity",
+        {"h": 9, "w": 24, "x": 0, "y": 159},
         [
             target(
                 "100 * aemo_battery_inferred_stored_mwh / on(duid) "
                 "label_replace(max by (unit) (oe_battery_capacity_storage_mwh), "
                 "\"duid\", \"$1\", \"unit\", \"(.*)\") "
-                "and on(duid) topk(12, abs(aemo_battery_power_mw))",
-                instant=False,
-                legend="{{duid}} (%% of cap)",
+                "and on(duid) topk(12, aemo_battery_power_mw) "
+                "and on(duid) (aemo_battery_power_mw > 0)",
+                instant=True,
+                legend="{{duid}}",
             )
         ],
-        "Gauges for the 12 most active batteries by |MW|, showing % of "
-        "capacity stored. The top 12 are selected live by the measured "
-        "charge/discharge rate - `abs(aemo_battery_power_mw)` - not by the "
-        "stored share, and only units with capacity in the OE fleet qualify. "
-        "Max=100%.",
+        "The 12 batteries discharging fastest right now, showing % of capacity "
+        "stored. Sign follows AEMO: `aemo_battery_power_mw > 0` is "
+        "discharging, so the selection is `topk(12, power)` - only units with "
+        "capacity in the OE fleet qualify.",
         unit="percent",
         decimals=1,
     )

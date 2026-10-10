@@ -2,6 +2,12 @@ global:
   scrape_interval: 1m
   evaluation_interval: 1m
 
+# Recording rules: prometheus_rules.yml in this directory is mounted into the
+# container at /etc/prometheus/prometheus_rules.yml (see docker-compose.yml),
+# so this relative path resolves against the config file's directory.
+rule_files:
+  - prometheus_rules.yml
+
 scrape_configs:
   - job_name: wht_tbm
     # The upstream only publishes a survey line every few hours; 5m is cheap and

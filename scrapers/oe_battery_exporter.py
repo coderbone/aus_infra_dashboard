@@ -173,6 +173,14 @@ Unlabelled fleet and poll gauges:
     oe_api_credits_remaining                   daily budget
     oe_api_requests_total                      counter, includes failures
 
+Labelled info gauge, value 1, whole fleet:
+
+    oe_battery_fleet_info{duid,facility,facility_name,region,network,status,
+        capacity_storage_mwh,capacity_registered_mw,data_last_seen}
+                                              registration metadata for every
+                                              battery unit, including committed
+                                              units the polling set never sees
+
 `oe_battery_scrape_success` is 0 for a facility whose *energy* reading could not
 be read, and the SOC series is **omitted** for it rather than repeated, so a
 failure shows as a gap in the gauge plus this flag, matching the sibling
@@ -1096,6 +1104,41 @@ def label_set(sample: dict) -> str:
     )
 
 
+def info_set(row: dict) -> str:
+    """Label set for `oe_battery_fleet_info`.
+
+    The battery's own code is published under `duid` here (rather than the
+    `unit` the other series use) because that is the identifier AEMO dispatch
+    series join to: `aemo_battery_power_mw` and friends carry `duid`, so a
+    `group_left(region) oe_battery_fleet_info` needs the same name on both
+    sides. The capacity figures ride as label strings - that is what an info
+    metric is for - and a missing figure (registered MW on an old metadata
+    row) renders as an empty value rather than `NaN`.
+    """
+    capacity_mwh = row.get("capacity_mwh")
+    registered_mw = row.get("registered_mw")
+    return (
+        'duid="%s",facility="%s",facility_name="%s",region="%s",'
+        'network="%s",status="%s",capacity_storage_mwh="%s",'
+        'capacity_registered_mw="%s",data_last_seen="%s"'
+        % (
+            escape_label(row.get("unit", "")),
+            escape_label(row.get("facility", "")),
+            escape_label(row.get("facility_name", "")),
+            escape_label(row.get("region", "")),
+            escape_label(row.get("network", "")),
+            escape_label(row.get("status", "")),
+            fmt(capacity_mwh)
+            if isinstance(capacity_mwh, (int, float)) and not isinstance(capacity_mwh, bool)
+            else "",
+            fmt(registered_mw)
+            if isinstance(registered_mw, (int, float)) and not isinstance(registered_mw, bool)
+            else "",
+            escape_label(str(row.get("data_last_seen") or "")),
+        )
+    )
+
+
 def trapezoid(p0: float, t0: float, p1: float, t1: float) -> float:
     """`∫P dt` between two sampled powers, MWh.
 
@@ -1770,6 +1813,32 @@ def render(state: dict, now: float) -> str:
         "rank",
     )
 
+    # Static registration metadata for every battery unit in the fleet, not
+    # just the polling set. As an info metric it is joined to per-unit series
+    # (aemo_battery_power_mw, the battery SOC gauges) with group_left(), which
+    # is what lets a Prometheus recording rule or a Grafana variable filter by
+    # facility, network or status without a lookup table. Published for the
+    # whole metadata - committed and never-built units included - because those
+    # are exactly the rows the top-N polling never touches; take the value 1
+    # and read the labels. Nothing is emitted until the fleet metadata has
+    # been loaded at least once, so absence of the metric (not just of rows)
+    # is the "metadata not yet read" signal.
+    fleet_meta = state.get("fleet_meta") or []
+    if fleet_meta:
+        lines.append(
+            "# HELP oe_battery_fleet_info Registration metadata for a NEM/WEM "
+            "battery unit. Value is always 1; the unit lives in the labels: duid, "
+            "facility, facility_name, region, network, status, storage capacity in "
+            "MWh and registered capacity in MW (both as label strings, suitable "
+            "for display and filtering), and the date the unit was last seen on "
+            "the data endpoint, empty for units that have never published. Covers "
+            "the whole fleet including committed, never-built units, so a duid "
+            "appears here whenever the metadata knows it, dispatched or not."
+        )
+        lines.append("# TYPE oe_battery_fleet_info gauge")
+        for row in fleet_meta:
+            lines.append("oe_battery_fleet_info{%s} 1" % info_set(row))
+
     lines.append(
         "# HELP oe_battery_scrape_success Whether the last poll read a usable "
         "state-of-charge sample for this battery. Carries the same labels as the "
@@ -2071,6 +2140,11 @@ class BatteryScraper:
         self.now_fn = now_fn
         self._state: dict = {}
         self._fleet: list[dict] = []
+        # The whole fleet, unfiltered by the dispatchability/data gate used for
+        # polling: every battery unit in the metadata, committed and never-built
+        # included. It backs oe_battery_fleet_info, whose whole point is to
+        # describe units the polling top-N will never tell you about.
+        self._fleet_meta: list[dict] = []
         self._fleet_at = 0.0
         # unit code -> epoch of the newest usable reading we have ever been
         # shown for it. Only the poll thread touches this; the serving thread
@@ -2163,10 +2237,11 @@ class BatteryScraper:
             cached = self.cached_fleet()
             if cached is None:
                 raise
-            rows, cached_at = cached
+            rows, meta, cached_at = cached
             log.warning("using cached fleet metadata (%s): %s", self.fleet_file, exc)
             with self._lock:
                 self._fleet, self._fleet_at = rows, cached_at
+                self._fleet_meta = meta
             return rows
         rows = unit_rows(facilities, self.require_data)
         if not rows:
@@ -2175,10 +2250,18 @@ class BatteryScraper:
             save_cache(self.fleet_file, facilities)
         with self._lock:
             self._fleet, self._fleet_at = rows, now
+            # require_data=False here is not an oversight: the info metric is
+            # metadata for the whole fleet, and the units `require_data` drops
+            # (committed, never dispatched) are precisely the ones the polling
+            # rows cannot describe. Both row shapes are computed from the same
+            # facilities response so they can never disagree.
+            self._fleet_meta = unit_rows(facilities, require_data=False)
         return rows
 
-    def cached_fleet(self) -> tuple[list[dict], float] | None:
-        """Rows and cache age from the on-disk fleet, or None if unusable."""
+    def cached_fleet(self) -> tuple[list[dict], list[dict], float] | None:
+        """Rows, full-fleet metadata rows, and cache age from the on-disk
+        fleet, or None if unusable. The metadata rows are the `require_data=False`
+        shape, mirroring what a live fetch stores."""
         if not self.fleet_file:
             return None
         cached = load_cache_entry(self.fleet_file)
@@ -2186,7 +2269,10 @@ class BatteryScraper:
             return None
         data, cached_at = cached
         rows = unit_rows(data, self.require_data)
-        return (rows, cached_at) if rows else None
+        if not rows:
+            return None
+        meta = unit_rows(data, require_data=False)
+        return (rows, meta, cached_at)
 
     # -- poll --------------------------------------------------------------- #
 
@@ -2297,6 +2383,7 @@ class BatteryScraper:
             "infer_charge_efficiency": self.infer_charge_efficiency,
             "infer_max_hold_hours": self.infer_max_hold_hours,
             "fleet_rows": rows,
+            "fleet_meta": self._fleet_meta or [],
             "now": started_at,
             "samples_map": {s["unit"]: s for s in result["samples"] if s.get("unit")},
         }

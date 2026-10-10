@@ -767,6 +767,63 @@ class RenderTest(unittest.TestCase):
     def test_ends_with_newline(self):
         self.assertTrue(self.text.endswith("\n"))
 
+    def test_fleet_info_is_absent_without_metadata(self):
+        """The info metric is opt-in per render: a state without `fleet_meta`
+        (e.g. the exporter right after start, before the first fleet read)
+        must not emit the metric at all rather than a half-populated one."""
+        self.assertNotIn("oe_battery_fleet_info", self.text)
+
+    def test_fleet_info_carries_registration_labels_as_strings(self):
+        text = exporter.render(
+            state(fleet_meta=[
+                {
+                    "facility": "ERB",
+                    "facility_name": "Eraring",
+                    "region": "NSW1",
+                    "network": "NEM",
+                    "unit": "ERB01",
+                    "status": "operating",
+                    "capacity_mwh": 400.0,
+                    "registered_mw": 96.0,
+                    "data_last_seen": "2026-09-29T13:00:00+00:00",
+                },
+                {
+                    "facility": "GRP",
+                    "facility_name": "Goyder South",
+                    "region": "SA1",
+                    "network": "NEM",
+                    "unit": "GRPYDS1",
+                    "status": "committed",
+                    "capacity_mwh": 20.0,
+                    "registered_mw": None,
+                    "data_last_seen": None,
+                },
+            ]),
+            self.now,
+        )
+        self.assertEqual(text.count("# HELP oe_battery_fleet_info "), 1)
+        self.assertEqual(text.count("# TYPE oe_battery_fleet_info gauge"), 1)
+        lines = [l for l in text.splitlines() if l.startswith("oe_battery_fleet_info{")]
+        self.assertEqual(len(lines), 2)
+
+        operating = lines[0]
+        self.assertTrue(operating.endswith(" 1"), operating)
+        for label in (
+            'duid="ERB01"', 'facility="ERB"', 'facility_name="Eraring"',
+            'region="NSW1"', 'network="NEM"', 'status="operating"',
+        ):
+            self.assertIn(label, operating)
+        self.assertIn('capacity_storage_mwh="400"', operating)
+        self.assertIn('capacity_registered_mw="96"', operating)
+        self.assertIn('data_last_seen="2026-09-29T13:00:00+00:00"', operating)
+
+        # Missing figures render as empty label values, never as "NaN" text.
+        committed = lines[1]
+        self.assertIn('duid="GRPYDS1"', committed)
+        self.assertIn('status="committed"', committed)
+        self.assertIn('capacity_registered_mw=""', committed)
+        self.assertIn('data_last_seen=""}', committed)
+
     def test_soc_carries_the_identifying_labels(self):
         line = self.lines_named("oe_battery_soc_ratio")[0]
         for label in ('facility="ERB"', 'unit="ERB01"', 'name="Eraring"',
@@ -2365,6 +2422,32 @@ class ScraperTest(unittest.TestCase):
         body, ok = second.poll_once()
         self.assertTrue(ok)
         self.assertIn("oe_batteries_enumerated 74", body)
+
+    def test_fleet_info_covers_units_the_poll_never_reads(self):
+        """`oe_battery_fleet_info` is the whole-fleet row set. The fixture has
+        119 battery units but only 74 have ever published data (the enumerated
+        count); the info metric must carry all 119, committed and unbuilt
+        included, because those are exactly the units the polling top-N is
+        blind to."""
+        scraper = make_scraper(ScraperClient(series={}))
+        body, ok = scraper.poll_once()
+        self.assertTrue(ok)
+        self.assertIn("oe_batteries_enumerated 74", body)
+        infos = [l for l in body.splitlines() if l.startswith("oe_battery_fleet_info{")]
+        self.assertEqual(len(infos), 119)
+        for line in infos:
+            self.assertTrue(line.endswith(" 1"), line)
+
+        baranduda = next(l for l in infos if 'duid="BARANDUDAB1"' in l)
+        # A committed, never-dispatched unit: region-classified metadata, but
+        # no data_last_seen.
+        self.assertIn('region="VIC1"', baranduda)
+        self.assertIn('network="NEM"', baranduda)
+        self.assertIn('status="committed"', baranduda)
+        self.assertTrue(baranduda.endswith('data_last_seen=""} 1'), baranduda)
+
+        # And the western units are there under their own network id.
+        self.assertTrue(any('network="WEM"' in l for l in infos), "no WEM unit in info metric")
 
     def test_stale_cache_does_not_pin_the_fleet(self):
         """The disk cache is a fallback, not a second source of truth.

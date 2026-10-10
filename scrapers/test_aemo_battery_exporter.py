@@ -402,6 +402,10 @@ def make_intraday(**kwargs):
         daily_report_fn=kwargs.pop("daily_report_fn", None),
         charge_efficiency=kwargs.pop("charge_efficiency", exporter.DEFAULT_INFER_CHARGE_EFFICIENCY),
         infer_clamp=kwargs.pop("infer_clamp", exporter.DEFAULT_INFER_CLAMP),
+        infer_backfill=kwargs.pop("infer_backfill", exporter.DEFAULT_INFER_BACKFILL),
+        infer_backfill_max_hours=kwargs.pop(
+            "infer_backfill_max_hours", exporter.MAX_INFER_BACKFILL_HOURS
+        ),
         infer_state_file=kwargs.pop("infer_state_file", None),
     )
     poller.now_fn = lambda: now
@@ -1315,6 +1319,14 @@ class InferenceTest(unittest.TestCase):
                 "LIMBESS1": {"ts": 1791396000.0, "initial": 50.0, "energy": 50.0},
             }
         )
+        # These tests drive _advance_inference directly, so a gap can trigger the
+        # archive backfill; the tests are hermetic, so the archive is never
+        # reachable here. Backfill tests patch in a fetcher of their own.
+        offline = mock.patch.object(
+            exporter, "http_get", side_effect=exporter.ScrapeError("offline")
+        )
+        offline.start()
+        self.addCleanup(offline.stop)
 
     def scada_at(self, duid, value_mw, ts):
         return {"file": SCADA_ZIP, "units": {duid: {"ts": ts, "scada": float(value_mw)}}}
@@ -1455,6 +1467,217 @@ class InferenceTest(unittest.TestCase):
         )
         self.assertIn("# TYPE aemo_battery_inferred_clamped gauge", text)
         self.assertIn("# TYPE aemo_battery_inferred_clamped_units gauge", text)
+
+    def test_a_stale_anchor_is_never_stamped_forward(self):
+        # The regression this guards: a restart at 13:00 anchors at the 04:00
+        # daily value; the old code dropped the unit on the 9h gap, then on the
+        # next cycle re-anchored it at the 04:00 value but stamped it 13:00 -
+        # claiming a nine-hour-old measurement was current, ~9 GWh low fleet
+        # wide. With the archive unreachable (setUp) the honest outcome is
+        # absence, never a stale value wearing a fresh timestamp.
+        poller = make_intraday(battery_duids={"ERB01"})
+        poller._daily_report_fn = lambda: self.daily
+        scada_ts = 1791396000.0 + 9 * 3600.0  # 13:00, nine hours after the anchor
+        poller._advance_inference(self.scada_at("ERB01", -450.0, scada_ts)["units"], scada_ts)
+        poller._advance_inference(
+            self.scada_at("ERB01", -450.0, scada_ts + 300.0)["units"], scada_ts + 300.0
+        )
+        v = poller._infer_view(scada_ts + 300.0)
+        self.assertNotIn("ERB01", v["units"])
+        self.assertNotIn(scada_ts, [u["ts"] for u in v["units"].values()])
+        # The anchor's own age is still reportable while the series is absent.
+        self.assertEqual(v["anchor_ts"], 1791396000.0)
+
+
+class ScadaArchiveRangeTest(unittest.TestCase):
+    def test_file_timestamp_decodes_the_interval(self):
+        name = "PUBLIC_DISPATCHSCADA_202610081520_0000000541812607.zip"
+        self.assertEqual(exporter.scada_file_timestamp(name), SCADA_TS)
+
+    def test_malformed_names_return_none(self):
+        for name in (
+            "PUBLIC_DISPATCHSCADA_notadate_0000000001.zip",
+            "PUBLIC_DISPATCHSCADA_20261_0000000001.zip",
+            "PUBLIC_DISPATCHIS_202610081520_0000000541812602.zip",
+            "random.zip",
+            "",
+        ):
+            with self.subTest(name=name):
+                self.assertIsNone(exporter.scada_file_timestamp(name))
+
+    def test_range_selects_only_the_overlap_and_sorts(self):
+        html = listing_html(
+            "/Reports/Current/Dispatch_SCADA/",
+            "PUBLIC_DISPATCHSCADA_202610081510_0000000001.zip",
+            "PUBLIC_DISPATCHSCADA_202610081520_0000000002.zip",
+            "PUBLIC_DISPATCHSCADA_202610081525_0000000003.zip",
+            "PUBLIC_DISPATCHSCADA_202610081610_0000000004.zip",
+        ).decode()
+        start = exporter.parse_aest("2026/10/08 15:20:00")
+        end = exporter.parse_aest("2026/10/08 15:25:00")
+        self.assertEqual(
+            exporter.scada_files_in_range(html, start, end),
+            [
+                "PUBLIC_DISPATCHSCADA_202610081520_0000000002.zip",
+                "PUBLIC_DISPATCHSCADA_202610081525_0000000003.zip",
+            ],
+        )
+
+
+class InferenceBackfillTest(unittest.TestCase):
+    """The anchor->live gap is rebuilt from the archived Dispatch_SCADA files."""
+
+    # A 2h restart gap: anchored at 10:00, live at 12:00.
+    A1000 = "PUBLIC_DISPATCHSCADA_202610091000_0000000001.zip"
+    A1100 = "PUBLIC_DISPATCHSCADA_202610091100_0000000002.zip"
+    A1200 = "PUBLIC_DISPATCHSCADA_202610091200_0000000003.zip"
+    C1000 = "PUBLIC_DISPATCHSCADA_202610091000_0000000001.CSV"
+    C1100 = "PUBLIC_DISPATCHSCADA_202610091100_0000000002.CSV"
+    C1200 = "PUBLIC_DISPATCHSCADA_202610091200_0000000003.CSV"
+
+    def setUp(self):
+        self.ts_1000 = exporter.parse_aest("2026/10/09 10:00:00")
+        self.ts_1100 = exporter.parse_aest("2026/10/09 11:00:00")
+        self.ts_1200 = exporter.parse_aest("2026/10/09 12:00:00")
+        self.daily = make_daily_report(
+            {"ERB01": {"ts": self.ts_1000, "initial": 100.0, "energy": 100.0}},
+            file_name="DAILY.zip",
+        )
+
+    def archive(self, names):
+        # Each archived file is a single-interval UNIT_SCADA snapshot.
+        power = {
+            self.A1000: ("2026/10/09 10:00:00", "0.0"),
+            self.A1100: ("2026/10/09 11:00:00", "10.0"),   # discharge 1h -> -10 MWh
+            self.A1200: ("2026/10/09 12:00:00", "-20.0"),  # charge 1h    -> +20 MWh
+        }
+        return IntradayFetcher(
+            scada_zips={
+                name: scada_zip(
+                    name=name.replace(".zip", ".CSV"),
+                    rows=[scada_row("D", power[name][0], "ERB01", power[name][1])],
+                )
+                for name in names
+            },
+            is_zips={IS_ZIP: IS_SAMPLE_ZIP},
+            scada_names=names,
+        )
+
+    def test_gap_is_reconstructed_one_interval_at_a_time(self):
+        fetcher = self.archive([self.A1000, self.A1100, self.A1200])
+        with mock.patch.object(exporter, "http_get", fetcher):
+            poller = make_intraday(
+                battery_duids={"ERB01"},
+                daily_report_fn=lambda: self.daily,
+                now=self.ts_1200 + 300.0,
+            )
+            body, ok = poller.poll_once()
+        self.assertTrue(ok)
+        v = poller._infer_view(self.ts_1200 + 300.0)
+        # 100 - 10 (discharge) + 20 (charge) = 110, timestamped at the live interval
+        # the reconstructed chain actually reaches.
+        self.assertAlmostEqual(v["units"]["ERB01"]["mwh"], 110.0, places=4)
+        self.assertEqual(v["units"]["ERB01"]["ts"], self.ts_1200)
+        self.assertIn("aemo_battery_infer_success 1", body)
+        anchor_age = [
+            float(l.rsplit(" ", 1)[1])
+            for l in body.splitlines()
+            if l.startswith("aemo_battery_inferred_anchor_age_seconds ")
+        ][0]
+        self.assertLess(anchor_age, 3 * 3600.0)
+
+    def test_a_unit_the_archive_never_carried_stays_absent(self):
+        # Cycle 1 backfills ERB01 across 10:00->12:00 (the archive only carries
+        # ERB01). At 12:05 LIMBESS1 appears live for the first time - the archive
+        # has no history for it, and the backfill does not re-run. LIMBESS1 stays
+        # at its 10:00 anchor and must be dropped, not integrated in one step and
+        # stamped 12:05.
+        ts_1205 = exporter.parse_aest("2026/10/09 12:05:00")
+        a1205 = "PUBLIC_DISPATCHSCADA_202610091205_0000000004.zip"
+        daily = make_daily_report(
+            {
+                "ERB01": {"ts": self.ts_1000, "initial": 100.0, "energy": 100.0},
+                "LIMBESS1": {"ts": self.ts_1000, "initial": 200.0, "energy": 200.0},
+            },
+            file_name="DAILY.zip",
+        )
+        fetcher = self.archive([self.A1000, self.A1100, self.A1200])
+        with mock.patch.object(exporter, "http_get", fetcher):
+            poller = make_intraday(
+                battery_duids={"ERB01", "LIMBESS1"},
+                daily_report_fn=lambda: daily,
+                now=ts_1205 + 300.0,
+            )
+            poller.poll_once()  # cycle 1: backfill, nothing else live yet
+            fetcher.scada_names.append(a1205)
+            fetcher.scada[a1205] = scada_zip(
+                name="PUBLIC_DISPATCHSCADA_202610091205_0000000004.CSV",
+                rows=[
+                    scada_row("D", "2026/10/09 12:05:00", "ERB01", "0.0"),
+                    scada_row("D", "2026/10/09 12:05:00", "LIMBESS1", "10.0"),
+                ],
+            )
+            body, ok = poller.poll_once()  # cycle 2: LIMBESS1 first sighting
+        self.assertTrue(ok)
+        v = poller._infer_view(ts_1205 + 300.0)
+        self.assertIn("ERB01", v["units"])
+        self.assertNotIn("LIMBESS1", v["units"])
+        self.assertIn("aemo_battery_inferred_stored_mwh{duid=\"ERB01\"}", body)
+        self.assertNotIn("aemo_battery_inferred_stored_mwh{duid=\"LIMBESS1\"}", body)
+
+    def test_backfill_runs_once_per_anchor(self):
+        fetcher = self.archive([self.A1000, self.A1100, self.A1200])
+        with mock.patch.object(exporter, "http_get", fetcher):
+            poller = make_intraday(
+                battery_duids={"ERB01"},
+                daily_report_fn=lambda: self.daily,
+                now=self.ts_1200 + 300.0,
+            )
+            poller.poll_once()
+            after_first = sum(1 for u in fetcher.fetches if u.endswith(".zip"))
+            poller.poll_once()
+            after_second = sum(1 for u in fetcher.fetches if u.endswith(".zip"))
+        # The unchanged live file is reused and the gap is already reconstructed,
+        # so the second cycle downloads nothing new.
+        self.assertEqual(after_second, after_first)
+
+    def test_shallow_archive_stays_absent_rather_than_extrapolating(self):
+        # The anchor is 10:00 but the archive only reaches back to 11:00: the
+        # one hour we cannot see must not be filled with the stale anchor value.
+        fetcher = self.archive([self.A1100, self.A1200])
+        with mock.patch.object(exporter, "http_get", fetcher):
+            poller = make_intraday(
+                battery_duids={"ERB01"},
+                daily_report_fn=lambda: self.daily,
+                now=self.ts_1200 + 300.0,
+            )
+            body, ok = poller.poll_once()
+        v = poller._infer_view(self.ts_1200 + 300.0)
+        self.assertNotIn("ERB01", v["units"])
+        self.assertIn("aemo_battery_infer_success 0", body)
+
+    def test_backfill_disabled_serves_nothing_for_a_stale_anchor(self):
+        fetcher = self.archive([self.A1000, self.A1100, self.A1200])
+        with mock.patch.object(exporter, "http_get", fetcher):
+            poller = make_intraday(
+                battery_duids={"ERB01"},
+                daily_report_fn=lambda: self.daily,
+                infer_backfill=False,
+                now=self.ts_1200 + 300.0,
+            )
+            body, ok = poller.poll_once()
+        v = poller._infer_view(self.ts_1200 + 300.0)
+        self.assertNotIn("ERB01", v["units"])
+        self.assertIn("aemo_battery_infer_success 0", body)
+        # Only the one live SCADA zip (for the newest interval) was fetched.
+        self.assertEqual(
+            sum(
+                1
+                for u in fetcher.fetches
+                if u.endswith(".zip") and "/Dispatch_SCADA/" in u
+            ),
+            1,
+        )
 
 
 if __name__ == "__main__":

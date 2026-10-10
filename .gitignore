@@ -7,3 +7,6 @@
 .env
 .env.*
 !.env.example
+
+# Grafana service-account token for the opencode MCP server (see opencode.json).
+.grafana-mcp-token

@@ -1003,6 +1003,26 @@ is dropped rather than frozen on stale data — a dead feed loses its series. Th
 intraday feed is the inverse: small files, so it polls every 5 minutes and its
 series are genuinely live (age = the 5-minute interval behind the reading).
 
+### The inferred stored-MWh series
+
+No public per-DUID live SOC exists, so the intraday poller builds one: each
+storage unit is anchored at the daily report's `ENERGY_STORAGE` and the measured
+`Dispatch_SCADA` MW is integrated across every 5-minute interval
+(`charge_efficiency×|MW|×dt` while charging, `MW×dt` while discharging). The raw
+integral is floored at zero (`--no-infer-clamp` serves the raw drift).
+`aemo_battery_infer_success` reports whether the series is actually being served,
+and `aemo_battery_inferred_anchor_age_seconds` the age of the daily anchor — let
+them drop/rise and the estimate is stale.
+
+**A stale anchor is never stamped forward.** A restart mid-day re-anchors at the
+04:00 daily value. Bridging that gap from the live feed in *one* step would
+claim a five-hour-old measurement was current, so the poller instead rebuilds
+the gap one 5-minute interval at a time from the archived files on
+`https://nemweb.com.au/Reports/Current/Dispatch_SCADA/` (that listing keeps
+current-day files). When the archive does not reach back far enough, or backfill
+is disabled (`--no-infer-backfill`), the series is served *absent* — never a
+wrong number — until a fresh daily report re-anchors it.
+
 ### Metrics
 
 | Metric | Meaning |
@@ -1030,6 +1050,16 @@ series are genuinely live (age = the 5-minute interval behind the reading).
 | `aemo_battery_region_storage_interval_timestamp_seconds` | its interval |
 | `aemo_battery_scada_success`, `aemo_battery_dispatchis_success` | 1 on success, 0 on failure, per intraday feed |
 | `aemo_battery_intraday_poll_duration_seconds`, `aemo_battery_intraday_last_poll_timestamp_seconds` | intraday poll timing |
+| `aemo_battery_inferred_stored_mwh{duid}` | live per-unit estimate: daily `ENERGY_STORAGE` anchor + integrated SCADA MW, MWh |
+| `aemo_battery_inferred_timestamp_seconds{duid}` | the integrated SCADA interval behind the estimate |
+| `aemo_battery_inferred_age_seconds{duid}` | its age at export time |
+| `aemo_battery_inferred_clamped{duid}` | 1 when the raw integral fell below zero and is pinned at 0 |
+| `aemo_battery_inferred_units` | inferred units being served |
+| `aemo_battery_inferred_clamped_units` | ... of them pinned at the zero floor |
+| `aemo_battery_infer_success` | 1/0 — the series is actually being served (0 while absent) |
+| `aemo_battery_inferred_anchor_age_seconds` | age of the daily anchor interval the estimates integrate away from |
+| `aemo_battery_infer_charge_efficiency` | the stored share of charging energy |
+| `aemo_battery_inferred_report_info{file}` | the daily report anchoring the estimates |
 
 ### Running
 
@@ -1038,11 +1068,13 @@ python3 scrapers/aemo_battery_exporter.py --listen-address 0.0.0.0 --port 9112 \
     --state-file /cache/state.json
 python3 scrapers/aemo_battery_exporter.py --once --state-file /cache/state.json
 python3 scrapers/aemo_battery_exporter.py --intraday-poll-interval=300
+python3 scrapers/aemo_battery_exporter.py --no-infer-backfill        # never fetch the SCADA archive
+python3 scrapers/aemo_battery_exporter.py --infer-backfill-max-hours=48
 ```
 
 ### Tests
 
-92 tests in this file, **no network access** — upstream responses are synthetic
+110 tests in this file, **no network access** — upstream responses are synthetic
 zips built in-test against the real column indices, and the parsers have been run
 against real captures (details in `NOTES.md`). Alert on `aemo_battery_scrape_success
 == 0` or `time() - aemo_battery_report_newest_interval_timestamp_seconds` being

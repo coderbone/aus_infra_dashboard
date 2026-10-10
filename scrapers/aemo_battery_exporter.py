@@ -148,7 +148,15 @@ NEMPulse-style dead-reckoning the OE exporter already does: anchor at the daily
 report's per-unit ENERGY_STORAGE and integrate the measured SCADA output each
 5-minute interval. Charging stores `charge_efficiency x |MW| x dt`, discharging
 deducts MW x dt in full, and a unit absent from SCADA longer than
-MAX_INFER_GAP_HOURS is dropped until a fresh daily report re-anchors it. The
+MAX_INFER_GAP_HOURS is dropped until a fresh daily report re-anchors it. An
+anchor is never stamped forward: an entry's timestamp is the time its value
+actually belongs to, so when a live SCADA step is longer than one poll interval
+the gap is rebuilt from the archived Dispatch_SCADA files (one per 5-minute
+interval) before the live integration continues - a restart mid-morning
+reconstructs the day's charging instead of anchoring at a 04:00 value that is
+hours old and silently claiming it is current. When the archive cannot cover
+the gap (too shallow, too old, or --no-infer-backfill), the series stays absent
+until the next daily report rather than extrapolating the stale anchor. The
 integral is floored at zero - stored energy cannot go negative - so an
 estimate a stale or mis-sign-conventioned anchor drives below zero is pinned at
 empty and flagged rather than silently showing a negative MWh.
@@ -159,7 +167,9 @@ empty and flagged rather than silently showing a negative MWh.
     aemo_battery_inferred_age_seconds{duid}      its age at export time
     aemo_battery_inferred_units                  inferred units being served
     aemo_battery_inferred_clamped_units          ... of them pinned at the zero floor
-    aemo_battery_infer_success                   1/0 (anchor present AND SCADA live)
+    aemo_battery_infer_success                   1/0 (series is actually served)
+    aemo_battery_inferred_anchor_age_seconds     age of the daily anchor interval;
+                                                 large here = stale anchor
     aemo_battery_infer_charge_efficiency         the stored share of charging energy
     aemo_battery_inferred_report_info{file}      the daily report anchoring it
 
@@ -246,6 +256,29 @@ DEFAULT_INFER_CHARGE_EFFICIENCY = 1.0
 # is a guess (a retag, a maintenance cycle, a feed regression), and the inferred
 # line is dropped until the next daily report re-anchors it.
 MAX_INFER_GAP_HOURS = 6.0
+
+# A step of up to an hour is treated as a brief poll hiccup and integrated at
+# the one measured sample we have - the historical behaviour, and roughly what a
+# missed poll or two looks like. Anything longer is a hole whose power shape is
+# unknown: it must be rebuilt from the archived Dispatch_SCADA files one
+# 5-minute interval at a time (see _backfill), or the unit is dropped.
+MAX_INFER_LIVE_STEP_SECONDS = 3600.0
+
+# The archive path (run the arithmetic back the other way: a day has 288
+# 5-minute intervals, so MAX_INFER_GAP_HOURS on a fresh 04:00 anchor means a
+# restart after 04:00 can reconstruct a span of up to a day at ~4 KB a file).
+# Since _reanchor_if_needed resets to that day's report, the span from anchor
+# to now is bounded by the daily cadence itself; 24 h of files plus the anchor
+# is the most a reconstruction ever needs, and the oldest file check refuses a
+# shallower archive rather than extrapolating a stale anchor.
+MAX_INFER_BACKFILL_HOURS = 24.0
+
+# Reconstructing the daily gap from the archive is the difference between a
+# restart mid-day reading empty and reading the true state of charge, but it
+# costs one listing plus up to 288 small zips once per anchor. On by default;
+# --no-infer-backfill disables the archive fetches and the stale series simply
+# stays absent until the next daily report.
+DEFAULT_INFER_BACKFILL = True
 
 # Stored energy cannot be negative, so the SCADA-integrated estimate is floored
 # at zero by default, the same envelope the OE exporter clamps to (its
@@ -419,6 +452,7 @@ def newest_report_file(html: str) -> str:
 # PUBLIC_DISPATCHIS_<YYYYMMDDHHMM>_<seq>.zip. The same rules apply as the daily
 # listing: lexicographic max is chronological and picks up corrections.
 SCADA_FILE_RE = re.compile(r"PUBLIC_DISPATCHSCADA_\d{12}_\d+\.zip")
+SCADA_FILE_NAME_RE = re.compile(r"PUBLIC_DISPATCHSCADA_(\d{12})_\d+\.zip")
 DISPATCHIS_FILE_RE = re.compile(r"PUBLIC_DISPATCHIS_\d{12}_\d+\.zip")
 
 
@@ -431,6 +465,41 @@ def _newest(html: str, pattern: re.Pattern, label: str) -> str:
 
 def newest_scada_file(html: str) -> str:
     return _newest(html, SCADA_FILE_RE, "PUBLIC_DISPATCHSCADA_*.zip")
+
+
+def scada_file_timestamp(name: str) -> float | None:
+    """`PUBLIC_DISPATCHSCADA_<YYYYMMDDHHMM>_<seq>.zip` -> its interval, Unix.
+
+    AEMO names the file for the settlement interval (UTC+10), so the timestamp
+    is recoverable without fetching it; a malformed stamp returns None.
+    """
+    match = SCADA_FILE_NAME_RE.match(name)
+    if not match:
+        return None
+    stamp = match.group(1)
+    try:
+        naive = datetime.strptime(stamp, "%Y%m%d%H%M")
+    except ValueError:
+        return None
+    return naive.replace(tzinfo=timezone(timedelta(seconds=AEST_UTC_OFFSET_SECONDS))).timestamp()
+
+
+def scada_files_in_range(html: str, start_ts: float, end_ts: float) -> list[str]:
+    """Archived Dispatch_SCADA file names whose interval overlaps [start, end].
+
+    Returns ascending; used by the inference backfill to reconstruct the power
+    shape across a gap between a stale anchor and the live measurement. Only the
+    overlap is returned, never the whole page (corrections and the previous days
+    are filtered out by interval).
+    """
+    names = []
+    for name in sorted(set(SCADA_FILE_RE.findall(html))):
+        ts = scada_file_timestamp(name)
+        if ts is None:
+            continue
+        if start_ts <= ts <= end_ts:
+            names.append(name)
+    return names
 
 
 def newest_dispatchis_file(html: str) -> str:
@@ -1010,10 +1079,19 @@ def render_intraday(
             % escape_label(infer.get("file", "")),
         ]
     lines += [
-        "# HELP aemo_battery_infer_success Whether an anchor exists and the last "
-        "SCADA poll supported the inferred series.",
+        "# HELP aemo_battery_infer_success Whether the inferred stored-MWh series "
+        "is being served (fresh anchor, live SCADA, and any anchor gap "
+        "reconstructed from the archive).",
         "# TYPE aemo_battery_infer_success gauge",
         "aemo_battery_infer_success %d" % (1 if infer_ok else 0),
+        "# HELP aemo_battery_inferred_anchor_age_seconds Age of the daily-report "
+        "interval behind the inferred series, at export time. The per-unit "
+        "values advance with SCADA; this is the anchor itself, so a fleet-wide "
+        "stale anchor reads large here even while individual ages look fine.",
+        "# TYPE aemo_battery_inferred_anchor_age_seconds gauge",
+        "aemo_battery_inferred_anchor_age_seconds %s"
+        % fmt(now - (infer or {}).get("anchor_ts")
+              if isinstance((infer or {}).get("anchor_ts"), (int, float)) else None),
         "# HELP aemo_battery_infer_charge_efficiency Share of charging energy "
         "counted as stored when integrating SCADA.",
         "# TYPE aemo_battery_infer_charge_efficiency gauge",
@@ -1315,6 +1393,8 @@ class IntradayPoller:
         daily_report_fn=None,
         charge_efficiency: float = DEFAULT_INFER_CHARGE_EFFICIENCY,
         infer_clamp: bool = DEFAULT_INFER_CLAMP,
+        infer_backfill: bool = DEFAULT_INFER_BACKFILL,
+        infer_backfill_max_hours: float = MAX_INFER_BACKFILL_HOURS,
         infer_state_file: str | None = None,
     ) -> None:
         self.scada_url = scada_url.rstrip("/") + "/"
@@ -1333,8 +1413,18 @@ class IntradayPoller:
         self._daily_report_fn = daily_report_fn
         self.charge_efficiency = charge_efficiency
         self.infer_clamp = infer_clamp
+        self.infer_backfill = infer_backfill
+        self.infer_backfill_max_hours = infer_backfill_max_hours
         self.infer_state_file = infer_state_file
         self._anchor_file: str | None = None
+        # The daily report's newest interval, kept apart from the per-unit ts
+        # (which advances as SCADA is integrated) so the anchor's own age stays
+        # reportable: that is the number that exposes a stale anchor.
+        self._anchor_ts: float | None = None
+        # Whether the current anchor's gap has already been handed to the
+        # archive. None = not tried, a ts = reconstructed up to there, -1.0 =
+        # tried and unusable (do not re-download the archive every cycle).
+        self._backfilled_end: float | None = None
         self._inferred: dict[str, dict] = {}
         if infer_state_file:
             self._load_infer_state()
@@ -1409,10 +1499,19 @@ class IntradayPoller:
             self._last_duration = duration
             self._scada_health = (scada_ok, "" if scada_ok else "Dispatch_SCADA poll failed")
             self._is_health = (region_ok, "" if region_ok else "DispatchIS poll failed")
+        # The inferred side is only "up" when it is actually serving units: an
+        # anchor that exists but whose gap could not be reconstructed serves
+        # nothing, and reporting success there is how a fleet-wide stale anchor
+        # stayed invisible. Success now tracks the served series, not the file.
+        infer_ok = (
+            scada_ok
+            and self._anchor_file is not None
+            and bool(infer.get("units"))
+        )
         return (
             render_intraday(
                 scada_state, scada_ok, is_state, region_ok, duration, finished,
-                infer, scada_ok and self._anchor_file is not None,
+                infer, infer_ok,
             ),
             scada_ok and region_ok,
         )
@@ -1448,9 +1547,16 @@ class IntradayPoller:
     # AEMO publishes no per-unit stored MWh live, so each unit starts from the
     # daily report's per-unit ENERGY_STORAGE and its measured Dispatch_SCADA
     # output is integrated between intervals. A new daily file re-anchors
-    # everything; a unit that first shows up mid-cycle is anchored at first
-    # sighting (no false integration across the earlier unscheduled hours); a
-    # gap longer than MAX_INFER_GAP_HOURS drops the unit until a fresh anchor.
+    # everything. The invariant that keeps the estimate honest: an entry's `ts`
+    # is always the timestamp its value actually belongs to. An anchor keeps the
+    # daily interval's own timestamp - a value from 04:00 is never re-stamped as
+    # if it were measured at 13:00. When a live SCADA step is longer than
+    # MAX_INFER_LIVE_STEP_SECONDS, the hole is rebuilt from the archived
+    # Dispatch_SCADA files
+    # (the backfill); when the archive cannot cover it, the unit is dropped and
+    # stays absent until a fresh daily report re-anchors it, rather than
+    # extrapolating a stale anchor. A gap longer than MAX_INFER_GAP_HOURS that
+    # survives all that is dropped the same way.
 
     def _current_daily(self) -> dict:
         if self._daily_report_fn is None:
@@ -1485,6 +1591,8 @@ class IntradayPoller:
             return False
         self._inferred = anchored
         self._anchor_file = file_name
+        self._anchor_ts = max((u["ts"] for u in anchored.values()), default=None)
+        self._backfilled_end = None
         log.info("inference re-anchored to %s (%d units)", file_name, len(anchored))
         return True
 
@@ -1506,11 +1614,159 @@ class IntradayPoller:
         mwh = max(0.0, raw) if self.infer_clamp else raw
         return mwh, clamped
 
+    def _advance_entry(self, entry: dict, ts: float, power: float) -> dict:
+        """Integrate one measured 5-minute power step into the inferred entry.
+
+        Shared by the live advance and the archive backfill. A step that does
+        not move the clock returns the entry unchanged, so re-sent or out-of-
+        order archive rows never double-count.
+        """
+        delta_hours = (ts - entry["ts"]) / 3600.0
+        if delta_hours <= 0:
+            return entry
+        if power > 0:
+            delta = -power * delta_hours
+        else:
+            delta = -power * delta_hours * self.charge_efficiency
+        mwh, clamped = self._clamp_inferred(entry["mwh"] + delta)
+        return {"ts": ts, "mwh": mwh, "clamped": clamped}
+
+    def _backfill_if_stale(self, end_ts: float | None, now: float) -> None:
+        """Reconstruct any anchor->live gap from the SCADA archive, once.
+
+        `end_ts` is the newest measured interval this cycle. A step within
+        MAX_INFER_LIVE_STEP_SECONDS is normal poll-to-poll integration and
+        needs no archive; anything longer needs the gap rebuilt one 5-minute
+        interval at a time. The reconstruction runs at most once per anchor -
+        re-downloading the archive every 5 minutes for the same stale anchor
+        would be both spammy and pointless, and a failed reconstruction leaves
+        the series absent (honest) until the next daily report.
+        """
+        if end_ts is None or not self._inferred:
+            return
+        if self._backfilled_end is not None:
+            return
+        trunk = min((u["ts"] for u in self._inferred.values()))
+        if end_ts - trunk <= MAX_INFER_LIVE_STEP_SECONDS:
+            self._backfilled_end = end_ts
+            return
+        if not self.infer_backfill:
+            self._backfilled_end = -1.0
+            log.info(
+                "inference: anchor %s is %.1fh behind SCADA and backfill is "
+                "disabled; the inferred series stays absent until a fresh "
+                "daily report",
+                self._anchor_file, (end_ts - trunk) / 3600.0,
+            )
+            return
+        advanced, complete = self._backfill(end_ts)
+        self._backfilled_end = end_ts if complete else -1.0
+
+    def _backfill(self, end_ts: float) -> tuple[int, bool]:
+        """Integrate the archived Dispatch_SCADA files across the anchor gap.
+
+        Returns (units_advanced, complete). `complete` False means the archive
+        could not be read or does not reach back to the anchor; the caller then
+        leaves units at their anchor timestamps and the age gate drops them -
+        a stale anchor is never stamped forward, and a partially covered hole
+        is never extrapolated from the anchor.
+        """
+        anchor_ts = min((u["ts"] for u in self._inferred.values()), default=None)
+        if anchor_ts is None:
+            return 0, False
+        span = end_ts - anchor_ts
+        if span <= 0:
+            return 0, True
+        if span > self.infer_backfill_max_hours * 3600.0:
+            log.info(
+                "inference: anchor %s too old to reconstruct (%.1fh); staying absent",
+                self._anchor_file, span / 3600.0,
+            )
+            return 0, False
+        try:
+            listing = http_get(
+                self.scada_url, self.timeout, self.retries, self.retry_budget
+            )
+            names = scada_files_in_range(listing.decode("utf-8", "replace"), anchor_ts, end_ts)
+        except (ScrapeError, ValueError, KeyError, TypeError, OSError) as exc:
+            log.warning("inference backfill: could not read %s: %s", self.scada_url, exc)
+            return 0, False
+        if not names:
+            log.warning("inference backfill: no Dispatch_SCADA files cover %.1fh-%s",
+                        anchor_ts, end_ts)
+            return 0, False
+        oldest_ts = scada_file_timestamp(names[0])
+        if oldest_ts is not None and oldest_ts > anchor_ts + 2 * 300.0:
+            log.warning(
+                "inference backfill: archive only reaches %.1fh ago, cannot bridge "
+                "the %.1fh gap; series stays absent",
+                (end_ts - oldest_ts) / 3600.0, span / 3600.0,
+            )
+            return 0, False
+        advanced = 0
+        failures = 0
+        for name in names:
+            try:
+                payload = http_get(
+                    urllib.parse.urljoin(self.scada_url, name),
+                    self.timeout, self.retries, self.retry_budget,
+                )
+                report = parse_dispatch_scada(payload)
+            except (ScrapeError, OSError, ValueError) as exc:
+                failures += 1
+                log.debug("inference backfill: %s failed: %s", name, exc)
+                if failures >= 3:
+                    break
+                continue
+            for duid, u in report["units"].items():
+                entry = self._inferred.get(duid)
+                if entry is None:
+                    continue
+                stepped = self._advance_entry(entry, u["ts"], u["scada"])
+                if stepped is not entry:
+                    self._inferred[duid] = stepped
+                    advanced += 1
+        log.info(
+            "inference: backfilled the %.1fh anchor gap from %d archive files "
+            "(%d unit steps)",
+            span / 3600.0, len(names), advanced,
+        )
+        return advanced, True
+
     def _advance_inference(self, scada_units: dict, now: float) -> None:
         """Integrate one 5-minute SCADA snapshot into the inferred state."""
         daily = self._current_daily()
         self._reanchor_if_needed(daily)
         daily_units = daily.get("units") or {}
+        # First sightings are anchored at the daily interval's *own* timestamp,
+        # never stamped forward: a value from 04:00 must not claim to be current
+        # at 13:00. The archive backfill below is what actually carries a stale
+        # anchor up to the live interval; a unit it cannot carry stays at its
+        # anchor ts and is dropped by the age gate.
+        end_ts: float | None = None
+        for duid, u in scada_units.items():
+            if not isinstance(duid, str) or not isinstance(u, dict):
+                continue
+            try:
+                ts = float(u["ts"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            if end_ts is None or ts > end_ts:
+                end_ts = ts
+            if duid in self._inferred:
+                continue
+            entry = daily_units.get(duid)
+            if (
+                isinstance(entry, dict)
+                and isinstance(entry.get("energy"), (int, float))
+                and isinstance(entry.get("ts"), (int, float))
+                and float(entry["ts"]) > 0
+            ):
+                mwh, clamped = self._clamp_inferred(float(entry["energy"]))
+                self._inferred[duid] = {
+                    "ts": float(entry["ts"]), "mwh": mwh, "clamped": clamped,
+                }
+        self._backfill_if_stale(end_ts, now)
         for duid, u in scada_units.items():
             if not isinstance(duid, str) or not isinstance(u, dict):
                 continue
@@ -1521,32 +1777,32 @@ class IntradayPoller:
                 continue
             current = self._inferred.get(duid)
             if current is None:
-                entry = daily_units.get(duid)
-                if (
-                    isinstance(entry, dict)
-                    and isinstance(entry.get("energy"), (int, float))
-                    and isinstance(entry.get("ts"), (int, float))
-                    and float(entry["ts"]) > 0
-                ):
-                    mwh, clamped = self._clamp_inferred(float(entry["energy"]))
-                    self._inferred[duid] = {"ts": ts, "mwh": mwh, "clamped": clamped}
                 continue
             delta_hours = (ts - current["ts"]) / 3600.0
             if delta_hours <= 0:
                 continue
+            delta_seconds = delta_hours * 3600.0
             if delta_hours > MAX_INFER_GAP_HOURS:
                 self._inferred.pop(duid, None)
                 continue
-            if power > 0:
-                delta = -power * delta_hours
-            else:
-                delta = -power * delta_hours * self.charge_efficiency
-            mwh, clamped = self._clamp_inferred(current["mwh"] + delta)
-            self._inferred[duid] = {"ts": ts, "mwh": mwh, "clamped": clamped}
+            if (
+                delta_seconds > MAX_INFER_LIVE_STEP_SECONDS
+                and (
+                    self._backfilled_end == -1.0
+                    or (self._anchor_ts is not None and current["ts"] <= self._anchor_ts)
+                )
+            ):
+                # The anchor gap could not be reconstructed for this unit (archive
+                # too shallow, backfill disabled, or the archive never carried the
+                # unit): integrating it in one step would stamp a stale anchor
+                # forward, so the unit is dropped instead.
+                self._inferred.pop(duid, None)
+                continue
+            self._inferred[duid] = self._advance_entry(current, ts, power)
         self._prune_stale(now)
 
     def _infer_view(self, now: float) -> dict:
-        """Snapshot for rendering: live units only, offset by clock if needed."""
+        """Snapshot for rendering: live units only, plus the anchor's age."""
         limit = now - MAX_INFER_GAP_HOURS * 3600.0
         with self._lock:
             anchor = self._anchor_file
@@ -1557,6 +1813,7 @@ class IntradayPoller:
             }
         return {
             "file": anchor or "",
+            "anchor_ts": self._anchor_ts,
             "units": inferred,
             "efficiency": self.charge_efficiency,
         }
@@ -1588,6 +1845,8 @@ class IntradayPoller:
         if not clean:
             return
         self._anchor_file = anchor
+        anchor_ts = payload.get("anchor_ts")
+        self._anchor_ts = float(anchor_ts) if isinstance(anchor_ts, (int, float)) else None
         self._inferred = clean
 
     def _save_infer_state(self) -> None:
@@ -1598,6 +1857,7 @@ class IntradayPoller:
             tmp = self.infer_state_file + ".tmp"
             payload = {
                 "anchor_file": self._anchor_file,
+                "anchor_ts": self._anchor_ts,
                 "saved_at": self.now_fn(),
                 "units": {
                     d: {"ts": u["ts"], "mwh": u["mwh"], "clamped": u.get("clamped", 0.0)}
@@ -1775,6 +2035,28 @@ def main(argv: list[str] | None = None) -> int:
         "floored; the clamped flag keeps reporting it either way",
     )
     parser.add_argument(
+        "--infer-backfill",
+        action="store_true",
+        default=DEFAULT_INFER_BACKFILL,
+        help="rebuild an anchor-to-live SCADA gap from the archived "
+        "Dispatch_SCADA files instead of serving nothing (default true)",
+    )
+    parser.add_argument(
+        "--no-infer-backfill",
+        action="store_false",
+        dest="infer_backfill",
+        help="never fetch archive files for reconstruction; a stale anchor "
+        "simply leaves the inferred series absent until the next daily report",
+    )
+    parser.add_argument(
+        "--infer-backfill-max-hours",
+        type=float,
+        default=MAX_INFER_BACKFILL_HOURS,
+        help="the oldest anchor gap that may be reconstructed from the archive "
+        "(default %g; a daily anchor is bounded by the daily cadence anyway)"
+        % MAX_INFER_BACKFILL_HOURS,
+    )
+    parser.add_argument(
         "--infer-state-file",
         help="JSON file persisting the integrated per-unit stored MWh, so a "
         "restart does not re-anchor the day's drift to the daily report.",
@@ -1843,6 +2125,8 @@ def main(argv: list[str] | None = None) -> int:
         daily_report_fn=scraper.daily_report,
         charge_efficiency=args.infer_charge_efficiency,
         infer_clamp=args.infer_clamp,
+        infer_backfill=args.infer_backfill,
+        infer_backfill_max_hours=args.infer_backfill_max_hours,
         infer_state_file=args.infer_state_file,
     )
 

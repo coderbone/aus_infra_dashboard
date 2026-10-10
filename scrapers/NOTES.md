@@ -1465,6 +1465,35 @@ dispatch interval. Verified against the live site on 2026-10-08:
   not roll the day's drift back to the previous anchor. Inference is only served
   when SCADA is live this cycle and a daily anchor exists (see
   `aemo_battery_infer_success`).
+- **A stale anchor is never stamped forward — that was a real bug.** A restart
+  mid-afternoon re-anchors at the 04:00 daily interval. The first cut integrated
+  the whole 9-hour gap with *one* instantaneous power sample and stamped the
+  result at the current SCADA time: a nine-hour-old measurement wearing a fresh
+  timestamp, and ~9 GWh low across the fleet (the unit then fell out of the
+  window and re-anchored at the stale value at the next SCADA timestamp,
+  repeating the lie). The invariant now is that an entry's timestamp is always
+  the instant its value belongs to. A step of up to `MAX_INFER_LIVE_STEP_SECONDS`
+  (1h) is treated as a poll hiccup and integrated at the one sample we have;
+  anything longer is a gap whose power shape is unknown and must be rebuilt from
+  the archive (below) or the unit is dropped — never single-sampled.
+- **The anchor gap is rebuilt from the `Dispatch_SCADA` archive.** When the
+  anchored units are more than a live step behind the newest SCADA interval, the
+  poller lists `https://nemweb.com.au/Reports/Current/Dispatch_SCADA/`, picks
+  every current-day file whose filename interval falls in the gap, and integrates
+  them oldest-first through the same `_advance_entry` step the live loop uses, so
+  the reconstruction is arithmetic-identical to a live run. It runs once per
+  anchor (tracked in `_backfilled_end`), refuses if the archive's oldest file
+  does not reach back to the anchor, and caps the span at
+  `--infer-backfill-max-hours` (default 24h). Failure at any point — listing
+  404s, a zip that will not read, too-shallow archive, `--no-infer-backfill` —
+  leaves the series absent rather than fabricated, which is what
+  `aemo_battery_infer_success 0` reports.
+- **The anchor's age is a first-class metric.** `aemo_battery_inferred_anchor_age_seconds`
+  reports how old the daily interval the estimates integrate away from is. A
+  growing value with `aemo_battery_infer_success 1` means the series is still
+  being served but is drifting on an old anchor; `infer_success 0` with a large
+  anchor age is the honest-absence state (the archive could not bridge the gap).
+  Alert on the pair, not on `aemo_battery_inferred_units` alone.
 - **The inferred MWh is floored at zero.** Stored energy cannot go negative, so
   a raw integral a stale or mis-signed anchor drives below zero is pinned at 0
   (default `--infer-clamp`; `--no-infer-clamp` serves the raw drift instead),
@@ -1492,3 +1521,15 @@ dispatch interval. Verified against the live site on 2026-10-08:
   UNIT_SOLUTION, no energy storage (checked an intraday capture byte-for-byte).
   Nothing per-DUID lives in the intraday dispatch file; the measured output is
   in `Dispatch_SCADA` and the region storage in `DispatchIS_Reports`.
+- **The "current" `Dispatch_SCADA` listing is not an infinite archive.** It
+  publishes one file per 5-minute interval and retains current-day files, but
+  retention is not guaranteed to reach a mid-morning anchor. The backfill
+  deliberately treats a gap the archive cannot cover as "unknown" and serves
+  nothing. If a fleet restart routinely falls outside the archive's reach, add a
+  nightly anchor refresh (the archive caps at `--infer-backfill-max-hours`
+  precisely so a stale anchor is never silently extrapolated).
+- **The backfill must not fight the live state.** `_backfilled_end` guards the
+  once-per-anchor rule, and the live loop drops (rather than re-integrates) a
+  unit whose anchor gap the archive failed to close — otherwise the stale anchor
+  would come back through the back door as a one-step integration. The regression
+  test `test_a_stale_anchor_is_never_stamped_forward` pins this.

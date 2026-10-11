@@ -12,4 +12,10 @@
    exporter polls hourly on its own schedule and serves Prometheus from the last completed
    cycle. See scrapers/NOTES.md, "OpenElectricity NEM batteries — audited 2026-09-30", and
    NOTES.md section 9.
+4. expose transmission line capacity and load on the AEMO exporter. Done 2026-10-11 for the
+   interconnectors: `DISPATCH,INTERCONNECTORRES` in the DispatchIS zip already downloaded
+   every 5 minutes yields `MWFLOW`/`METEREDMWFLOW` and `EXPORTLIMIT`/`IMPORTLIMIT` (carried
+   verbatim, AEMO's sign convention) as `aemo_interconnector_*`. Intra-regional line loading
+   is not published by AEMO at all and remains impossible; binding constraint IDs and the
+   locally-constrained flags are still noted as future work. See scrapers/NOTES.md.
 

@@ -59,9 +59,9 @@ charts them in Grafana:
 > takes the mean error across the full daytime gap from 11.3% to 7.4% of
 > capacity and leaves the one-hour case untouched.
 
-- `docker-compose.yml` — the six services (`tbm-exporter`,
+- `docker-compose.yml` — the seven services (`tbm-exporter`,
   `reservoir-exporter`, `battery-exporter`, `aemobattery-exporter`,
-  `prometheus`, `grafana`)
+  `webmap`, `prometheus`, `grafana`)
 - `prometheus.yml` — scrape configs, targets `tbm-exporter:9109`,
   `reservoir-exporter:9110`, `battery-exporter:9111` and
   `aemobattery-exporter:9112`
@@ -97,6 +97,7 @@ The stack is on the `aus_infra_dashboard_monitoring` bridge network:
 | `reservoir-exporter` | not published — only Prometheus needs it |
 | `battery-exporter` | not published — only Prometheus needs it |
 | `aemobattery-exporter` | not published — only Prometheus needs it |
+| `webmap` | `http://192.168.1.100:9119` (standalone NEM map) |
 | `prometheus` | `http://192.168.1.100:9090` |
 | `grafana` | `http://192.168.1.100:3000` |
 

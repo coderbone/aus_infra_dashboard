@@ -1,0 +1,85 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": { "kind": "interconnector", "id": "NSW1-QLD1", "name": "QNI (Queensland\u2011New South Wales)" },
+      "geometry": { "type": "LineString", "coordinates": [[151.7, -30.5], [151.2, -28.6], [151.9, -27.1]] }
+    },
+    {
+      "type": "Feature",
+      "properties": { "kind": "mnsp", "id": "N-Q-MNSP1", "name": "Directlink (Terranora HVDC)" },
+      "geometry": { "type": "LineString", "coordinates": [[153.45, -28.4], [153.3, -28.2], [153.5, -28.1]] }
+    },
+    {
+      "type": "Feature",
+      "properties": { "kind": "interconnector", "id": "VIC1-NSW1", "name": "New South Wales\u2011Victoria" },
+      "geometry": { "type": "LineString", "coordinates": [[149.0, -35.1], [148.2, -36.0], [147.5, -36.5], [147.4, -36.9]] }
+    },
+    {
+      "type": "Feature",
+      "properties": { "kind": "interconnector", "id": "V-SA", "name": "Heywood (Victoria\u2011South Australia)" },
+      "geometry": { "type": "LineString", "coordinates": [[141.6, -38.2], [140.9, -37.5], [140.3, -36.6], [139.2, -35.2]] }
+    },
+    {
+      "type": "Feature",
+      "properties": { "kind": "mnsp", "id": "T-V-MNSP1", "name": "Murraylink (HVDC)" },
+      "geometry": { "type": "LineString", "coordinates": [[142.2, -34.3], [140.6, -34.3]] }
+    },
+    {
+      "type": "Feature",
+      "properties": { "kind": "mnsp", "id": "V-S-MNSP1", "name": "Victoria\u2011South Australia MNSP" },
+      "geometry": { "type": "LineString", "coordinates": [[140.0, -37.3], [139.0, -36.6], [138.6, -36.0]] }
+    },
+    {
+      "type": "Feature",
+      "properties": { "kind": "interconnector", "id": "NSW1-SA1", "name": "South Australia\u2011New South Wales (EnergyConnect)" },
+      "geometry": { "type": "LineString", "coordinates": [[138.9, -34.0], [140.0, -34.4], [142.2, -34.1]] }
+    },
+    {
+      "type": "Feature",
+      "properties": { "kind": "snowy", "id": "SNOWY", "name": "Snowy 2.0 (Tantangara\u2011Talbingo)" },
+      "geometry": { "type": "LineString", "coordinates": [[148.65, -35.8], [148.5, -35.9], [148.4, -35.6]] }
+    },
+    {
+      "type": "Feature",
+      "properties": { "kind": "schematic", "id": "nsw-coast", "name": "NSW coastal trunk" },
+      "geometry": { "type": "LineString", "coordinates": [[151.2, -33.9], [151.8, -32.9], [152.6, -31.4], [153.1, -30.3]] }
+    },
+    {
+      "type": "Feature",
+      "properties": { "kind": "schematic", "id": "nsw-inland", "name": "NSW inland spine" },
+      "geometry": { "type": "LineString", "coordinates": [[151.2, -33.9], [150.2, -33.5], [149.0, -33.0], [148.7, -32.5]] }
+    },
+    {
+      "type": "Feature",
+      "properties": { "kind": "schematic", "id": "qld-coast", "name": "QLD coastal corridor" },
+      "geometry": { "type": "LineString", "coordinates": [[153.0, -27.5], [152.5, -25.0], [150.5, -23.4]] }
+    },
+    {
+      "type": "Feature",
+      "properties": { "kind": "schematic", "id": "qld-sw", "name": "QLD south-west generation" },
+      "geometry": { "type": "LineString", "coordinates": [[153.0, -27.5], [151.6, -27.0], [150.7, -27.6]] }
+    },
+    {
+      "type": "Feature",
+      "properties": { "kind": "schematic", "id": "vic-latrobe", "name": "VIC Latrobe Valley\u2011Melbourne" },
+      "geometry": { "type": "LineString", "coordinates": [[147.0, -38.2], [146.3, -38.2], [145.3, -38.0], [144.7, -37.8]] }
+    },
+    {
+      "type": "Feature",
+      "properties": { "kind": "schematic", "id": "vic-sw", "name": "VIC south-west corridor" },
+      "geometry": { "type": "LineString", "coordinates": [[144.7, -37.8], [142.5, -38.5], [141.6, -38.2]] }
+    },
+    {
+      "type": "Feature",
+      "properties": { "kind": "schematic", "id": "sa-north", "name": "SA northern corridor" },
+      "geometry": { "type": "LineString", "coordinates": [[138.6, -34.9], [138.5, -33.2], [138.0, -32.0]] }
+    },
+    {
+      "type": "Feature",
+      "properties": { "kind": "schematic", "id": "tas-chain", "name": "TAS north\u2011south" },
+      "geometry": { "type": "LineString", "coordinates": [[147.3, -42.8], [147.0, -41.5]] }
+    }
+  ]
+}

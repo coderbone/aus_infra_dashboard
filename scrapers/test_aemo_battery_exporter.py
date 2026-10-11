@@ -256,8 +256,13 @@ def region_header():
     return row
 
 
-def is_zip(name=IS_CSV, rows=()):
-    return make_zip(name, [region_header(), *rows])
+def is_zip(name=IS_CSV, rows=(), interconnector_rows=None):
+    if interconnector_rows is None:
+        interconnector_rows = interconnector_sample_rows()
+    return make_zip(
+        name,
+        [region_header(), *rows, interconnector_header(), *interconnector_rows],
+    )
 
 
 def is_sample_rows():
@@ -283,6 +288,88 @@ def is_sample_rows():
         # skipped by the storage map. Its renewables do curtail, but this row
         # leaves SS blank to keep the "TAS1 is absent" render assertions exact.
         region_sum_row("D", "2026/10/08 15:20:00", "TAS1", "", ""),
+    ]
+
+
+def interconnector_row(
+    kind, timestamp="2026/10/08 15:20:00", interconnector="NSW1-QLD1",
+    metered="", flow="", losses="", marginal_value="", violation="",
+    export_limit="", import_limit="", marginal_loss="",
+):
+    """A DISPATCH,INTERCONNECTORRES row at the verified column positions
+    (SETTLEMENTDATE 4, INTERCONNECTORID 6, METEREDMWFLOW 9, MWFLOW 10,
+    MWLOSSES 11, MARGINALVALUE 12, VIOLATIONDEGREE 13, EXPORTLIMIT 15,
+    IMPORTLIMIT 16, MARGINALLOSS 17 of a 26-column row)."""
+    cells = [""] * 26
+    cells[0] = kind
+    cells[1] = "DISPATCH"
+    cells[2] = "INTERCONNECTORRES"
+    cells[3] = "1"
+    cells[4] = timestamp
+    cells[5] = "123"  # RUNNO
+    cells[6] = interconnector
+    cells[7] = "10"  # DISPATCHINTERVAL
+    cells[8] = "0"  # INTERVENTION
+    cells[9] = metered
+    cells[10] = flow
+    cells[11] = losses
+    cells[12] = marginal_value
+    cells[13] = violation
+    cells[14] = "2026/10/08 15:24:00"  # LASTCHANGED
+    cells[15] = export_limit
+    cells[16] = import_limit
+    cells[17] = marginal_loss
+    return cells
+
+
+def interconnector_header():
+    row = interconnector_row("I")
+    row[4] = "SETTLEMENTDATE"
+    row[5] = "RUNNO"
+    row[6] = "INTERCONNECTORID"
+    row[7] = "DISPATCHINTERVAL"
+    row[8] = "INTERVENTION"
+    row[9] = "METEREDMWFLOW"
+    row[10] = "MWFLOW"
+    row[11] = "MWLOSSES"
+    row[12] = "MARGINALVALUE"
+    row[13] = "VIOLATIONDEGREE"
+    row[14] = "LASTCHANGED"
+    row[15] = "EXPORTLIMIT"
+    row[16] = "IMPORTLIMIT"
+    row[17] = "MARGINALLOSS"
+    return row
+
+
+def interconnector_sample_rows():
+    # The numbers are the upstream's own, read from the DISPATCH,INTERCONNECTORRES
+    # table of the live 2026-10-11 DispatchIS file and carried here at the
+    # fixture's SCADA_TS stamp. NSW1-QLD1 flows away from NSW (negative under
+    # AEMO's convention) with a metered differ by 59 MW; VIC1-NSW1 binds on its
+    # export limit (MWFLOW == EXPORTLIMIT); T-V-MNSP1 reports both limits
+    # negative - AEMO's own sign, and the reason limits are carried verbatim.
+    return [
+        interconnector_row(
+            "D", interconnector="NSW1-QLD1",
+            metered="-867.49219", flow="-926.72489", losses="21.43",
+            marginal_value="0.5", violation="0",
+            export_limit="864.09094", import_limit="-1185",
+            marginal_loss="0.86235",
+        ),
+        interconnector_row(
+            "D", interconnector="VIC1-NSW1",
+            metered="590.01123", flow="690.80116", losses="17.22",
+            marginal_value="2.0", violation="0",
+            export_limit="690.80116", import_limit="-595.36292",
+            marginal_loss="0.74122",
+        ),
+        interconnector_row(
+            "D", interconnector="T-V-MNSP1",
+            metered="22.5", flow="33.1", losses="0.1",
+            marginal_value="1.0", violation="0",
+            export_limit="-185", import_limit="-220",
+            marginal_loss="0.5",
+        ),
     ]
 
 
@@ -1100,6 +1187,73 @@ class ParseDispatchIsTest(unittest.TestCase):
         self.assertIn("NSW1", parsed["regions"])
 
 
+class ParseInterconnectorTest(unittest.TestCase):
+    def parsed(self, ic_rows=None):
+        if ic_rows is None:
+            ic_rows = interconnector_sample_rows()
+        return exporter.parse_dispatchis_interconnectors(
+            make_zip(IS_CSV, [interconnector_header(), *ic_rows])
+        )
+
+    def test_flow_and_metered_flow_carry_the_sign(self):
+        ic = self.parsed()["interconnectors"]["NSW1-QLD1"]
+        self.assertAlmostEqual(ic["mwflow"], -926.72489, places=4)
+        self.assertAlmostEqual(ic["metered_mwflow"], -867.49219, places=4)
+        self.assertEqual(ic["ts"], SCADA_TS)
+
+    def test_limits_are_carried_verbatim_never_normalized(self):
+        ic = self.parsed()["interconnectors"]
+        # VIC1-NSW1 binds on export: flow equals the export limit, but the
+        # import limit is AEMO's own negative number, not a mirror image.
+        vic = ic["VIC1-NSW1"]
+        self.assertAlmostEqual(vic["mwflow"], 690.80116, places=4)
+        self.assertAlmostEqual(vic["export_limit"], 690.80116, places=4)
+        self.assertAlmostEqual(vic["import_limit"], -595.36292, places=4)
+        # T-V-MNSP1 reports BOTH limits negative; a normalization scheme would
+        # flip one of them.
+        mnsp = ic["T-V-MNSP1"]
+        self.assertAlmostEqual(mnsp["export_limit"], -185.0, places=4)
+        self.assertAlmostEqual(mnsp["import_limit"], -220.0, places=4)
+
+    def test_losses_and_marginals(self):
+        ic = self.parsed()["interconnectors"]["NSW1-QLD1"]
+        self.assertAlmostEqual(ic["losses"], 21.43, places=4)
+        self.assertAlmostEqual(ic["marginal_value"], 0.5, places=4)
+        self.assertAlmostEqual(ic["marginal_loss"], 0.86235, places=4)
+        self.assertAlmostEqual(ic["violation_degree"], 0.0, places=4)
+
+    def test_newest_stamp_wins_per_interconnector(self):
+        rows = [
+            interconnector_row("D", "2026/10/08 15:20:00", "NSW1-QLD1", flow="-900.0"),
+            interconnector_row("D", "2026/10/08 15:25:00", "NSW1-QLD1", flow="-901.0"),
+        ]
+        parsed = self.parsed(rows)
+        self.assertAlmostEqual(parsed["interconnectors"]["NSW1-QLD1"]["mwflow"], -901.0, places=4)
+        self.assertEqual(parsed["newest_interval"], SCADA_TS + 300.0)
+
+    def test_a_missing_optional_column_reads_none_not_a_crash(self):
+        header = interconnector_header()
+        for name in ("MWLOSSES", "MARGINALLOSS", "VIOLATIONDEGREE"):
+            header[header.index(name)] = ""
+        rows = [interconnector_row(
+            "D", flow="-1.0", export_limit="10", import_limit="-10",
+        )]
+        parsed = exporter.parse_dispatchis_interconnectors(
+            make_zip(IS_CSV, [header, *rows])
+        )
+        ic = parsed["interconnectors"]["NSW1-QLD1"]
+        self.assertAlmostEqual(ic["mwflow"], -1.0, places=4)
+        self.assertIsNone(ic["losses"])
+        self.assertIsNone(ic["marginal_loss"])
+        self.assertIsNone(ic["violation_degree"])
+
+    def test_no_interconnector_rows_is_a_scrape_error(self):
+        with self.assertRaises(exporter.ScrapeError):
+            exporter.parse_dispatchis_interconnectors(
+                make_zip(IS_CSV, [interconnector_header()])
+            )
+
+
 # --------------------------------------------------------------------------- #
 # render_intraday
 # --------------------------------------------------------------------------- #
@@ -1111,6 +1265,9 @@ class RenderIntradayTest(unittest.TestCase):
         self.scada = exporter.parse_dispatch_scada(SCADA_SAMPLE_ZIP)
         self.scada["file"] = SCADA_ZIP
         self.isr = exporter.parse_dispatchis_region_storage(IS_SAMPLE_ZIP)
+        self.isr["interconnectors"] = exporter.parse_dispatchis_interconnectors(
+            IS_SAMPLE_ZIP
+        )["interconnectors"]
         self.isr["file"] = IS_ZIP
 
     def text(self):
@@ -1212,6 +1369,53 @@ class RenderIntradayTest(unittest.TestCase):
         text = exporter.render_intraday(self.scada, False, self.isr, True, 1.5, self.now)
         self.assertNotIn("aemo_battery_region_fossil_generation_mw", text)
 
+    def test_interconnector_flow_and_limits_render_verbatim(self):
+        text = self.text()
+        flow = next(
+            l for l in lines_named(text, "aemo_interconnector_flow_mw")
+            if 'interconnector="NSW1-QLD1"' in l
+        )
+        self.assertAlmostEqual(float(flow.rsplit(" ", 1)[1]), -926.72489, places=4)
+        exp = next(
+            l for l in lines_named(text, "aemo_interconnector_export_limit_mw")
+            if 'interconnector="NSW1-QLD1"' in l
+        )
+        self.assertAlmostEqual(float(exp.rsplit(" ", 1)[1]), 864.09094, places=4)
+        imp = next(
+            l for l in lines_named(text, "aemo_interconnector_import_limit_mw")
+            if 'interconnector="T-V-MNSP1"' in l
+        )
+        self.assertAlmostEqual(float(imp.rsplit(" ", 1)[1]), -220.0, places=4)
+        self.assertIn(
+            'aemo_interconnector_export_limit_mw{interconnector="VIC1-NSW1"} 690.8012',
+            text,
+        )
+
+    def test_interconnector_age_is_computed_from_now(self):
+        text = self.text()
+        line = next(
+            l for l in lines_named(text, "aemo_interconnector_age_seconds")
+            if 'interconnector="VIC1-NSW1"' in l
+        )
+        self.assertAlmostEqual(float(line.rsplit(" ", 1)[1]), self.now - SCADA_TS, places=3)
+
+    def test_interconnector_report_info_and_count(self):
+        text = self.text()
+        self.assertIn('aemo_interconnector_report_info{file="%s"} 1' % IS_ZIP, text)
+        self.assertIn("aemo_interconnector_count 3", text)
+
+    def test_an_empty_interconnector_table_renders_count_zero(self):
+        self.isr["interconnectors"] = {}
+        text = self.text()
+        self.assertNotIn("aemo_interconnector_flow_mw", text)
+        self.assertIn('aemo_interconnector_report_info{file="%s"} 1' % IS_ZIP, text)
+        self.assertIn("aemo_interconnector_count 0", text)
+
+    def test_a_failed_dispatchis_read_omits_interconnectors(self):
+        text = exporter.render_intraday(self.scada, True, self.isr, False, 1.5, self.now)
+        self.assertNotIn("aemo_interconnector_flow_mw", text)
+        self.assertNotIn("aemo_interconnector_count", text)
+
 
 # --------------------------------------------------------------------------- #
 # Intraday poller
@@ -1239,6 +1443,8 @@ class IntradayPollerTest(unittest.TestCase):
         self.assertNotIn('duid="DPNTB1"', body)
         self.assertIn('aemo_battery_region_stored_mwh{region="NSW1"}', body)
         self.assertIn("aemo_battery_scada_success 1", body)
+        self.assertIn('aemo_interconnector_flow_mw{interconnector="NSW1-QLD1"}', body)
+        self.assertIn("aemo_interconnector_count 3", body)
 
     def test_batteries_are_learned_from_the_daily_scraper(self):
         fetcher = self.battery_fetcher()
@@ -1314,6 +1520,20 @@ class IntradayPollerTest(unittest.TestCase):
         self.assertIn("aemo_battery_dispatchis_success 0", body)
         self.assertNotIn("aemo_battery_region_stored_mwh", body)
         self.assertIn('aemo_battery_power_mw{duid="ERB01"}', body)
+
+    def test_a_zip_without_the_interconnector_table_keeps_regions(self):
+        # The DISPATCH,INTERCONNECTORRES table can be missing or unparsable
+        # without the region storage series suffering; the interconnector
+        # series is gated on its own table and the count makes the gap visible.
+        fetcher = IntradayFetcher(
+            scada_zips={SCADA_ZIP: SCADA_SAMPLE_ZIP},
+            is_zips={IS_ZIP: is_zip(rows=is_sample_rows(), interconnector_rows=())},
+        )
+        poller, body, ok = polled_intraday(fetcher, battery_duids={"WTAHB1"})
+        self.assertTrue(ok)
+        self.assertIn('aemo_battery_region_stored_mwh{region="NSW1"}', body)
+        self.assertNotIn("aemo_interconnector_flow_mw", body)
+        self.assertIn("aemo_interconnector_count 0", body)
 
     def test_exposition_serves_the_last_cycle(self):
         fetcher = self.battery_fetcher()

@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NEM map</title>
+<link rel="stylesheet" href="/static/lib/leaflet/leaflet.css">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="map"></div>
+
+<div id="header">
+  <div id="title">NEM map</div>
+  <div id="status"><span id="st-time">–</span> <span id="st-prom">–</span></div>
+</div>
+
+<div id="panel">
+  <label class="opt">Region fill
+    <select id="region-metric">
+      <option value="stored" selected>Battery stored MWh</option>
+      <option value="fossil">Fossil generation MW</option>
+      <option value="curtail">Curtailment MW</option>
+      <option value="none">Off</option>
+    </select>
+  </label>
+  <label class="opt chk"><input type="checkbox" id="tog-schematic" checked> schematic lines</label>
+  <label class="opt chk"><input type="checkbox" id="tog-unmonitored" checked> unmonitored batteries</label>
+</div>
+
+<div id="legend"></div>
+
+<script src="/static/lib/leaflet/leaflet.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

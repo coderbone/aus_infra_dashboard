@@ -137,7 +137,7 @@ python3 -m unittest discover -s scrapers -t scrapers -v
 ./scrapers/test_wht_tbm_exporter.py                         # equivalent
 ```
 
-136 tests in this file (726 for all four exporters), about 15 seconds, **no network
+136 tests in this file (738 for all four exporters), about 15 seconds, **no network
 access** — every upstream response is
 replayed from `scrapers/fixtures/`, captured verbatim from ArcGIS on
 2026-09-29. Verified offline by re-running with `socket.getaddrinfo` and every
@@ -952,13 +952,15 @@ Two feeds from AEMO's NEMWEB archive, both free and anonymous, exposing
   day, published the previous evening; use the freshness metrics, not the scrape
   timestamp, to judge age.
 - **Intraday** — `Dispatch_SCADA` (measured output MW per unit, every 5-minute
-  interval) and `DispatchIS_Reports` (region-level `BDU_ENERGY_STORAGE` and the
-  `SS_*` curtailment columns, every 5-minute interval). These are the feeds that
-  move a charge/discharge chart through the day. There is **no** public per-DUID
-  live SOC: the daily report is the only per-unit storage, and AEMO's only live
+  interval) and `DispatchIS_Reports` (region-level `BDU_ENERGY_STORAGE`, the
+  `SS_*` curtailment columns, and the `DISPATCH,INTERCONNECTORRES` flow/limit
+  table, every 5-minute interval). These are the feeds that move a
+  charge/discharge chart through the day. There is **no** public per-DUID live
+  SOC: the daily report is the only per-unit storage, and AEMO's only live
   *measured* storage number is the region-level BDU figure. The same two files
-  also yield region curtailment (wind and solar as separate series) and, joined
-  against the OE fleet cache, region fossil generation.
+  also yield region curtailment (wind and solar as separate series), region
+  fossil generation (joined against the OE fleet cache), and interconnector
+  transfer flows and limits.
 
 ### How it gets the numbers — the daily file
 
@@ -1000,6 +1002,14 @@ A second thread polls two tiny archives on `--intraday-poll-interval` (default
    MWh of all battery dispatch units per region (NSW1 5063.4 → 5084.6 MWh at
    15:20). Regions with no storage publish blanks (TAS1) and are skipped *for
    storage*, but the same table is the source of the curtailment series below.
+3. The file's other table, `DISPATCH,INTERCONNECTORRES`, carries per link and
+   interval the settled flow `MWFLOW`/`METEREDMWFLOW`, the dispatch engine's
+   `EXPORTLIMIT`/`IMPORTLIMIT`, losses, marginal value and violation degree
+   (verified 2026-10-11: NSW1-QLD1 flow −926.7 MW, VIC1-NSW1 binding on its
+   690.8 MW export limit, T-V-MNSP1 reporting *both* limits negative). AEMO
+   settles flow under its own per-link sign convention, so every column is
+   carried verbatim and never normalized — a negative limit is AEMO's own
+   number, not a sign error.
 
 Both files are one interval each and advance every 5 minutes, so a cycle costs
 two tiny listings plus ~30KB of zips; the reuse check absorbs a poll that lands
@@ -1039,6 +1049,21 @@ would vanish on every other cycle. The cache is re-read while either map is
 still empty (not just the capacity map), so a cache written before this feature
 - battery capacity but no fossil units - is superseded on the OE exporter's
 next in-place refresh instead of pinning the fossil map empty.
+
+### Interconnector transfer flows and limits
+
+The `aemo_interconnector_*` series come from the `DISPATCH,INTERCONNECTORRES`
+table in the *same* `DispatchIS_Reports` zip already downloaded for region
+storage, parsed in-memory from the same bytes — transmission telemetry costs no
+second request. It covers the seven interconnectors plus the MNSP links. AEMO
+applies its own per-interconnector sign convention to `MWFLOW` and reports
+`EXPORTLIMIT`/`IMPORTLIMIT` that are negative for some links (T-V-MNSP1 reports
+both), so the columns are carried verbatim, never re-derived or mirrored; a link
+"binding on export with a negative import limit" (VIC1-NSW1, MWFLOW ==
+EXPORTLIMIT) stays visible as-is. The table fails independently of region
+storage: a file without it keeps the region series and publishes the
+interconnector set empty, made explicit by `aemo_interconnector_count 0` and its
+`report_info`.
 
 ### Freshness and the poll loop
 
@@ -1103,6 +1128,18 @@ wrong number — until a fresh daily report re-anchors it.
 | `aemo_battery_region_fossil_generation_mw{region}` | live fossil (coal/gas/distillate) generation per region, MW — summed from `Dispatch_SCADA` using the OE fleet cache's DUID→region+fueltech map |
 | `aemo_battery_region_fossil_timestamp_seconds{region}` | the 5-minute interval behind the fossil reading |
 | `aemo_battery_fossil_units` | fossil units that contributed to the region sums |
+| `aemo_interconnector_flow_mw{interconnector}` | settled MW flow from `MWFLOW` (AEMO's per-link sign convention) |
+| `aemo_interconnector_metered_flow_mw{interconnector}` | `METEREDMWFLOW`, MW |
+| `aemo_interconnector_export_limit_mw{interconnector}` | `EXPORTLIMIT`, MW — verbatim, can be negative (T-V-MNSP1) |
+| `aemo_interconnector_import_limit_mw{interconnector}` | `IMPORTLIMIT`, MW — verbatim, can be negative |
+| `aemo_interconnector_losses_mw{interconnector}` | `MWLOSSES`, MW |
+| `aemo_interconnector_marginal_value{interconnector}` | `MARGINALVALUE`, $/MWh |
+| `aemo_interconnector_marginal_loss_factor{interconnector}` | `MARGINALLOSS` |
+| `aemo_interconnector_violation_degree{interconnector}` | `VIOLATIONDEGREE` |
+| `aemo_interconnector_timestamp_seconds{interconnector}` | the 5-minute interval behind the readings |
+| `aemo_interconnector_age_seconds{interconnector}` | its age at export time |
+| `aemo_interconnector_report_info{file}` | the processed `PUBLIC_DISPATCHIS` file |
+| `aemo_interconnector_count` | links with a reading; 0 when the INTERCONNECTORRES table was missing/unparsable |
 | `aemo_battery_scada_success`, `aemo_battery_dispatchis_success` | 1 on success, 0 on failure, per intraday feed |
 | `aemo_battery_intraday_poll_duration_seconds`, `aemo_battery_intraday_last_poll_timestamp_seconds` | intraday poll timing |
 | `aemo_battery_inferred_stored_mwh{duid}` | live per-unit estimate: daily `ENERGY_STORAGE` anchor + integrated SCADA MW, MWh |
@@ -1131,7 +1168,7 @@ python3 scrapers/aemo_battery_exporter.py --fleet-cache-file=/oefleet/fleet.json
 
 ### Tests
 
-131 tests in this file, **no network access** — upstream responses are synthetic
+143 tests in this file, **no network access** — upstream responses are synthetic
 zips built in-test against the real column indices, and the parsers have been run
 against real captures (details in `NOTES.md`). Alert on `aemo_battery_scrape_success
 == 0` or `time() - aemo_battery_report_newest_interval_timestamp_seconds` being
@@ -1148,6 +1185,32 @@ bind-mounts each read-only into `python:3.12-alpine` and Prometheus scrapes the
 containers over the compose network. See `../README.md` for that stack and
 `../NOTES.md` for its history. The invocations above are only for running an
 exporter outside compose.
+
+### The NEM web map (`webmap`, container `nem-map`, port 9119)
+
+The seventh service in the compose file is not an exporter. `webmap` is a
+stdlib-only `ThreadingHTTPServer` (same `python:3.12-alpine` image, mounted the
+same way) serving a **standalone Leaflet page with no tile dependency** — it
+draws region polygons, the interconnector lines and the battery circles onto a
+plain dark background, so it renders with no internet at all. `./webmap/data`
+is hand-authored schematic `*.geojson` (six regions, the seven
+interconnectors/MNSP links plus the Snowy link, and intra-regional corridors
+AEMO does not publish numbers for). `./webmap/static/app.js` polls
+`/data/live` every 30s, which the server builds from a single Prometheus
+instant query batch — live for the interconnector flow/limits and region
+stored/fossil/curtailment series above, plus the top dozen `oe_battery_*`
+units — and it ships so the map is not left depending on the point-in-time
+state of any one poll.
+
+Two properties matter for the sign convention this README insists on: the map
+reads the `aemo_interconnector_*` series verbatim (flow arrows drawn from the
+sign, utilization from `|flow|` against the limits), and it reads the fleet
+**straight off the `battery-fleet-cache` volume the OE exporter writes** —
+read-only, never a copy, so the map cannot drift from what the scrapers last
+fetched. The unmonitored ~110 batteries render grey at their cached capacity,
+which is why the whole-fleet cache (facility coordinates included) is the map's
+data source rather than a fresh API call. Healthcheck hits `127.0.0.1:9119`
+like the other services.
 
 The WHT exporter's deployment is:
 

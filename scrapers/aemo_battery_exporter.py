@@ -138,6 +138,19 @@ per region at the newest interval:
     aemo_battery_region_fossil_generation_mw{region}  summed measured MW of the
                                                region's coal/gas/distillate units
     aemo_battery_fossil_units                  fossil units with a live reading
+    aemo_interconnector_flow_mw{interconnector}  dispatched MW flow (MWFLOW,
+                                               AEMO's own per-link sign convention)
+    aemo_interconnector_metered_flow_mw{interconnector}  metered MW flow
+    aemo_interconnector_export_limit_mw{interconnector}  EXPORTLIMIT, verbatim
+    aemo_interconnector_import_limit_mw{interconnector}  IMPORTLIMIT, verbatim
+    aemo_interconnector_losses_mw{interconnector}  MWLOSSES
+    aemo_interconnector_marginal_value{interconnector}  MARGINALVALUE ($/MWh)
+    aemo_interconnector_marginal_loss_factor{interconnector}  MARGINALLOSS
+    aemo_interconnector_violation_degree{interconnector}  VIOLATIONDEGREE
+    aemo_interconnector_timestamp_seconds{interconnector}  interval SETTLEMENTDATE
+    aemo_interconnector_age_seconds{interconnector}  its age at export time
+    aemo_interconnector_report_info{file}        the DispatchIS file processed
+    aemo_interconnector_count                   interconnectors with a reading
 
 The two derived region series both come from a DUID-level measurement paired
 with a map, because AEMO publishes neither directly at region granularity:
@@ -146,6 +159,18 @@ fuel, and fossil generation sums each measured Dispatch_SCADA unit that the OE
 fleet cache (`--fleet-cache-file`) tags as coal, gas or distillate. Absent
 cache, no fossil series; a DispatchIS file predating the SS_* columns yields
 no curtailment.
+
+Interconnector flow and transfer limits are a third item riding the same
+DispatchIS download: the DISPATCH,INTERCONNECTORRES table reports, per link
+and interval, the settled flow (MWFLOW), the metered flow (METEREDMWFLOW) and
+the dispatch engine's EXPORTLIMIT/IMPORTLIMIT, alongside losses, marginal
+value and violation degree. AEMO settles flow under its own per-interconnector
+sign convention and reports limits that are negative for some links
+(T-V-MNSP1 reports both limits negative), so the columns are carried verbatim,
+never re-derived or normalized. A parse failure of that one table leaves the
+interconnector series absent while the region storage survives - the series is
+gated on its own table, and `aemo_interconnector_count` makes the absence
+visible.
 
 and the intraday bookkeeping:
 
@@ -356,6 +381,25 @@ FOSSIL_FUELTECHS = frozenset(
 CURTAILMENT_COLUMNS = (
     ("SS_WIND_UIGF", "SS_WIND_CLEAREDMW", "wind"),
     ("SS_SOLAR_UIGF", "SS_SOLAR_CLEAREDMW", "solar"),
+)
+
+# The DispatchIS INTERCONNECTORRES columns backing the interconnector series.
+# Only the identifying columns are required; every numeric field is read when
+# its column is present, so a file predating one of them still parses.
+INTERCONNECTOR_REQUIRED = (
+    "SETTLEMENTDATE",
+    "INTERCONNECTORID",
+)
+
+INTERCONNECTOR_OPTIONAL = (
+    "METEREDMWFLOW",
+    "MWFLOW",
+    "MWLOSSES",
+    "MARGINALVALUE",
+    "VIOLATIONDEGREE",
+    "EXPORTLIMIT",
+    "IMPORTLIMIT",
+    "MARGINALLOSS",
 )
 
 # An error body from these listing pages is not meaningful, but the cap keeps a
@@ -815,6 +859,29 @@ def _region_sum_indices(header_row: list[str]) -> dict[str, int] | None:
     return positions
 
 
+def _interconnector_indices(header_row: list[str]) -> dict[str, int] | None:
+    """Column indices for a DISPATCH,INTERCONNECTORRES header, by name.
+
+    Verified against the real 2026-10-11 file: SETTLEMENTDATE at 4,
+    INTERCONNECTORID at 6, METEREDMWFLOW at 9, MWFLOW at 10, MWLOSSES at 11,
+    MARGINALVALUE at 12, VIOLATIONDEGREE at 13, EXPORTLIMIT at 15, IMPORTLIMIT
+    at 16, MARGINALLOSS at 17. The identification columns are required; any
+    optional column that is absent simply yields None series.
+    """
+    positions = {}
+    for name in INTERCONNECTOR_REQUIRED:
+        try:
+            positions[name] = header_row.index(name)
+        except ValueError:
+            return None
+    for name in INTERCONNECTOR_OPTIONAL:
+        try:
+            positions[name] = header_row.index(name)
+        except ValueError:
+            pass
+    return positions
+
+
 def parse_dispatchis_region_storage(data: bytes) -> dict:
     """Reduce one DispatchIS CSV into per-region storage and curtailment.
 
@@ -929,6 +996,116 @@ def parse_dispatchis_region_storage(data: bytes) -> dict:
         "newest_interval": newest,
         "regions": regions,
         "curtailment": curtailment,
+    }
+
+
+def _cell_float(row: list[str], idx: int | None, what: str, id_: str) -> float | None:
+    """One optional numeric cell: None when blank or absent, else the float."""
+    if idx is None or idx >= len(row) or not row[idx]:
+        return None
+    try:
+        return float(row[idx])
+    except ValueError:
+        log.warning("interconnector %s: non-numeric %s", id_, what)
+        return None
+
+
+def parse_dispatchis_interconnectors(data: bytes) -> dict:
+    """Reduce one DispatchIS CSV into per-interconnector flow and limits.
+
+    Returns {"file": str, "newest_interval": float, "interconnectors": {id:
+    {"ts": float, "mwflow": float|None, "metered_mwflow": float|None,
+    "export_limit": float|None, "import_limit": float|None, "losses":
+    float|None, "marginal_value": float|None, "marginal_loss": float|None,
+    "violation_degree": float|None}}}. The DISPATCH,INTERCONNECTORRES table
+    carries, per interval and interconnector, the dispatch engine's settled
+    flow (MWFLOW) and its limit solution (EXPORTLIMIT/IMPORTLIMIT) alongside
+    the metered flow, losses and marginal values. AEMO settles flow under its
+    own per-interconnector sign convention and reports limits that can be
+    negative for some links (T-V-MNSP1 reports both limits negative), so every
+    column is carried verbatim, never re-derived. Where a row is re-sent the
+    newest stamp wins.
+    """
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(data))
+    except zipfile.BadZipFile as exc:
+        raise ScrapeError("zip corrupted or not a zip: %s" % exc) from exc
+    members = [
+        name
+        for name in archive.namelist()
+        if name.rpartition(".")[-1].lower() == "csv"
+    ]
+    if not members:
+        raise ScrapeError("zip contained no .csv member (%s)" % archive.namelist())
+    filename = members[0].rsplit(".", 1)[0]
+
+    interconnectors: dict[str, dict] = {}
+    newest: float | None = None
+    indices: dict[str, int] | None = None
+    handled_rows = 0
+    with archive.open(members[0]) as member:
+        for row in csv_row_reader(member):
+            if not row:
+                continue
+            if row[0] == "I":
+                if (
+                    len(row) >= 3
+                    and row[1] == "DISPATCH"
+                    and row[2] == "INTERCONNECTORRES"
+                ):
+                    indices = _interconnector_indices(row)
+                continue
+            if row[0] != "D" or indices is None:
+                continue
+            if (
+                len(row) < 3
+                or row[1] != "DISPATCH"
+                or row[2] != "INTERCONNECTORRES"
+            ):
+                continue
+            stamp = parse_aest(row[indices["SETTLEMENTDATE"]])
+            ic = row[indices["INTERCONNECTORID"]]
+            if stamp is None or not ic:
+                continue
+            handled_rows += 1
+            entry = {
+                "ts": stamp,
+                "mwflow": _cell_float(row, indices.get("MWFLOW"), "MWFLOW", ic),
+                "metered_mwflow": _cell_float(
+                    row, indices.get("METEREDMWFLOW"), "METEREDMWFLOW", ic
+                ),
+                "export_limit": _cell_float(
+                    row, indices.get("EXPORTLIMIT"), "EXPORTLIMIT", ic
+                ),
+                "import_limit": _cell_float(
+                    row, indices.get("IMPORTLIMIT"), "IMPORTLIMIT", ic
+                ),
+                "losses": _cell_float(row, indices.get("MWLOSSES"), "MWLOSSES", ic),
+                "marginal_value": _cell_float(
+                    row, indices.get("MARGINALVALUE"), "MARGINALVALUE", ic
+                ),
+                "marginal_loss": _cell_float(
+                    row, indices.get("MARGINALLOSS"), "MARGINALLOSS", ic
+                ),
+                "violation_degree": _cell_float(
+                    row, indices.get("VIOLATIONDEGREE"), "VIOLATIONDEGREE", ic
+                ),
+            }
+            prev = interconnectors.get(ic)
+            if prev is None or stamp >= prev["ts"]:
+                interconnectors[ic] = entry
+            if newest is None or stamp > newest:
+                newest = stamp
+
+    if not interconnectors:
+        raise ScrapeError(
+            "no INTERCONNECTORRES rows in %s (handled %d)"
+            % (filename, handled_rows)
+        )
+    return {
+        "file": filename,
+        "newest_interval": newest,
+        "interconnectors": interconnectors,
     }
 
 
@@ -1199,6 +1376,87 @@ def render_intraday(
             "# TYPE aemo_battery_fossil_units gauge",
             "aemo_battery_fossil_units %d"
             % sum(f["units"] for f in fossil.values()),
+        ]
+
+    interconnectors = region_storage.get("interconnectors") or {}
+    if region_ok:
+        if interconnectors:
+            lines += [
+                "# HELP aemo_interconnector_flow_mw Algebraic MW flow on the "
+            "interconnector at the newest interval (AEMO's own per-link sign "
+            "convention).",
+            "# TYPE aemo_interconnector_flow_mw gauge",
+            "# HELP aemo_interconnector_metered_flow_mw Metered MW flow at the "
+            "newest interval (METEREDMWFLOW).",
+            "# TYPE aemo_interconnector_metered_flow_mw gauge",
+            "# HELP aemo_interconnector_export_limit_mw Export limit in the "
+            "dispatch solution, MW. Carried verbatim: AEMO reports negative "
+            "limits for some links (e.g. T-V-MNSP1).",
+            "# TYPE aemo_interconnector_export_limit_mw gauge",
+            "# HELP aemo_interconnector_import_limit_mw Import limit in the "
+            "dispatch solution, MW. Carried verbatim; a negative value is "
+            "AEMO's own, not a sign error here.",
+            "# TYPE aemo_interconnector_import_limit_mw gauge",
+            "# HELP aemo_interconnector_losses_mw Interconnector losses at the "
+            "newest interval, MW.",
+            "# TYPE aemo_interconnector_losses_mw gauge",
+            "# HELP aemo_interconnector_marginal_value Marginal value of the "
+            "interconnector constraint, $/MWh.",
+            "# TYPE aemo_interconnector_marginal_value gauge",
+            "# HELP aemo_interconnector_marginal_loss_factor Marginal loss "
+            "factor at the newest interval.",
+            "# TYPE aemo_interconnector_marginal_loss_factor gauge",
+            "# HELP aemo_interconnector_violation_degree Constraint violation "
+            "degree at the newest interval.",
+            "# TYPE aemo_interconnector_violation_degree gauge",
+            "# HELP aemo_interconnector_timestamp_seconds Newest interval "
+            "behind the interconnector readings.",
+            "# TYPE aemo_interconnector_timestamp_seconds gauge",
+            "# HELP aemo_interconnector_age_seconds Age of that interval at "
+            "export time.",
+            "# TYPE aemo_interconnector_age_seconds gauge",
+        ]
+        for ic in sorted(interconnectors):
+            i = interconnectors[ic]
+            lines += [
+                'aemo_interconnector_flow_mw{interconnector="%s"} %s'
+                % (escape_label(ic), fmt(i.get("mwflow"))),
+                'aemo_interconnector_metered_flow_mw{interconnector="%s"} %s'
+                % (escape_label(ic), fmt(i.get("metered_mwflow"))),
+                'aemo_interconnector_export_limit_mw{interconnector="%s"} %s'
+                % (escape_label(ic), fmt(i.get("export_limit"))),
+                'aemo_interconnector_import_limit_mw{interconnector="%s"} %s'
+                % (escape_label(ic), fmt(i.get("import_limit"))),
+                'aemo_interconnector_losses_mw{interconnector="%s"} %s'
+                % (escape_label(ic), fmt(i.get("losses"))),
+                'aemo_interconnector_marginal_value{interconnector="%s"} %s'
+                % (escape_label(ic), fmt(i.get("marginal_value"))),
+                'aemo_interconnector_marginal_loss_factor{interconnector="%s"} %s'
+                % (escape_label(ic), fmt(i.get("marginal_loss"))),
+                'aemo_interconnector_violation_degree{interconnector="%s"} %s'
+                % (escape_label(ic), fmt(i.get("violation_degree"))),
+                'aemo_interconnector_timestamp_seconds{interconnector="%s"} %s'
+                % (escape_label(ic), fmt(i.get("ts"))),
+                'aemo_interconnector_age_seconds{interconnector="%s"} %s'
+                % (
+                    escape_label(ic),
+                    fmt(
+                        now - i["ts"]
+                        if i.get("ts") is not None
+                        else None
+                    ),
+                ),
+            ]
+        lines += [
+            "# HELP aemo_interconnector_report_info Processed DispatchIS file.",
+            "# TYPE aemo_interconnector_report_info gauge",
+            'aemo_interconnector_report_info{file="%s"} 1'
+            % escape_label(region_storage.get("file", "")),
+            "# HELP aemo_interconnector_count Interconnectors with a reading "
+            "this cycle; 0 when the DISPATCH,INTERCONNECTORRES table was "
+            "missing or unparsable.",
+            "# TYPE aemo_interconnector_count gauge",
+            "aemo_interconnector_count %d" % len(interconnectors),
         ]
 
     infer_units = (infer or {}).get("units") or {}
@@ -1741,6 +1999,23 @@ class IntradayPoller:
         url = urllib.parse.urljoin(self.dispatchis_url, newest)
         payload = http_get(url, self.timeout, self.retries, self.retry_budget)
         report = parse_dispatchis_region_storage(payload)
+        # Interconnector flow/limits live in the same DispatchIS payload (the
+        # DISPATCH,INTERCONNECTORRES table), so they are parsed in-memory from
+        # the very download that already yields region storage. A failure of
+        # that one table must not drop the region series: log it and publish an
+        # empty interconnector set, which `aemo_interconnector_count` makes
+        # visible.
+        report["interconnectors"] = {}
+        try:
+            report["interconnectors"] = parse_dispatchis_interconnectors(
+                payload
+            )["interconnectors"]
+        except ScrapeError as exc:
+            log.warning(
+                "DispatchIS interconnector table failed; interconnector series "
+                "absent: %s",
+                exc,
+            )
         report["file"] = newest
         report["reused"] = False
         return report

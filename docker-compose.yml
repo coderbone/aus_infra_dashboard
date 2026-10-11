@@ -526,6 +526,38 @@ services:
     networks: [monitoring]
     restart: unless-stopped
 
+  webmap:
+    image: python:3.12-alpine
+    container_name: nem-map
+    command:
+      - python
+      - /app/server.py
+      - --listen-address=0.0.0.0
+      - --port=9119
+    # Prometheus talks to it as "prometheus" over the compose network; the
+    # fleet cache (facility coordinates + capacities) is read straight off the
+    # volume the OE exporter writes, never a copy, so the map cannot drift
+    # from what the scrapers last fetched.
+    volumes:
+      - ./webmap/server.py:/app/server.py:ro
+      - ./webmap/static:/app/static:ro
+      - ./webmap/data:/app/data:ro
+      - battery-fleet-cache:/cache:ro
+    networks: [monitoring]
+    ports:
+      - "9119:9119"
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import socket; socket.create_connection(('127.0.0.1', 9119), 3).close()"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
 networks:
   monitoring:
     driver: bridge

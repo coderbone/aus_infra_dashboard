@@ -1437,6 +1437,19 @@ dispatch interval. Verified against the live site on 2026-10-08:
   `SS_{SOLAR,WIND}_AVAILABILITY` (122/123) and the compliance columns (113/114),
   which the exporter does not read. The file also carries `DISPATCH,PRICE`
   (live 5-min RRP).
+- **`DISPATCH,INTERCONNECTORRES` also rides the DispatchIS file.** Same ~23KB
+  download, second table — `SETTLEMENTDATE` (column 4), `INTERCONNECTORID` (6),
+  `METEREDMWFLOW` (9), `MWFLOW` (10), `MWLOSSES` (11), `MARGINALVALUE` (12),
+  `VIOLATIONDEGREE` (13), `EXPORTLIMIT` (15), `IMPORTLIMIT` (16),
+  `MARGINALLOSS` (17), one row per interval per link, with the seven
+  interconnectors plus the MNSP links (verified 2026-10-11: NSW1-QLD1 MWFLOW
+  −926.72 vs METEREDMWFLOW −867.49, EXPORTLIMIT 864.09 / IMPORTLIMIT −1185;
+  VIC1-NSW1 MWFLOW 690.80 == EXPORTLIMIT — binding; T-V-MNSP1 *reports both
+  limits negative*). AEMO settles flow under its own per-link sign convention
+  and reports such negative limits, so the exporter carries every column
+  verbatim and never normalizes: the parse is the same shape as
+  `parse_dispatchis_region_storage`, reading the second table in-memory from
+  the already-downloaded payload.
 - **There is no public per-DUID live SOC.** `UNIT_SOLUTION` `ENERGY_STORAGE`
   exists only in the daily file; the intraday `PUBLIC_DISPATCH`/`DispatchIS`
   files have no per-unit solution table. NEMPulse's own docs say their live SOC
@@ -1485,6 +1498,17 @@ dispatch interval. Verified against the live site on 2026-10-08:
   map: a cache written before this feature holds battery capacity but no fossil
   units, so a stop-on-capacity guard would leave the fossil map empty forever
   after the OE exporter rewrites the file in place.
+- **Interconnector flow/limits piggy-back the DispatchIS download.** The
+  `DISPATCH,INTERCONNECTORRES` table shares the payload already fetched for
+  region storage, so exposing transmission telemetry costs no second request —
+  it is parsed in-memory from the same bytes. The two tables fail
+  independently: a REGIONSUM-only file (or an unparsable second table) leaves
+  `aemo_interconnector_*` absent while region storage keeps serving, and the
+  absence is explicit via `aemo_interconnector_count 0` + `report_info`, not an
+  invisible gap. Limits are deliberately not re-derived: EXPORTLIMIT/IMPORTLIMIT
+  can be negative (T-V-MNSP1) and the flow sign is AEMO's own per link, so the
+  series read like the file, and a "binding on export with a negative import
+  limit" (VIC1-NSW1) is visible rather than laundered into a mirror image.
 - **Per-unit inferred stored MWh.** Since no public per-DUID live SOC exists,
   the intraday poller anchors each storage unit at the daily report's
   `ENERGY_STORAGE` and integrates the measured `Dispatch_SCADA` MW across each

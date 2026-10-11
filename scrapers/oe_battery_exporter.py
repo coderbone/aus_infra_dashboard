@@ -173,13 +173,18 @@ Unlabelled fleet and poll gauges:
     oe_api_credits_remaining                   daily budget
     oe_api_requests_total                      counter, includes failures
 
-Labelled info gauge, value 1, whole fleet:
+Labelled info and whole-fleet gauges, value 1 / per-unit MWh, whole fleet:
 
     oe_battery_fleet_info{duid,facility,facility_name,region,network,status,
         capacity_storage_mwh,capacity_registered_mw,data_last_seen}
                                               registration metadata for every
                                               battery unit, including committed
                                               units the polling set never sees
+    oe_battery_fleet_capacity_storage_mwh{facility,unit,name,region,status}
+                                              storage capacity (MWh) for every
+                                              battery unit; the monitored
+                                              oe_battery_capacity_storage_mwh
+                                              stops at --top, this one does not
 
 `oe_battery_scrape_success` is 0 for a facility whose *energy* reading could not
 be read, and the SOC series is **omitted** for it rather than repeated, so a
@@ -1838,6 +1843,30 @@ def render(state: dict, now: float) -> str:
         lines.append("# TYPE oe_battery_fleet_info gauge")
         for row in fleet_meta:
             lines.append("oe_battery_fleet_info{%s} 1" % info_set(row))
+
+        # Whole-fleet numeric complement to the info gauge above. The info
+        # metric carries capacity as a *label string*, which is exactly wrong
+        # for an operand: PromQL cannot divide by a label, and a dashboard
+        # that wants % of capacity for a unit outside the monitored top-N has
+        # nowhere to get a number. The monitored oe_battery_capacity_storage_mwh
+        # stops at `--top`, so a per-unit capacity for the rest of the fleet
+        # has to come from somewhere. Same five labels as every per-unit
+        # series, same value shape (MWh), one row per battery unit in the
+        # metadata.
+        lines.append(
+            "# HELP oe_battery_fleet_capacity_storage_mwh Registered storage "
+            "capacity of a NEM/WEM battery unit in MWh, for the whole fleet "
+            "metadata (the monitored oe_battery_capacity_storage_mwh stops at "
+            "--top; this one does not). Same five labels as every per-unit "
+            "series, so a % of capacity for any unit can be built as "
+            "energy / on(unit) this series."
+        )
+        lines.append("# TYPE oe_battery_fleet_capacity_storage_mwh gauge")
+        for row in fleet_meta:
+            lines.append(
+                "oe_battery_fleet_capacity_storage_mwh{%s} %s"
+                % (label_set(row), fmt(row["capacity_mwh"]))
+            )
 
     lines.append(
         "# HELP oe_battery_scrape_success Whether the last poll read a usable "

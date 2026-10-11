@@ -491,6 +491,7 @@ never-built units included, not just the polling set:
 | Metric | Type | Meaning |
 | --- | --- | --- |
 | `oe_battery_fleet_info{duid, facility, facility_name, region, network, status, capacity_storage_mwh, capacity_registered_mw, data_last_seen}` | gauge | Registration metadata for one unit. `duid` is the join key: AEMO per-unit dispatch series carry `duid`, so `aemo_battery_power_mw * on(duid) group_left(region) oe_battery_fleet_info` enriches them with region/network/status with no lookup table. Capacity figures ride as label strings for display and filtering; `data_last_seen` is empty for units that have never published. Absent entirely until the fleet metadata is first read. |
+| `oe_battery_fleet_capacity_storage_mwh{facility, unit, name, region, status}` | gauge | Storage capacity in MWh for every unit in the fleet metadata, not just the `--top` polled ones — the numeric operand the info gauge's capacity label cannot be, so any unit's % of capacity can be computed (`energy / on(unit) this series`). |
 
 With `--enable-inferred`, a separate synthetic family is exported for units with
 no *fresh* measured reading. It is deliberately kept out of the table above so
@@ -1017,10 +1018,12 @@ No public per-DUID live SOC exists, so the intraday poller builds one: each
 storage unit is anchored at the daily report's `ENERGY_STORAGE` and the measured
 `Dispatch_SCADA` MW is integrated across every 5-minute interval
 (`charge_efficiency×|MW|×dt` while charging, `MW×dt` while discharging). The raw
-integral is floored at zero (`--no-infer-clamp` serves the raw drift).
-`aemo_battery_infer_success` reports whether the series is actually being served,
-and `aemo_battery_inferred_anchor_age_seconds` the age of the daily anchor — let
-them drop/rise and the estimate is stale.
+integral is clamped into `[0, capacity]`: the zero floor always applies, and the
+100% ceiling applies wherever `--fleet-cache-file` supplies the unit's
+registered storage capacity (the OE exporter's cache). `--no-infer-clamp` serves
+the raw drift instead. `aemo_battery_infer_success` reports whether the series is
+actually being served, and `aemo_battery_inferred_anchor_age_seconds` the age of
+the daily anchor — let them drop/rise and the estimate is stale.
 
 **A stale anchor is never stamped forward.** A restart mid-day re-anchors at the
 04:00 daily value. Bridging that gap from the live feed in *one* step would
@@ -1061,9 +1064,10 @@ wrong number — until a fresh daily report re-anchors it.
 | `aemo_battery_inferred_stored_mwh{duid}` | live per-unit estimate: daily `ENERGY_STORAGE` anchor + integrated SCADA MW, MWh |
 | `aemo_battery_inferred_timestamp_seconds{duid}` | the integrated SCADA interval behind the estimate |
 | `aemo_battery_inferred_age_seconds{duid}` | its age at export time |
-| `aemo_battery_inferred_clamped{duid}` | 1 when the raw integral fell below zero and is pinned at 0 |
+| `aemo_battery_inferred_clamped{duid}` | 1 when the raw integral left `[0, capacity]` and is pinned at a boundary |
 | `aemo_battery_inferred_units` | inferred units being served |
-| `aemo_battery_inferred_clamped_units` | ... of them pinned at the zero floor |
+| `aemo_battery_inferred_clamped_units` | ... of them pinned at a boundary |
+| `aemo_battery_inferred_fleet_capacity_units` | ... of them with a known registered capacity (`--fleet-cache-file`), feeding the 100% clamp |
 | `aemo_battery_infer_success` | 1/0 — the series is actually being served (0 while absent) |
 | `aemo_battery_inferred_anchor_age_seconds` | age of the daily anchor interval the estimates integrate away from |
 | `aemo_battery_infer_charge_efficiency` | the stored share of charging energy |
@@ -1078,11 +1082,12 @@ python3 scrapers/aemo_battery_exporter.py --once --state-file /cache/state.json
 python3 scrapers/aemo_battery_exporter.py --intraday-poll-interval=300
 python3 scrapers/aemo_battery_exporter.py --no-infer-backfill        # never fetch the SCADA archive
 python3 scrapers/aemo_battery_exporter.py --infer-backfill-max-hours=48
+python3 scrapers/aemo_battery_exporter.py --fleet-cache-file=/oefleet/fleet.json  # clamp charging at 100%
 ```
 
 ### Tests
 
-110 tests in this file, **no network access** — upstream responses are synthetic
+117 tests in this file, **no network access** — upstream responses are synthetic
 zips built in-test against the real column indices, and the parsers have been run
 against real captures (details in `NOTES.md`). Alert on `aemo_battery_scrape_success
 == 0` or `time() - aemo_battery_report_newest_interval_timestamp_seconds` being

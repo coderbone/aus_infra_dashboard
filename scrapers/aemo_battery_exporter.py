@@ -162,24 +162,29 @@ estimate a stale or mis-sign-conventioned anchor drives below zero is pinned at
 empty and flagged rather than silently showing a negative MWh.
 
     aemo_battery_inferred_stored_mwh{duid}       anchor + integrated SCADA (MWh)
-    aemo_battery_inferred_clamped{duid}          1 = raw integral fell below 0
+    aemo_battery_inferred_clamped{duid}          1 = raw integral left the
+                                                 [0, capacity] envelope
     aemo_battery_inferred_timestamp_seconds{duid}  the integrated interval
     aemo_battery_inferred_age_seconds{duid}      its age at export time
     aemo_battery_inferred_units                  inferred units being served
-    aemo_battery_inferred_clamped_units          ... of them pinned at the zero floor
+    aemo_battery_inferred_clamped_units          ... of them pinned at a boundary
+    aemo_battery_inferred_fleet_capacity_units   ... of them with a known registered
+                                                 capacity (feeds the top clamp)
     aemo_battery_infer_success                   1/0 (series is actually served)
     aemo_battery_inferred_anchor_age_seconds     age of the daily anchor interval;
                                                  large here = stale anchor
     aemo_battery_infer_charge_efficiency         the stored share of charging energy
     aemo_battery_inferred_report_info{file}      the daily report anchoring it
 
-The pinned flag is the OE exporter's `--infer-clamp` convention: it reports the
-raw integral going negative whether or not clamping is applied, so a battery
-held at empty is distinguishable from one genuinely empty. `--no-infer-clamp`
-serves the raw drift instead, for inspecting the estimate rather than reading
-it. The OE exporter clamps the top end too, against registered capacity; this
-exporter has no capacity in scope (that is OpenElectricity data), so it can
-only floor.
+The clamped flag is the OE exporter's `--saturated` convention: it reports the
+raw integral leaving the envelope, so a battery held at empty or full is
+distinguishable from one genuinely there. `--no-infer-clamp` serves the raw
+drift instead, for inspecting the estimate rather than reading it. The bottom
+boundary (empty) needs no data; the top boundary needs the unit's registered
+storage capacity, which is OpenElectricity data, so `--fleet-cache-file` points
+the exporter at the OE fleet cache (`data[].units[].code` ->
+`capacity_storage`). A unit with no known capacity - not in the OE fleet, or no
+cache file - is floored at zero only, the pre-capacity behaviour.
 
 A unit is a "storage" unit if it reports a non-empty INITIAL_ENERGY_STORAGE in
 any interval; everything else in UNIT_SOLUTION is a generator and is skipped.
@@ -282,11 +287,13 @@ DEFAULT_INFER_BACKFILL = True
 
 # Stored energy cannot be negative, so the SCADA-integrated estimate is floored
 # at zero by default, the same envelope the OE exporter clamps to (its
-# --infer-clamp). This exporter has no capacity in scope to clamp the top end
-# against, so it can only floor; --no-infer-clamp serves the raw drift instead.
-# Either way `aemo_battery_inferred_clamped` reports a raw integral that went
-# negative, so a battery pinned at empty is never mistaken for a genuinely empty
-# one - the OE exporter's reported-rather-than-hidden convention.
+# --infer-clamp). The top end needs the unit's registered storage capacity -
+# OpenElectricity data - so it only clamps when --fleet-cache-file supplies it;
+# without one this exporter can only floor. --no-infer-clamp serves the raw
+# drift instead. Either way `aemo_battery_inferred_clamped` reports a raw
+# integral that left the [0, capacity] envelope, so a battery pinned at empty
+# or full is never mistaken for one genuinely there - the OE exporter's
+# reported-rather-than-hidden convention.
 DEFAULT_INFER_CLAMP = True
 
 # The zip download is the only large transfer (8 MB), so the defaults are roomier
@@ -1040,9 +1047,11 @@ def render_intraday(
             "stored; discharging is deducted in full).",
             "# TYPE aemo_battery_inferred_stored_mwh gauge",
             "# HELP aemo_battery_inferred_clamped Whether the raw SCADA-"
-            "integrated stored MWh went below zero and was floored at 0. "
-            "Reported whether or not clamping is applied, so a battery pinned "
-            "at empty is distinguishable from one genuinely empty.",
+            "integrated stored MWh left the [0, capacity] envelope (below zero "
+            "always; above the unit's registered capacity when it is known) and "
+            "was clamped. Reported whether or not clamping is applied, so a "
+            "battery pinned at empty or full is distinguishable from one "
+            "genuinely there.",
             "# TYPE aemo_battery_inferred_clamped gauge",
             "# HELP aemo_battery_inferred_timestamp_seconds Integrated interval "
             "behind the inferred stored MWh.",
@@ -1067,11 +1076,18 @@ def render_intraday(
             "# HELP aemo_battery_inferred_units Inferred units being served.",
             "# TYPE aemo_battery_inferred_units gauge",
             "aemo_battery_inferred_units %d" % len(infer_units),
-            "# HELP aemo_battery_inferred_clamped_units Inferred units held at "
-            "the zero floor because the raw integral went negative.",
+            "# HELP aemo_battery_inferred_clamped_units Inferred units held at a "
+            "boundary because the raw integral left the [0, capacity] envelope.",
             "# TYPE aemo_battery_inferred_clamped_units gauge",
             "aemo_battery_inferred_clamped_units %d"
             % sum(1 for u in infer_units.values() if float(u.get("clamped", 0.0)) > 0.0),
+            "# HELP aemo_battery_inferred_fleet_capacity_units Inferred units "
+            "with a known registered storage capacity (from --fleet-cache-file), "
+            "which is what the 100% top clamp clamps against. 0 = no capacity in "
+            "scope, so only the zero floor applies.",
+            "# TYPE aemo_battery_inferred_fleet_capacity_units gauge",
+            "aemo_battery_inferred_fleet_capacity_units %d"
+            % int((infer or {}).get("capacity_units") or 0),
             "# HELP aemo_battery_inferred_report_info Daily report anchoring the "
             "inferred series.",
             "# TYPE aemo_battery_inferred_report_info gauge",
@@ -1396,6 +1412,7 @@ class IntradayPoller:
         infer_backfill: bool = DEFAULT_INFER_BACKFILL,
         infer_backfill_max_hours: float = MAX_INFER_BACKFILL_HOURS,
         infer_state_file: str | None = None,
+        fleet_cache_file: str | None = None,
     ) -> None:
         self.scada_url = scada_url.rstrip("/") + "/"
         self.dispatchis_url = dispatchis_url.rstrip("/") + "/"
@@ -1425,10 +1442,19 @@ class IntradayPoller:
         # archive. None = not tried, a ts = reconstructed up to there, -1.0 =
         # tried and unusable (do not re-download the archive every cycle).
         self._backfilled_end: float | None = None
+        self.now_fn = time.time
+        # Registered storage capacity per DUID, read from the OE fleet cache so
+        # charging clamps at the battery's capacity as well as at zero. Absent
+        # (no --fleet-cache-file, or one not yet written) means the top clamp is
+        # simply not available and units stay floored at zero only. Loaded
+        # before the state restore so a restored value above capacity is pinned.
+        self.fleet_cache_file = fleet_cache_file
+        self._fleet_capacity: dict[str, float] = {}
+        self._fleet_capacity_last_attempt = 0.0
+        self._maybe_load_fleet_capacity(force=True)
         self._inferred: dict[str, dict] = {}
         if infer_state_file:
             self._load_infer_state()
-        self.now_fn = time.time
         self._lock = threading.Lock()
         self._scada_state: dict | None = None
         self._is_state: dict | None = None
@@ -1450,6 +1476,10 @@ class IntradayPoller:
 
     def poll_once(self) -> tuple[str, bool]:
         started = time.monotonic()
+        # Pick up the OE fleet cache if it was not there at startup (a cold
+        # start usually beats the OE exporter to the shared volume), so this
+        # cycle's integration already clamps at the units' capacities.
+        self._maybe_load_fleet_capacity()
         scada_ok = region_ok = False
         scada_state: dict = {}
         is_state: dict = {}
@@ -1585,7 +1615,9 @@ class IntradayPoller:
                 continue
             if ts <= 0:
                 continue
-            mwh, clamped = self._clamp_inferred(float(energy))
+            mwh, clamped = self._clamp_inferred(
+                float(energy), self._fleet_capacity.get(duid)
+            )
             anchored[duid] = {"ts": ts, "mwh": mwh, "clamped": clamped}
         if not anchored:
             return False
@@ -1600,21 +1632,32 @@ class IntradayPoller:
         limit = now - MAX_INFER_GAP_HOURS * 3600.0
         self._inferred = {d: u for d, u in self._inferred.items() if u["ts"] > limit}
 
-    def _clamp_inferred(self, raw: float) -> tuple[float, float]:
-        """Floor the inferred stored MWh at zero; returns (mwh, clamped_flag).
+    def _clamp_inferred(
+        self, raw: float, capacity: float | None = None
+    ) -> tuple[float, float]:
+        """Clamp the inferred stored MWh into [0, capacity]; returns (mwh, flag).
 
-        Stored energy cannot go negative, so a raw integral below zero is pinned
-        at empty. The flag reports the raw integral going negative whether or
-        not clamping is actually applied, so a battery held at empty is
-        distinguishable from one genuinely empty - the OE exporter's
-        `saturated` convention, here without a capacity ceiling because this
-        exporter has no capacity in scope.
+        Stored energy cannot go below zero, and - when the unit's registered
+        storage capacity is known (OE fleet cache) - cannot exceed it either, so
+        a raw integral outside that envelope is pinned at the boundary. The flag
+        reports the raw integral leaving the envelope whether or not clamping is
+        applied, so a battery held at empty or full is distinguishable from one
+        genuinely there - the OE exporter's `saturated` convention. A unit with
+        no known capacity (not in the OE fleet, or no cache file) is floored at
+        zero only, the pre-capacity behaviour.
         """
-        clamped = 1.0 if raw < 0.0 else 0.0
-        mwh = max(0.0, raw) if self.infer_clamp else raw
+        high = float(capacity) if capacity is not None and capacity > 0.0 else None
+        clamped = 1.0 if (raw < 0.0 or (high is not None and raw > high)) else 0.0
+        if not self.infer_clamp:
+            return raw, clamped
+        mwh = max(0.0, raw)
+        if high is not None:
+            mwh = min(mwh, high)
         return mwh, clamped
 
-    def _advance_entry(self, entry: dict, ts: float, power: float) -> dict:
+    def _advance_entry(
+        self, entry: dict, ts: float, power: float, capacity: float | None = None
+    ) -> dict:
         """Integrate one measured 5-minute power step into the inferred entry.
 
         Shared by the live advance and the archive backfill. A step that does
@@ -1628,7 +1671,7 @@ class IntradayPoller:
             delta = -power * delta_hours
         else:
             delta = -power * delta_hours * self.charge_efficiency
-        mwh, clamped = self._clamp_inferred(entry["mwh"] + delta)
+        mwh, clamped = self._clamp_inferred(entry["mwh"] + delta, capacity)
         return {"ts": ts, "mwh": mwh, "clamped": clamped}
 
     def _backfill_if_stale(self, end_ts: float | None, now: float) -> None:
@@ -1722,7 +1765,9 @@ class IntradayPoller:
                 entry = self._inferred.get(duid)
                 if entry is None:
                     continue
-                stepped = self._advance_entry(entry, u["ts"], u["scada"])
+                stepped = self._advance_entry(
+                    entry, u["ts"], u["scada"], self._fleet_capacity.get(duid)
+                )
                 if stepped is not entry:
                     self._inferred[duid] = stepped
                     advanced += 1
@@ -1762,7 +1807,9 @@ class IntradayPoller:
                 and isinstance(entry.get("ts"), (int, float))
                 and float(entry["ts"]) > 0
             ):
-                mwh, clamped = self._clamp_inferred(float(entry["energy"]))
+                mwh, clamped = self._clamp_inferred(
+                    float(entry["energy"]), self._fleet_capacity.get(duid)
+                )
                 self._inferred[duid] = {
                     "ts": float(entry["ts"]), "mwh": mwh, "clamped": clamped,
                 }
@@ -1798,8 +1845,61 @@ class IntradayPoller:
                 # forward, so the unit is dropped instead.
                 self._inferred.pop(duid, None)
                 continue
-            self._inferred[duid] = self._advance_entry(current, ts, power)
+            self._inferred[duid] = self._advance_entry(
+                current, ts, power, self._fleet_capacity.get(duid)
+            )
         self._prune_stale(now)
+
+    def _maybe_load_fleet_capacity(self, force: bool = False) -> None:
+        """Load DUID -> registered storage capacity (MWh) from the OE fleet cache.
+
+        The OE exporter writes this cache for the whole fleet, so it carries a
+        capacity for units this exporter never anchors - exactly the set the
+        top clamp needs. Missing or unreadable is not fatal: the map stays
+        empty (or keeps its last good contents) and units are floored at zero
+        only, so a malformed cache degrades to the pre-capacity behaviour
+        instead of dropping the inferred series.
+        """
+        if not self.fleet_cache_file:
+            return
+        if self._fleet_capacity and not force:
+            return
+        now = self.now_fn()
+        # A cold start routinely beats the OE exporter to the shared volume;
+        # retry at most once per poll cycle rather than on every integration
+        # step, and never spam the log in between.
+        if not force and now - self._fleet_capacity_last_attempt < 300.0:
+            return
+        self._fleet_capacity_last_attempt = now
+        try:
+            with open(self.fleet_cache_file, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, ValueError) as exc:
+            log.warning(
+                "fleet capacity cache %s unreadable (%s); inference is floored "
+                "at zero only", self.fleet_cache_file, exc,
+            )
+            return
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, list):
+            return
+        caps: dict[str, float] = {}
+        for facility in data:
+            if not isinstance(facility, dict):
+                continue
+            for unit in facility.get("units") or ():
+                if not isinstance(unit, dict):
+                    continue
+                code = unit.get("code")
+                cap = unit.get("capacity_storage")
+                if isinstance(code, str) and isinstance(cap, (int, float)) and cap > 0:
+                    caps[code] = float(cap)
+        if caps:
+            self._fleet_capacity = caps
+            log.info(
+                "fleet capacity loaded: %d units from %s",
+                len(caps), self.fleet_cache_file,
+            )
 
     def _infer_view(self, now: float) -> dict:
         """Snapshot for rendering: live units only, plus the anchor's age."""
@@ -1816,6 +1916,9 @@ class IntradayPoller:
             "anchor_ts": self._anchor_ts,
             "units": inferred,
             "efficiency": self.charge_efficiency,
+            # Of the served units, how many have a registered capacity in scope -
+            # the ones the 100% top clamp can actually hold back.
+            "capacity_units": sum(1 for d in inferred if d in self._fleet_capacity),
         }
 
     def _load_infer_state(self) -> None:
@@ -1840,7 +1943,7 @@ class IntradayPoller:
             except (TypeError, ValueError, KeyError):
                 continue
             if ts > 0:
-                mwh, clamped = self._clamp_inferred(mwh)
+                mwh, clamped = self._clamp_inferred(mwh, self._fleet_capacity.get(duid))
                 clean[duid] = {"ts": ts, "mwh": mwh, "clamped": clamped}
         if not clean:
             return
@@ -2025,14 +2128,23 @@ def main(argv: list[str] | None = None) -> int:
         "--infer-clamp",
         action="store_true",
         default=DEFAULT_INFER_CLAMP,
-        help="floor the inferred stored MWh at zero (default true)",
+        help="clamp the inferred stored MWh into [0, capacity] (default true). "
+        "The zero floor always applies; the capacity ceiling only applies where "
+        "--fleet-cache-file supplies a registered capacity for the unit.",
     )
     parser.add_argument(
         "--no-infer-clamp",
         action="store_false",
         dest="infer_clamp",
-        help="serve the raw SCADA-integrated drift below zero instead of "
-        "floored; the clamped flag keeps reporting it either way",
+        help="serve the raw SCADA-integrated drift outside [0, capacity] "
+        "instead of clamped; the clamped flag keeps reporting it either way",
+    )
+    parser.add_argument(
+        "--fleet-cache-file",
+        help="JSON file the OE exporter writes (its --fleet-cache-file), read "
+        "for the per-DUID registered storage capacity that the inference top "
+        "clamps at 100%%. Read-only; a missing or unreadable file degrades to "
+        "the zero floor only.",
     )
     parser.add_argument(
         "--infer-backfill",
@@ -2128,6 +2240,7 @@ def main(argv: list[str] | None = None) -> int:
         infer_backfill=args.infer_backfill,
         infer_backfill_max_hours=args.infer_backfill_max_hours,
         infer_state_file=args.infer_state_file,
+        fleet_cache_file=args.fleet_cache_file,
     )
 
     if args.once:

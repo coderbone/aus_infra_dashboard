@@ -407,6 +407,7 @@ def make_intraday(**kwargs):
             "infer_backfill_max_hours", exporter.MAX_INFER_BACKFILL_HOURS
         ),
         infer_state_file=kwargs.pop("infer_state_file", None),
+        fleet_cache_file=kwargs.pop("fleet_cache_file", None),
     )
     poller.now_fn = lambda: now
     return poller
@@ -1444,6 +1445,92 @@ class InferenceTest(unittest.TestCase):
         self.assertEqual(v["units"]["ERB01"]["mwh"], 0.0)
         self.assertEqual(v["units"]["ERB01"]["clamped"], 1.0)
 
+    def write_fleet_cache(self, tmp, units):
+        path = os.path.join(tmp, "fleet.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"cached_at": 1.0, "data": [{"units": units}]}, handle)
+        return path
+
+    def test_charging_past_capacity_is_clamped_and_flagged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_fleet_cache(
+                tmp, [{"code": "ERB01", "capacity_storage": 200.0}]
+            )
+            poller = make_intraday(battery_duids={"ERB01"}, fleet_cache_file=path)
+        self.assertEqual(poller._fleet_capacity, {"ERB01": 200.0})
+        poller._daily_report_fn = lambda: self.daily
+        # Anchor 130 MWh, then charge 100 MW for 1h (efficiency 1.0) = +100,
+        # driving the raw integral to 230 - 30 above the 200 MWh capacity.
+        poller._advance_inference(
+            self.scada_at("ERB01", -100.0, 1791396000.0 + 3600.0)["units"], NOW
+        )
+        v = poller._infer_view(NOW)
+        self.assertEqual(v["units"]["ERB01"]["mwh"], 200.0)
+        self.assertEqual(v["units"]["ERB01"]["clamped"], 1.0)
+
+    def test_unit_without_known_capacity_is_floored_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_fleet_cache(
+                tmp, [{"code": "LIMBESS1", "capacity_storage": 200.0}]
+            )
+            poller = make_intraday(battery_duids={"ERB01"}, fleet_cache_file=path)
+        poller._daily_report_fn = lambda: self.daily
+        poller._advance_inference(
+            self.scada_at("ERB01", -100.0, 1791396000.0 + 3600.0)["units"], NOW
+        )
+        v = poller._infer_view(NOW)
+        # No capacity for ERB01, so the top clamp cannot apply: raw 230 served,
+        # unclamped, and the flag stays down.
+        self.assertEqual(v["units"]["ERB01"]["mwh"], 230.0)
+        self.assertEqual(v["units"]["ERB01"]["clamped"], 0.0)
+
+    def test_no_infer_clamp_serves_raw_above_capacity_but_keeps_the_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_fleet_cache(
+                tmp, [{"code": "ERB01", "capacity_storage": 200.0}]
+            )
+            poller = make_intraday(
+                battery_duids={"ERB01"}, fleet_cache_file=path, infer_clamp=False
+            )
+        poller._daily_report_fn = lambda: self.daily
+        poller._advance_inference(
+            self.scada_at("ERB01", -100.0, 1791396000.0 + 3600.0)["units"], NOW
+        )
+        v = poller._infer_view(NOW)
+        self.assertEqual(v["units"]["ERB01"]["mwh"], 230.0)
+        self.assertEqual(v["units"]["ERB01"]["clamped"], 1.0)
+
+    def test_fleet_capacity_loads_and_reports_coverage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_fleet_cache(
+                tmp,
+                [
+                    {"code": "ERB01", "capacity_storage": 200.0},
+                    {"code": "LIMBESS1", "capacity_storage": 50.0},
+                    {"code": "NO_CAP", "capacity_registered": 10.0},
+                ],
+            )
+            poller = make_intraday(battery_duids={"ERB01"}, fleet_cache_file=path)
+        self.assertEqual(
+            poller._fleet_capacity, {"ERB01": 200.0, "LIMBESS1": 50.0}
+        )
+        poller._daily_report_fn = lambda: self.daily
+        poller._advance_inference(self.scada_at("ERB01", 0.0, 1791396000.0)["units"], NOW)
+        poller._advance_inference(self.scada_at("LIMBESS1", 0.0, 1791396000.0)["units"], NOW)
+        # Of the two served units, both have a capacity in scope.
+        self.assertEqual(poller._infer_view(NOW)["capacity_units"], 2)
+
+    def test_missing_fleet_cache_degrades_to_the_floor(self):
+        poller = make_intraday(
+            battery_duids={"ERB01"}, fleet_cache_file="/nonexistent/fleet.json"
+        )
+        self.assertEqual(poller._fleet_capacity, {})
+        poller._daily_report_fn = lambda: self.daily
+        poller._advance_inference(self.scada_at("ERB01", 400.0, 1791396000.0 + 3600.0)["units"], NOW)
+        v = poller._infer_view(NOW)
+        self.assertEqual(v["units"]["ERB01"]["mwh"], 0.0)
+        self.assertEqual(v["units"]["ERB01"]["clamped"], 1.0)
+
     def test_render_intraday_reports_clamped_flags(self):
         scada = exporter.parse_dispatch_scada(SCADA_SAMPLE_ZIP)
         scada["file"] = SCADA_ZIP
@@ -1467,6 +1554,22 @@ class InferenceTest(unittest.TestCase):
         )
         self.assertIn("# TYPE aemo_battery_inferred_clamped gauge", text)
         self.assertIn("# TYPE aemo_battery_inferred_clamped_units gauge", text)
+        self.assertIn("# TYPE aemo_battery_inferred_fleet_capacity_units gauge", text)
+        self.assertIn("aemo_battery_inferred_fleet_capacity_units 0", text)
+
+    def test_render_intraday_reports_capacity_coverage(self):
+        scada = exporter.parse_dispatch_scada(SCADA_SAMPLE_ZIP)
+        scada["file"] = SCADA_ZIP
+        isr = exporter.parse_dispatchis_region_storage(IS_SAMPLE_ZIP)
+        isr["file"] = IS_ZIP
+        infer = {
+            "file": "DAILY.zip",
+            "units": {"ERB01": {"ts": SCADA_TS, "mwh": 200.0, "clamped": 1.0}},
+            "efficiency": 1.0,
+            "capacity_units": 67,
+        }
+        text = exporter.render_intraday(scada, True, isr, True, 1.5, NOW, infer, True)
+        self.assertIn("aemo_battery_inferred_fleet_capacity_units 67", text)
 
     def test_a_stale_anchor_is_never_stamped_forward(self):
         # The regression this guards: a restart at 13:00 anchors at the 04:00

@@ -2449,6 +2449,17 @@ class ScraperTest(unittest.TestCase):
         # And the western units are there under their own network id.
         self.assertTrue(any('network="WEM"' in l for l in infos), "no WEM unit in info metric")
 
+        # The whole-fleet numeric capacity gauge, one row per unit with the
+        # same per-unit labels. The committed fixture unit carries its number;
+        # Castletown's capacity (collie) shows the floating point.
+        caps = [l for l in body.splitlines()
+                if l.startswith("oe_battery_fleet_capacity_storage_mwh{")]
+        self.assertEqual(len(caps), 119)
+        baranduda_cap = next(l for l in caps if 'unit="BARANDUDAB1"' in l)
+        self.assertTrue(baranduda_cap.endswith(" 1886"), baranduda_cap)
+        for label in ('facility="BARANDUDA"', 'name="Baranduda"', 'region="VIC1"', 'status="committed"'):
+            self.assertIn(label, baranduda_cap)
+
     def test_stale_cache_does_not_pin_the_fleet(self):
         """The disk cache is a fallback, not a second source of truth.
 

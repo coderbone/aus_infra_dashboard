@@ -53,6 +53,36 @@ def target(expr, refid="A", instant=True, legend="{{name}}", fmt=None):
     return out
 
 
+def project_soc_1h(selector):
+    """Stored SOC one hour ahead at the current dispatch rate, clamped to
+    0..100% of fleet capacity. Sign follows AEMO: discharging (power > 0)
+    depletes stored energy, charging (power < 0) refills it, so the raw
+    integral is `stored - power`. `selector` is the per-duid `topk` + sign
+    tail that picks the batteries the panel is about; it must match refId A's
+    so the same units are paired up in the panel."""
+    return (
+        "clamp_min(clamp_max(100 * (aemo_battery_inferred_stored_mwh - "
+        "aemo_battery_power_mw) / on(duid) "
+        "label_replace(max by (unit) (oe_battery_fleet_capacity_storage_mwh), "
+        "\"duid\", \"$1\", \"unit\", \"(.*)\"), 100), 0) "
+        "and on(duid) %s" % selector
+    )
+
+
+def fast_chargers_not_nearly_full():
+    """The 12 fastest-absorbing batteries that still have headroom to take
+    charge. A unit already at or above 99% of its whole-fleet capacity can
+    only taper its intake, so it would otherwise sit in the top-12 forever;
+    exclude it *before* `topk`, keeping the panel at a coherent twelve."""
+    return (
+        "topk(12, -aemo_battery_power_mw and on(duid) "
+        "(aemo_battery_power_mw < -1) and on(duid) "
+        "(aemo_battery_inferred_stored_mwh < on(duid) (0.99 * "
+        "label_replace(max by (unit) (oe_battery_fleet_capacity_storage_mwh), "
+        "\"duid\", \"$1\", \"unit\", \"(.*)\"))))"
+    )
+
+
 def ds_():
     return dict(DS)
 
@@ -64,7 +94,7 @@ def thresholds(steps, mode="absolute"):
 def text_color_step():
     return [{"color": "text", "value": 0}]
 
-def gauge(title, grid, targets, description, unit=None, decimals=None, threshold_steps=None, orientation="auto", max_per_row=6, min_=None, max_=None, field_min_max=False):
+def gauge(title, grid, targets, description, unit=None, decimals=None, threshold_steps=None, orientation="auto", max_per_row=6, min_=None, max_=None, field_min_max=False, overrides=()):
     options = {
         "legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": True},
         "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": False},
@@ -103,10 +133,13 @@ def gauge(title, grid, targets, description, unit=None, decimals=None, threshold
         defaults["max"] = max_
     if field_min_max:
         defaults["fieldMinMax"] = True
+    config = {"defaults": defaults}
+    if overrides:
+        config["overrides"] = list(overrides)
     return {
         "datasource": ds_(),
         "description": description,
-        "fieldConfig": {"defaults": defaults},
+        "fieldConfig": config,
         "gridPos": grid,
         "options": options,
         "pluginVersion": "13.2.2",
@@ -1293,20 +1326,37 @@ panels.append(
         [
             target(
                 "100 * aemo_battery_inferred_stored_mwh / on(duid) "
-                "label_replace(max by (unit) (oe_battery_capacity_storage_mwh), "
+                "label_replace(max by (unit) (oe_battery_fleet_capacity_storage_mwh), "
                 "\"duid\", \"$1\", \"unit\", \"(.*)\") "
-                "and on(duid) topk(12, -aemo_battery_power_mw) "
-                "and on(duid) (aemo_battery_power_mw < 0)",
+                "and on(duid) %s" % fast_chargers_not_nearly_full(),
                 instant=True,
                 legend="{{duid}}",
-            )
+            ),
+            target(
+                project_soc_1h(fast_chargers_not_nearly_full()),
+                refid="B",
+                instant=True,
+                legend="{{duid}} (1h)",
+            ),
         ],
-        "The 12 batteries charging fastest right now, showing % of capacity "
-        "stored. Sign follows AEMO: `aemo_battery_power_mw < 0` is "
-        "charging/absorbing, so the selection is `topk(12, -power)` - only "
-        "units with capacity in the OE fleet qualify.",
+        "The 12 batteries charging fastest right now that still have headroom, "
+        "showing % of capacity stored. Units already at or above 99% of their "
+        "whole-fleet capacity are excluded *before* `topk`, since a nearly "
+        "full battery can only taper its intake, not keep charging. Sign "
+        "follows AEMO: `aemo_battery_power_mw < 0` is charging/absorbing, so "
+        "the selection is `topk(12, -power)`. "
+        "`oe_battery_fleet_capacity_storage_mwh` is the whole-fleet capacity "
+        "gauge, so any dispatch unit in the SCADA panel qualifies - not just "
+        "the 12 OE-monitored ones. The dim, `(1h)` ring below each is where "
+        "the unit's stored energy would sit one hour ahead at the current "
+        "dispatch rate, clamped to 0..100% of capacity (`stored - power`), "
+        "marked by the Point endpoint on a fixed 0-100 % scale.",
         unit="percent",
         decimals=1,
+        min_=0,
+        max_=100,
+        max_per_row=12,
+        overrides=[override(by_frame("B"), [("color", {"fixedColor": "#8B949E", "mode": "fixed"})])],
     )
 )
 
@@ -1318,20 +1368,38 @@ panels.append(
         [
             target(
                 "100 * aemo_battery_inferred_stored_mwh / on(duid) "
-                "label_replace(max by (unit) (oe_battery_capacity_storage_mwh), "
+                "label_replace(max by (unit) (oe_battery_fleet_capacity_storage_mwh), "
                 "\"duid\", \"$1\", \"unit\", \"(.*)\") "
                 "and on(duid) topk(12, aemo_battery_power_mw) "
                 "and on(duid) (aemo_battery_power_mw > 0)",
                 instant=True,
                 legend="{{duid}}",
-            )
+            ),
+            target(
+                project_soc_1h(
+                    "topk(12, aemo_battery_power_mw) "
+                    "and on(duid) (aemo_battery_power_mw > 0)"
+                ),
+                refid="B",
+                instant=True,
+                legend="{{duid}} (1h)",
+            ),
         ],
         "The 12 batteries discharging fastest right now, showing % of capacity "
         "stored. Sign follows AEMO: `aemo_battery_power_mw > 0` is "
-        "discharging, so the selection is `topk(12, power)` - only units with "
-        "capacity in the OE fleet qualify.",
+        "discharging, so the selection is `topk(12, power)`. "
+        "`oe_battery_fleet_capacity_storage_mwh` is the whole-fleet capacity "
+        "gauge, so any dispatch unit in the SCADA panel qualifies - not just "
+        "the 12 OE-monitored ones. The dim, `(1h)` ring bottom row is where "
+        "each unit's stored energy would sit one hour ahead at the current "
+        "dispatch rate, clamped to 0..100% of its capacity (`stored - power`), "
+        "marked by the Point endpoint on a fixed 0-100 % scale.",
         unit="percent",
         decimals=1,
+        min_=0,
+        max_=100,
+        max_per_row=12,
+        overrides=[override(by_frame("B"), [("color", {"fixedColor": "#8B949E", "mode": "fixed"})])],
     )
 )
 

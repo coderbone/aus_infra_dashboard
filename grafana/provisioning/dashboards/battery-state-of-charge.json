@@ -2718,13 +2718,15 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
-      "description": "The 12 batteries charging fastest right now, showing % of capacity stored. Sign follows AEMO: `aemo_battery_power_mw < 0` is charging/absorbing, so the selection is `topk(12, -power)` - only units with capacity in the OE fleet qualify.",
+      "description": "The 12 batteries charging fastest right now that still have headroom, showing % of capacity stored. Units already at or above 99% of their whole-fleet capacity are excluded *before* `topk`, since a nearly full battery can only taper its intake, not keep charging. Sign follows AEMO: `aemo_battery_power_mw < 0` is charging/absorbing, so the selection is `topk(12, -power)`. `oe_battery_fleet_capacity_storage_mwh` is the whole-fleet capacity gauge, so any dispatch unit in the SCADA panel qualifies - not just the 12 OE-monitored ones. The dim, `(1h)` ring below each is where the unit's stored energy would sit one hour ahead at the current dispatch rate, clamped to 0..100% of capacity (`stored - power`), marked by the Point endpoint on a fixed 0-100 % scale.",
       "fieldConfig": {
         "defaults": {
           "color": {
             "mode": "palette-classic"
           },
           "decimals": 1,
+          "max": 100,
+          "min": 0,
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -2743,7 +2745,24 @@
             ]
           },
           "unit": "percent"
-        }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#8B949E",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
       },
       "gridPos": {
         "h": 9,
@@ -2767,7 +2786,7 @@
           "placement": "bottom",
           "showLegend": true
         },
-        "maxPerRow": 6,
+        "maxPerRow": 12,
         "minVizHeight": 75,
         "minVizWidth": 75,
         "orientation": "auto",
@@ -2796,11 +2815,24 @@
           },
           "editorMode": "code",
           "exemplar": false,
-          "expr": "100 * aemo_battery_inferred_stored_mwh / on(duid) label_replace(max by (unit) (oe_battery_capacity_storage_mwh), \"duid\", \"$1\", \"unit\", \"(.*)\") and on(duid) topk(12, -aemo_battery_power_mw) and on(duid) (aemo_battery_power_mw < 0)",
+          "expr": "100 * aemo_battery_inferred_stored_mwh / on(duid) label_replace(max by (unit) (oe_battery_fleet_capacity_storage_mwh), \"duid\", \"$1\", \"unit\", \"(.*)\") and on(duid) topk(12, -aemo_battery_power_mw and on(duid) (aemo_battery_power_mw < -1) and on(duid) (aemo_battery_inferred_stored_mwh < on(duid) (0.99 * label_replace(max by (unit) (oe_battery_fleet_capacity_storage_mwh), \"duid\", \"$1\", \"unit\", \"(.*)\"))))",
           "instant": true,
           "legendFormat": "{{duid}}",
           "range": false,
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "clamp_min(clamp_max(100 * (aemo_battery_inferred_stored_mwh - aemo_battery_power_mw) / on(duid) label_replace(max by (unit) (oe_battery_fleet_capacity_storage_mwh), \"duid\", \"$1\", \"unit\", \"(.*)\"), 100), 0) and on(duid) topk(12, -aemo_battery_power_mw and on(duid) (aemo_battery_power_mw < -1) and on(duid) (aemo_battery_inferred_stored_mwh < on(duid) (0.99 * label_replace(max by (unit) (oe_battery_fleet_capacity_storage_mwh), \"duid\", \"$1\", \"unit\", \"(.*)\"))))",
+          "instant": true,
+          "legendFormat": "{{duid}} (1h)",
+          "range": false,
+          "refId": "B"
         }
       ],
       "title": "Most active batteries (charging): stored energy vs capacity",
@@ -2811,13 +2843,15 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
-      "description": "The 12 batteries discharging fastest right now, showing % of capacity stored. Sign follows AEMO: `aemo_battery_power_mw > 0` is discharging, so the selection is `topk(12, power)` - only units with capacity in the OE fleet qualify.",
+      "description": "The 12 batteries discharging fastest right now, showing % of capacity stored. Sign follows AEMO: `aemo_battery_power_mw > 0` is discharging, so the selection is `topk(12, power)`. `oe_battery_fleet_capacity_storage_mwh` is the whole-fleet capacity gauge, so any dispatch unit in the SCADA panel qualifies - not just the 12 OE-monitored ones. The dim, `(1h)` ring bottom row is where each unit's stored energy would sit one hour ahead at the current dispatch rate, clamped to 0..100% of its capacity (`stored - power`), marked by the Point endpoint on a fixed 0-100 % scale.",
       "fieldConfig": {
         "defaults": {
           "color": {
             "mode": "palette-classic"
           },
           "decimals": 1,
+          "max": 100,
+          "min": 0,
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -2836,7 +2870,24 @@
             ]
           },
           "unit": "percent"
-        }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#8B949E",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
       },
       "gridPos": {
         "h": 9,
@@ -2860,7 +2911,7 @@
           "placement": "bottom",
           "showLegend": true
         },
-        "maxPerRow": 6,
+        "maxPerRow": 12,
         "minVizHeight": 75,
         "minVizWidth": 75,
         "orientation": "auto",
@@ -2889,11 +2940,24 @@
           },
           "editorMode": "code",
           "exemplar": false,
-          "expr": "100 * aemo_battery_inferred_stored_mwh / on(duid) label_replace(max by (unit) (oe_battery_capacity_storage_mwh), \"duid\", \"$1\", \"unit\", \"(.*)\") and on(duid) topk(12, aemo_battery_power_mw) and on(duid) (aemo_battery_power_mw > 0)",
+          "expr": "100 * aemo_battery_inferred_stored_mwh / on(duid) label_replace(max by (unit) (oe_battery_fleet_capacity_storage_mwh), \"duid\", \"$1\", \"unit\", \"(.*)\") and on(duid) topk(12, aemo_battery_power_mw) and on(duid) (aemo_battery_power_mw > 0)",
           "instant": true,
           "legendFormat": "{{duid}}",
           "range": false,
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "clamp_min(clamp_max(100 * (aemo_battery_inferred_stored_mwh - aemo_battery_power_mw) / on(duid) label_replace(max by (unit) (oe_battery_fleet_capacity_storage_mwh), \"duid\", \"$1\", \"unit\", \"(.*)\"), 100), 0) and on(duid) topk(12, aemo_battery_power_mw) and on(duid) (aemo_battery_power_mw > 0)",
+          "instant": true,
+          "legendFormat": "{{duid}} (1h)",
+          "range": false,
+          "refId": "B"
         }
       ],
       "title": "Most active batteries (discharging): stored energy vs capacity",

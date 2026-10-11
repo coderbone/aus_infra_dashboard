@@ -26,7 +26,14 @@ OUT = os.path.join(
 # number - but the range panels must NOT bridge gaps, because a gap is the only
 # visible sign that the exporter stopped answering. See the panel descriptions.
 INSTANT = "last_over_time(%s[2h])"
-SEL = "name=~\"$battery\""
+# The two dashboard filters. `region` is multi-select and defaults to All, so
+# `=~".*"` keeps every series that carries a region label and - because
+# Prometheus treats a missing label as the empty string - every series that does
+# not, which is what lets one matcher sit on both region-tagged and untagged
+# metrics without dropping anything under All. It is folded into SEL so all the
+# OE per-unit panels (whose metrics all carry `region`) filter in one place.
+REGION = 'region=~"$region"'
+SEL = 'name=~"$battery",%s' % REGION
 
 # Mirrors `--max-infer-hours` in docker-compose.yml, drawn as the threshold
 # line on the anchor-age panel. Past this the exporter stops publishing an
@@ -73,13 +80,16 @@ def fast_chargers_not_nearly_full():
     """The 12 fastest-absorbing batteries that still have headroom to take
     charge. A unit already at or above 99% of its whole-fleet capacity can
     only taper its intake, so it would otherwise sit in the top-12 forever;
-    exclude it *before* `topk`, keeping the panel at a coherent twelve."""
+    exclude it *before* `topk`, keeping the panel at a coherent twelve. The
+    region join is inside the `topk` too, so the twelve are the fastest
+    *within the selected regions* rather than a global twelve filtered down."""
     return (
         "topk(12, -aemo_battery_power_mw and on(duid) "
         "(aemo_battery_power_mw < -1) and on(duid) "
         "(aemo_battery_inferred_stored_mwh < on(duid) (0.99 * "
         "label_replace(max by (unit) (oe_battery_fleet_capacity_storage_mwh), "
-        "\"duid\", \"$1\", \"unit\", \"(.*)\"))))"
+        "\"duid\", \"$1\", \"unit\", \"(.*)\"))) "
+        "and on(duid) oe_battery_fleet_info{%s})" % REGION
     )
 
 
@@ -94,8 +104,9 @@ def fossil_runtime():
     near-zero denominator cannot blow the axis. Regions with no fossil units
     publish no fossil series, so they simply have no line here."""
     return (
-        "clamp_max(3600 * aemo_battery_region_stored_mwh / on(region) "
-        "clamp_min(aemo_battery_region_fossil_generation_mw, 1), 604800)"
+        "clamp_max(3600 * aemo_battery_region_stored_mwh{%s} / on(region) "
+        "clamp_min(aemo_battery_region_fossil_generation_mw{%s}, 1), 604800)"
+        % (REGION, REGION)
     )
 
 
@@ -701,7 +712,7 @@ panels.append(
     stat(
         "Age of oldest reading",
         {"h": 4, "w": 4, "x": 16, "y": 9},
-        "max(oe_battery_sample_age_seconds)",
+        "max(oe_battery_sample_age_seconds{%s})" % REGION,
         "The oldest **energy** reading currently on the board. Non-zero by design - "
         "the storage_battery feed only publishes overnight - but a jump into the "
         "tens of hours means that feed went quiet, and every SOC panel is about to "
@@ -1174,7 +1185,14 @@ panels.append(
     timeseries(
         "Charge/discharge rate: live SCADA (5-min)",
         {"h": 11, "w": 24, "x": 0, "y": 91},
-        [target("aemo_battery_power_mw", instant=False, legend="{{duid}}")],
+        [
+            target(
+                "aemo_battery_power_mw and on(duid) oe_battery_fleet_info{%s}"
+                % REGION,
+                instant=False,
+                legend="{{duid}}",
+            )
+        ],
         "Each unit's **measured** output from AEMO's `Dispatch_SCADA` archive, "
         "polled every 5-minute interval and served with the interval's age. "
         "**Negative (below zero) is charging, positive (above) is discharging** - "
@@ -1190,7 +1208,12 @@ panels.append(
         "measured at the same cadence but straight from the dispatch archive. A "
         "flat line here is a unit actually idle; a *gap* plus a growing "
         "`aemo_battery_power_age_seconds`, or `aemo_battery_scada_success == 0`, "
-        "is a missing feed.",
+        "is a missing feed.\n\n"
+        "The **Region** filter scopes this per-unit view through the OE region "
+        "map (`oe_battery_fleet_info`), the only per-duid region source - so a "
+        "dispatch unit with no OE facility (TB3B1 today) drops out even under "
+        "All. That is the same scoping the by-region panel below and the "
+        "`aemo_battery_power_mw_region` recording rule already use.",
         unit="mwatth",
         axis="MW",
         decimals=1,
@@ -1206,7 +1229,7 @@ panels.append(
         {"h": 11, "w": 24, "x": 0, "y": 102},
         [
             target(
-                "sum by (region) (aemo_battery_power_mw_region)",
+                "sum by (region) (aemo_battery_power_mw_region{%s})" % REGION,
                 instant=False,
                 legend="{{region}}",
             )
@@ -1239,7 +1262,8 @@ panels.append(
             target(
                 "100 * aemo_battery_inferred_stored_mwh / on(duid) "
                 "label_replace(max by (unit) (oe_battery_capacity_storage_mwh), "
-                "\"duid\", \"$1\", \"unit\", \"(.*)\")",
+                "\"duid\", \"$1\", \"unit\", \"(.*)\") "
+                "and on(duid) oe_battery_fleet_info{%s}" % REGION,
                 instant=False,
                 legend="{{duid}}",
             )
@@ -1293,7 +1317,13 @@ panels.append(
     timeseries(
         "Stored energy by region: live (BDU)",
         {"h": 9, "w": 24, "x": 0, "y": 132},
-        [target("aemo_battery_region_stored_mwh", instant=False, legend="{{region}}")],
+        [
+            target(
+                "aemo_battery_region_stored_mwh{%s}" % REGION,
+                instant=False,
+                legend="{{region}}",
+            )
+        ],
         "The region-level aggregate stored MWh from AEMO's `DispatchIS_Reports` "
         "archive, `DISPATCH,REGIONSUM` `BDU_ENERGY_STORAGE`, polled every "
         "5-minute interval. Stacked so the top of the stack reads as the NEM's "
@@ -1323,7 +1353,13 @@ panels.append(
     gauge(
         "Stored energy by region: live (BDU) gauges",
         {"h": 9, "w": 24, "x": 0, "y": 141},
-        [target("aemo_battery_region_stored_mwh", instant=False, legend="{{region}}")],
+        [
+            target(
+                "aemo_battery_region_stored_mwh{%s}" % REGION,
+                instant=False,
+                legend="{{region}}",
+            )
+        ],
         "Gauges showing current stored energy per region (reactive units). "
         "Scaled from a fixed 0 floor to each region's own maximum (`fieldMinMax`), "
         "so a smaller region is not dwarfed by the largest one's range.",
@@ -1401,7 +1437,10 @@ panels.append(
         "the 12 OE-monitored ones. The dim, `(1h)` ring below each is where "
         "the unit's stored energy would sit one hour ahead at the current "
         "dispatch rate, clamped to 0..100% of capacity (`stored - power`), "
-        "marked by the Point endpoint on a fixed 0-100 % scale.",
+        "marked by the Point endpoint on a fixed 0-100 % scale. The **Region** "
+        "filter picks the top twelve *within* the selected regions - the join "
+        "sits inside the `topk`, so it is not a global twelve narrowed after.",
+
         unit="percent",
         decimals=1,
         min_=0,
@@ -1421,15 +1460,17 @@ panels.append(
                 "100 * aemo_battery_inferred_stored_mwh / on(duid) "
                 "label_replace(max by (unit) (oe_battery_fleet_capacity_storage_mwh), "
                 "\"duid\", \"$1\", \"unit\", \"(.*)\") "
-                "and on(duid) topk(12, aemo_battery_power_mw) "
-                "and on(duid) (aemo_battery_power_mw > 0)",
+                "and on(duid) topk(12, aemo_battery_power_mw and on(duid) "
+                "oe_battery_fleet_info{%s}) "
+                "and on(duid) (aemo_battery_power_mw > 0)" % REGION,
                 instant=True,
                 legend="{{duid}}",
             ),
             target(
                 project_soc_1h(
-                    "topk(12, aemo_battery_power_mw) "
-                    "and on(duid) (aemo_battery_power_mw > 0)"
+                    "topk(12, aemo_battery_power_mw and on(duid) "
+                    "oe_battery_fleet_info{%s}) "
+                    "and on(duid) (aemo_battery_power_mw > 0)" % REGION
                 ),
                 refid="B",
                 instant=True,
@@ -1444,7 +1485,9 @@ panels.append(
         "the 12 OE-monitored ones. The dim, `(1h)` ring bottom row is where "
         "each unit's stored energy would sit one hour ahead at the current "
         "dispatch rate, clamped to 0..100% of its capacity (`stored - power`), "
-        "marked by the Point endpoint on a fixed 0-100 % scale.",
+        "marked by the Point endpoint on a fixed 0-100 % scale. The **Region** "
+        "filter picks the top twelve *within* the selected regions - the join "
+        "sits inside the `topk`, so it is not a global twelve narrowed after.",
         unit="percent",
         decimals=1,
         min_=0,
@@ -1528,7 +1571,41 @@ dashboard = {
                 "sort": 3,
                 "type": "query",
                 "allValue": ".*",
-            }
+            },
+            # The Region filter. A multi-select over the union of every source
+            # that carries a `region` label, because no single metric spans them
+            # all: `oe_battery_fleet_info` has the WEM batteries but no TAS1 (no
+            # OE battery there), while the AEMO region metrics have TAS1 but no
+            # WEM. The union selector lists all six. `allValue: ".*"` makes the
+            # All default a match-everything regex, so `region=~"$region"` is a
+            # no-op under All and scopes the panel once a region is picked.
+            {
+                "allowCustomValue": True,
+                "current": {"selected": True, "text": ["All"], "value": ["$__all"]},
+                "datasource": ds_(),
+                "definition": 'label_values({__name__=~"oe_battery_fleet_info|'
+                              'aemo_battery_region_fossil_generation_mw"}, region)',
+                "hide": 0,
+                "includeAll": True,
+                "label": "Region",
+                "multi": True,
+                "name": "region",
+                "options": [],
+                "query": {
+                    "query": 'label_values({__name__=~"oe_battery_fleet_info|'
+                             'aemo_battery_region_fossil_generation_mw"}, region)',
+                    "refId": "PrometheusVariableQueryEditor-VariableQuery",
+                },
+                # 2 = on time range change, matching the battery variable.
+                "refresh": 2,
+                "regex": "",
+                "regexApplyTo": "value",
+                "skipUrlSync": False,
+                # Alphabetical so the codes read NSW1, QLD1, SA1, TAS1, VIC1, WEM.
+                "sort": 1,
+                "type": "query",
+                "allValue": ".*",
+            },
         ]
     },
     "time": {"from": "now-7d", "to": "now"},

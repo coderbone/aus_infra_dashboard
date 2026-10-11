@@ -1583,3 +1583,50 @@ dispatch interval. Verified against the live site on 2026-10-08:
   unit whose anchor gap the archive failed to close — otherwise the stale anchor
   would come back through the back door as a one-step integration. The regression
   test `test_a_stale_anchor_is_never_stamped_forward` pins this.
+
+## The Region dashboard filter — 2026-10-11
+
+The battery dashboard got a multi-select **Region** variable, applied to every
+panel whose query can carry it. It is a query variable over the *union* of the
+two region-bearing sources, because neither alone spans the NEM:
+`oe_battery_fleet_info` labels the OE batteries (VIC1/NSW1/QLD1/SA1/WEM — no
+TAS1, since there is no OE battery there), while the AEMO region metrics label
+TAS1 but not WEM. The union selector
+`label_values({__name__=~"oe_battery_fleet_info|aemo_battery_region_fossil_generation_mw"}, region)`
+lists all six.
+
+Applied with the same proven pattern as the `battery` variable:
+`region=~"$region"`, `includeAll` with `allValue: ".*"`. The pattern's safety
+comes from Prometheus semantics: an unset label has the empty value, and `.*`
+matches it, so under **All** the matcher is a no-op even on metrics that carry
+no `region` label at all (the OE per-unit series do carry one; the aggregates
+do not). One region picked scopes the panel. For the OE per-unit panels the
+matcher is folded into the shared `SEL` constant, so one edit covers them all.
+
+Filtered: all OE per-unit panels (via `SEL`), `Age of oldest reading`
+(`max(oe_battery_sample_age_seconds{region=~"$region"})`), the live-SCADA
+per-unit rate and inferred-SoC panels (an `and on(duid) oe_battery_fleet_info`
+join — `duid` is the only per-unit region key), the by-region rate
+(`sum by (region) (aemo_battery_power_mw_region{...})`), the by-region BDU
+stored timeseries and gauges, the fossil runtime, and the two
+most-active-battery gauges. Deliberately *not* filtered: the OE aggregate stat
+panels (no `region` label), `Inferred vs reported storage (NEM total)` (a NEM
+total by definition), and the API credit/request/poll-duration scalars.
+
+### Traps (Region filter)
+
+- **The per-unit region join drops TB3B1 even under All.** It is a Tasmania
+  battery with a SCADA series but no OE facility, so `aemo_battery_power_mw`
+  (68 series) joins to `oe_battery_fleet_info` as 67. This is not the filter
+  misbehaving — it is the same scoping the `aemo_battery_power_mw_region`
+  recording rule and the region BDU aggregates already use (no OE facility ⇒ no
+  region ⇒ excluded), just now visible in per-unit panels too. Verified live.
+- **The region join on the most-active gauges belongs *inside* `topk`.** Written
+  after it (`topk(12, …) and on(duid) …region…`) the panel would pick the global
+  twelve and then hide the out-of-region ones, silently showing fewer than
+  twelve for a small region; inside, it picks the twelve fastest *within the
+  selected regions*.
+- **Do not "complete" the region list from one source.** Picking a single source
+  for the variable silently loses a region (TAS1 from OE, WEM from AEMO), and
+  the panels that then show nothing for it look like missing data rather than a
+  variable that never offered the option.

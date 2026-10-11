@@ -405,8 +405,10 @@ services:
       - --intraday-poll-interval=300
       - --infer-state-file=/cache/intraday-state.json
       - --infer-charge-efficiency=1.0
-      # Registered storage capacity per DUID, read-only from the OE exporter's
-      # fleet cache, so charging clamps at 100% as well as at the zero floor.
+      # Read-only from the OE exporter's fleet cache. Supplies each unit's
+      # registered storage capacity (so inference clamps at 100% as well as at
+      # the zero floor) and its fueltech + region (so Dispatch_SCADA MW can be
+      # summed into region fossil generation).
       - --fleet-cache-file=/oefleet/fleet.json
     # Same resolver override as the other three exporters, for the same reason:
     # Docker's embedded resolver intermittently gives up with EAI_AGAIN, and the
@@ -418,7 +420,8 @@ services:
       - ./scrapers/aemo_battery_exporter.py:/app/aemo_battery_exporter.py:ro
       # aemo-state holds this exporter's own files only. The OE fleet cache is
       # mounted read-only at a separate path (/oefleet) so it can supply the
-      # per-DUID capacity without either exporter clobbering the other's file.
+      # per-DUID capacity and fueltech without either exporter clobbering the
+      # other's file.
       - aemo-state:/cache
       - battery-fleet-cache:/oefleet:ro
     networks: [monitoring]

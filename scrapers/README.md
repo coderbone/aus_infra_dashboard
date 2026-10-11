@@ -137,7 +137,7 @@ python3 -m unittest discover -s scrapers -t scrapers -v
 ./scrapers/test_wht_tbm_exporter.py                         # equivalent
 ```
 
-136 tests in this file (689 for all four exporters), about 15 seconds, **no network
+136 tests in this file (726 for all four exporters), about 15 seconds, **no network
 access** — every upstream response is
 replayed from `scrapers/fixtures/`, captured verbatim from ArcGIS on
 2026-09-29. Verified offline by re-running with `socket.getaddrinfo` and every
@@ -294,7 +294,7 @@ Alert on `snowy_tantangara_scrape_success == 0` and on
 ### Tests
 
 ```bash
-python3 -m unittest discover -s scrapers -t scrapers    # all four, 684 tests
+python3 -m unittest discover -s scrapers -t scrapers    # all four, 726 tests
 ./scrapers/test_snowy_tantangara_exporter.py            # 121 tests, this one only
 ```
 
@@ -349,9 +349,13 @@ opennem.com.au.
 
 Two endpoints, one request per battery per cycle:
 
-1. `GET /facilities/?fueltech_id=battery` — the fleet metadata: every battery
-   unit, its `capacity_storage`, its `status_id`, and its `data_last_seen`. Read
-   once per `--fleet-refresh-interval` (24h) and cached to disk as a fallback.
+1. `GET /facilities/` — the fleet metadata for the **whole** NEM (batteries and
+   everything else), each unit's `fueltech_id`, `network_region`,
+   `capacity_storage`, `status_id` and `data_last_seen`. Read once per
+   `--fleet-refresh-interval` (24h) and cached to disk as a fallback. Despite
+   being unfiltered this is one request (~1.3 MB, ~631 facilities / 1142 units,
+   no pagination) — the battery rows feed this exporter, and the non-battery
+   rows are what let the AEMO exporter sum fossil generation per region.
 2. `GET /data/facilities/{NEM|WEM}?metrics=storage_battery&metrics=power&facility_code=…`
    — the data, **per facility**, with a `date_start`/`date_end` window and
    `interval=1h`. The response holds one block per metric and one series per
@@ -892,8 +896,8 @@ bounded, timestamped and reported, as set out under `--reading-cache-file` above
 ### Tests
 
 ```bash
-python3 -m unittest discover -s scrapers -t scrapers    # all four, 684 tests
-./scrapers/test_oe_battery_exporter.py                  # 335 tests, this one only
+python3 -m unittest discover -s scrapers -t scrapers    # all four, 726 tests
+./scrapers/test_oe_battery_exporter.py                  # 338 tests, this one only
 ```
 
 **No network access** — the fleet metadata, a real Eraring storage response, an
@@ -948,11 +952,13 @@ Two feeds from AEMO's NEMWEB archive, both free and anonymous, exposing
   day, published the previous evening; use the freshness metrics, not the scrape
   timestamp, to judge age.
 - **Intraday** — `Dispatch_SCADA` (measured output MW per unit, every 5-minute
-  interval) and `DispatchIS_Reports` (region-level `BDU_ENERGY_STORAGE`, every
-  5-minute interval). These are the feeds that move a charge/discharge chart
-  through the day. There is **no** public per-DUID live SOC: the daily report is
-  the only per-unit storage, and AEMO's only live *measured* storage number is
-  the region-level BDU figure.
+  interval) and `DispatchIS_Reports` (region-level `BDU_ENERGY_STORAGE` and the
+  `SS_*` curtailment columns, every 5-minute interval). These are the feeds that
+  move a charge/discharge chart through the day. There is **no** public per-DUID
+  live SOC: the daily report is the only per-unit storage, and AEMO's only live
+  *measured* storage number is the region-level BDU figure. The same two files
+  also yield region curtailment (wind and solar as separate series) and, joined
+  against the OE fleet cache, region fossil generation.
 
 ### How it gets the numbers — the daily file
 
@@ -992,7 +998,8 @@ A second thread polls two tiny archives on `--intraday-poll-interval` (default
    snapshot whose `DISPATCH,REGIONSUM` table carries `BDU_INITIAL_ENERGY_STORAGE`
    (idx 129) and `BDU_ENERGY_STORAGE` (idx 124) — the reported aggregate stored
    MWh of all battery dispatch units per region (NSW1 5063.4 → 5084.6 MWh at
-   15:20). Regions with no storage publish blanks (TAS1) and are skipped.
+   15:20). Regions with no storage publish blanks (TAS1) and are skipped *for
+   storage*, but the same table is the source of the curtailment series below.
 
 Both files are one interval each and advance every 5 minutes, so a cycle costs
 two tiny listings plus ~30KB of zips; the reuse check absorbs a poll that lands
@@ -1000,6 +1007,38 @@ inside the same interval (the newest file is unchanged, so it is served without
 a re-download). The two sides fail independently — `aemo_battery_scada_success`
 and `aemo_battery_dispatchis_success` — and a failed side drops its own series
 rather than repeating the last one, the same rule as the daily file.
+
+### Curtailment (from `DISPATCH,REGIONSUM`)
+
+The same region rows carry AEMO's own self-forecast and cleared MW for
+semi-scheduled plant in four columns: `SS_WIND_UIGF` (idx 110),
+`SS_SOLAR_UIGF` (idx 109), `SS_WIND_CLEAREDMW` (idx 112) and
+`SS_SOLAR_CLEAREDMW` (idx 111). Curtailment is the gap the region did not get to
+send — `UIGF − CLEAREDMW` per fuel, **floored at 0** because a unit beating its
+own forecast can push the raw gap negative. The region map is built even when
+the storage columns are blank, so TAS1 curtails even though it has no storage
+row; when the four columns are absent entirely the curtailment map is simply
+empty. Slack: real captures on 2026-10-11 14:20 read VIC1 solar 1641.0 → 227.9
+curtailed (1413.2 MW) and SA1 wind 2119.3 → 527.0 (1592.3 MW).
+
+### Fossil generation
+
+AEMO publishes no per-region fossil feed (`Next_Day_Actual_Gen` is per-DUID
+MWh, `Regional_Summary_Report` is weekly settlements, `DUDETAILSUMMARY` carries
+no fuel type), so the exporter gets fuel from the OpenElectricity fleet cache
+(the same `--fleet-cache-file` the inference clamp reads): the OE exporter now
+caches the *whole* NEM facility list, and the aemo side reads each unit's
+`fueltech_id` + `network_region`. Units whose fueltech is
+`coal_black`/`coal_brown`/`distillate`/`gas_ccgt`/`gas_ocgt`/`gas_steam`/
+`gas_recip`/`gas_wcmg` are summed per region against the live
+`Dispatch_SCADA` MW. Bioenergy and hydro are excluded. With no cache readable,
+`aemo_battery_region_fossil_generation_mw` is omitted entirely (never a wrong
+zero). The sums are computed on the *unfiltered* SCADA units, before the
+battery filter, and are not recomputed on a reused poll — otherwise fossil
+would vanish on every other cycle. The cache is re-read while either map is
+still empty (not just the capacity map), so a cache written before this feature
+- battery capacity but no fossil units - is superseded on the OE exporter's
+next in-place refresh instead of pinning the fossil map empty.
 
 ### Freshness and the poll loop
 
@@ -1059,6 +1098,11 @@ wrong number — until a fresh daily report re-anchors it.
 | `aemo_battery_region_storage_timestamp_seconds{region}` | the 5-minute interval behind the region reading |
 | `aemo_battery_region_storage_report_info{file}` | the processed `PUBLIC_DISPATCHIS` file |
 | `aemo_battery_region_storage_interval_timestamp_seconds` | its interval |
+| `aemo_battery_region_curtailment_mw{region,fuel}` | renewables curtailed in the region, MW (`fuel="wind"`/`"solar"`; self-forecast `SS_*_UIGF` − cleared `SS_*_CLEAREDMW`, floored at 0) |
+| `aemo_battery_region_curtailment_timestamp_seconds{region}` | the 5-minute interval behind the curtailment reading |
+| `aemo_battery_region_fossil_generation_mw{region}` | live fossil (coal/gas/distillate) generation per region, MW — summed from `Dispatch_SCADA` using the OE fleet cache's DUID→region+fueltech map |
+| `aemo_battery_region_fossil_timestamp_seconds{region}` | the 5-minute interval behind the fossil reading |
+| `aemo_battery_fossil_units` | fossil units that contributed to the region sums |
 | `aemo_battery_scada_success`, `aemo_battery_dispatchis_success` | 1 on success, 0 on failure, per intraday feed |
 | `aemo_battery_intraday_poll_duration_seconds`, `aemo_battery_intraday_last_poll_timestamp_seconds` | intraday poll timing |
 | `aemo_battery_inferred_stored_mwh{duid}` | live per-unit estimate: daily `ENERGY_STORAGE` anchor + integrated SCADA MW, MWh |
@@ -1087,7 +1131,7 @@ python3 scrapers/aemo_battery_exporter.py --fleet-cache-file=/oefleet/fleet.json
 
 ### Tests
 
-117 tests in this file, **no network access** — upstream responses are synthetic
+131 tests in this file, **no network access** — upstream responses are synthetic
 zips built in-test against the real column indices, and the parsers have been run
 against real captures (details in `NOTES.md`). Alert on `aemo_battery_scrape_success
 == 0` or `time() - aemo_battery_report_newest_interval_timestamp_seconds` being

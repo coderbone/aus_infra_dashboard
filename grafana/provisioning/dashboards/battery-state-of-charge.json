@@ -2718,6 +2718,102 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
+      "description": "How long the region's stored battery energy would carry the region's **current** fossil generation if the whole fossil fleet stopped at once: `stored MWh / fossil MW` (x3600 for seconds, which Grafana's time unit renders as h/d). Fanciful on every axis - it assumes lossless discharge at an unbounded rate, that fossil output is exactly the load left behind, and that nothing else picks up the slack - so read it as a mood, not a plan. It nevertheless *moves* the way one wants: it rises as batteries fill and as fossil backs off (midday solar) and falls as fossil ramps. `clamp_min` keeps a momentary zero denominator from dividing by it and the value is pinned at a week so one cannot blow the axis. Regions with no fossil units at all publish no fossil series and so have no line here.\n\nThe numerator is AEMO's reported region `BDU_ENERGY_STORAGE` (`aemo_battery_region_stored_mwh`); the denominator is measured `Dispatch_SCADA` MW attributed to coal/gas/distillate by the OE fleet cache (`aemo_battery_region_fossil_generation_mw`).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "fossil-load runtime",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "s"
+        }
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 150
+      },
+      "id": 26,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "clamp_max(3600 * aemo_battery_region_stored_mwh / on(region) clamp_min(aemo_battery_region_fossil_generation_mw, 1), 604800)",
+          "instant": false,
+          "legendFormat": "{{region}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Fossil-load runtime by region: stored MWh / fossil MW (fanciful)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
       "description": "The 12 batteries charging fastest right now that still have headroom, showing % of capacity stored. Units already at or above 99% of their whole-fleet capacity are excluded *before* `topk`, since a nearly full battery can only taper its intake, not keep charging. Sign follows AEMO: `aemo_battery_power_mw < 0` is charging/absorbing, so the selection is `topk(12, -power)`. `oe_battery_fleet_capacity_storage_mwh` is the whole-fleet capacity gauge, so any dispatch unit in the SCADA panel qualifies - not just the 12 OE-monitored ones. The dim, `(1h)` ring below each is where the unit's stored energy would sit one hour ahead at the current dispatch rate, clamped to 0..100% of capacity (`stored - power`), marked by the Point endpoint on a fixed 0-100 % scale.",
       "fieldConfig": {
         "defaults": {
@@ -2768,9 +2864,9 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 150
+        "y": 159
       },
-      "id": 26,
+      "id": 27,
       "options": {
         "barShape": "flat",
         "barWidthFactor": 0.54,
@@ -2893,9 +2989,9 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 159
+        "y": 168
       },
-      "id": 27,
+      "id": 28,
       "options": {
         "barShape": "flat",
         "barWidthFactor": 0.54,

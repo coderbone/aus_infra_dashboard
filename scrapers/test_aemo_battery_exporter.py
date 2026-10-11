@@ -223,6 +223,7 @@ SCADA_SAMPLE_ZIP = scada_zip(rows=scada_sample_rows())
 def region_sum_row(
     kind, timestamp="2026/10/08 15:20:00", region="NSW1",
     initial="5063.368830", energy="5084.591640",
+    wind_uigf="", wind_cleared="", solar_uigf="", solar_cleared="",
 ):
     cells = [""] * 130
     cells[0] = kind
@@ -231,6 +232,12 @@ def region_sum_row(
     cells[3] = "1"
     cells[4] = timestamp
     cells[6] = region
+    # SS_* curtailment columns at their real positions (109 solar UIGF,
+    # 110 wind UIGF, 111 solar cleared, 112 wind cleared).
+    cells[109] = solar_uigf
+    cells[110] = wind_uigf
+    cells[111] = solar_cleared
+    cells[112] = wind_cleared
     cells[124] = energy
     cells[129] = initial
     return cells
@@ -240,6 +247,10 @@ def region_header():
     row = region_sum_row("I")
     row[4] = "SETTLEMENTDATE"
     row[6] = "REGIONID"
+    row[109] = "SS_SOLAR_UIGF"
+    row[110] = "SS_WIND_UIGF"
+    row[111] = "SS_SOLAR_CLEAREDMW"
+    row[112] = "SS_WIND_CLEAREDMW"
     row[124] = "BDU_ENERGY_STORAGE"
     row[129] = "BDU_INITIAL_ENERGY_STORAGE"
     return row
@@ -250,12 +261,27 @@ def is_zip(name=IS_CSV, rows=()):
 
 
 def is_sample_rows():
+    # The SS_* values are real: read from the REGIONSUM table of the live
+    # 2026-10-11 14:20 DispatchIS file, the same columns, carried here at the
+    # fixture's own interval stamp. Wind curtailment is mostly zero because the
+    # self-forecast and the cleared figure agree; SA1 and VIC1 show the big
+    # solar gaps the region series are meant to surface.
     return [
-        region_sum_row("D", "2026/10/08 15:20:00", "NSW1", "5063.368830", "5084.591640"),
-        region_sum_row("D", "2026/10/08 15:20:00", "QLD1", "4207.204660", "4238.2711"),
-        region_sum_row("D", "2026/10/08 15:20:00", "SA1", "1967.194450", "1973.289430"),
-        region_sum_row("D", "2026/10/08 15:20:00", "VIC1", "3881.447850", "3881.825510"),
-        # TAS1 reports no battery storage: both BDU columns blank, so it is skipped.
+        region_sum_row("D", "2026/10/08 15:20:00", "NSW1", "5063.368830", "5084.591640",
+                       wind_uigf="879.57159", wind_cleared="879.57159",
+                       solar_uigf="3652.93266", solar_cleared="2805.51158"),
+        region_sum_row("D", "2026/10/08 15:20:00", "QLD1", "4207.204660", "4238.2711",
+                       wind_uigf="155.2312", wind_cleared="146.121",
+                       solar_uigf="3205.63629", solar_cleared="2881.06057"),
+        region_sum_row("D", "2026/10/08 15:20:00", "SA1", "1967.194450", "1973.289430",
+                       wind_uigf="2119.2538", wind_cleared="526.98107",
+                       solar_uigf="209.33037", solar_cleared="0.0"),
+        region_sum_row("D", "2026/10/08 15:20:00", "VIC1", "3881.447850", "3881.825510",
+                       wind_uigf="4458.12561", wind_cleared="720.202",
+                       solar_uigf="1641.01878", solar_cleared="227.85951"),
+        # TAS1 reports no battery storage: both BDU columns blank, so it is
+        # skipped by the storage map. Its renewables do curtail, but this row
+        # leaves SS blank to keep the "TAS1 is absent" render assertions exact.
         region_sum_row("D", "2026/10/08 15:20:00", "TAS1", "", ""),
     ]
 
@@ -1025,6 +1051,54 @@ class ParseDispatchIsTest(unittest.TestCase):
         with self.assertRaises(exporter.ScrapeError):
             self.parsed(rows)
 
+    def test_curtailment_is_self_forecast_minus_cleared(self):
+        cur = self.parsed()["curtailment"]
+        # NSW1 wind: the forecast and the cleared figure agree, so no curtailment.
+        self.assertAlmostEqual(cur["NSW1"]["wind"], 0.0, places=4)
+        # NSW1 solar: 3652.93266 - 2805.51158.
+        self.assertAlmostEqual(cur["NSW1"]["solar"], 847.42108, places=4)
+        self.assertEqual(cur["NSW1"]["ts"], SCADA_TS)
+
+    def test_curtailment_covers_regions_without_storage(self):
+        rows = [region_sum_row(
+            "D", "2026/10/08 15:20:00", "TAS1", "", "",
+            wind_uigf="210.08731", wind_cleared="88.94531",
+            solar_uigf="0.0", solar_cleared="0.0",
+        )]
+        parsed = self.parsed(rows)
+        self.assertNotIn("TAS1", parsed["regions"])
+        self.assertAlmostEqual(parsed["curtailment"]["TAS1"]["wind"], 121.142, places=4)
+        self.assertAlmostEqual(parsed["curtailment"]["TAS1"]["solar"], 0.0, places=4)
+
+    def test_curtailment_is_floored_at_zero(self):
+        # Cleared above the forecast (a unit beating its own UIGF) must read 0,
+        # never a negative MW.
+        rows = [region_sum_row(
+            "D", "2026/10/08 15:20:00", "NSW1", "5000.0", "5100.0",
+            wind_uigf="100.0", wind_cleared="120.0",
+        )]
+        self.assertEqual(self.parsed(rows)["curtailment"]["NSW1"]["wind"], 0.0)
+
+    def test_curtailment_is_absent_when_the_columns_are(self):
+        header = region_header()
+        for index in (109, 110, 111, 112):
+            header[index] = ""
+        rows = [region_sum_row("D", "2026/10/08 15:20:00", "NSW1", "5000.0", "5100.0")]
+        parsed = exporter.parse_dispatchis_region_storage(
+            make_zip(IS_CSV, [header, *rows])
+        )
+        self.assertEqual(parsed["curtailment"], {})
+        self.assertIn("NSW1", parsed["regions"])
+
+    def test_non_numeric_curtailment_drops_that_region(self):
+        rows = [region_sum_row(
+            "D", "2026/10/08 15:20:00", "NSW1", "5000.0", "5100.0",
+            wind_uigf="oops", wind_cleared="1.0",
+        )]
+        parsed = self.parsed(rows)
+        self.assertNotIn("NSW1", parsed["curtailment"])
+        self.assertIn("NSW1", parsed["regions"])
+
 
 # --------------------------------------------------------------------------- #
 # render_intraday
@@ -1100,6 +1174,43 @@ class RenderIntradayTest(unittest.TestCase):
         text = self.text()
         self.assertIn('aemo_battery_power_report_info{file="%s"} 1' % SCADA_ZIP, text)
         self.assertIn('aemo_battery_region_storage_report_info{file="%s"} 1' % IS_ZIP, text)
+
+    def test_curtailment_series_render_with_the_fuel_label(self):
+        text = self.text()
+        vic = next(
+            l for l in lines_named(text, "aemo_battery_region_curtailment_mw")
+            if 'region="VIC1",fuel="solar"' in l
+        )
+        self.assertAlmostEqual(float(vic.rsplit(" ", 1)[1]), 1413.15927, places=4)
+        nsw = next(
+            l for l in lines_named(text, "aemo_battery_region_curtailment_mw")
+            if 'region="NSW1",fuel="solar"' in l
+        )
+        self.assertAlmostEqual(float(nsw.rsplit(" ", 1)[1]), 847.42108, places=4)
+
+    def test_a_failed_dispatchis_read_omits_curtailment(self):
+        text = exporter.render_intraday(self.scada, True, self.isr, False, 1.5, self.now)
+        self.assertNotIn("aemo_battery_region_curtailment_mw", text)
+
+    def test_fossil_generation_renders_per_region(self):
+        self.scada["region_fossil"] = {
+            "NSW1": {"ts": SCADA_TS, "mw": 7000.5, "units": 12},
+            "VIC1": {"ts": SCADA_TS, "mw": 3000.0, "units": 5},
+        }
+        text = self.text()
+        self.assertIn(
+            'aemo_battery_region_fossil_generation_mw{region="NSW1"} 7000.5', text
+        )
+        self.assertIn(
+            'aemo_battery_region_fossil_timestamp_seconds{region="VIC1"} %d'
+            % int(SCADA_TS), text,
+        )
+        self.assertIn("aemo_battery_fossil_units 17", text)
+
+    def test_a_failed_scada_read_omits_fossil(self):
+        self.scada["region_fossil"] = {"NSW1": {"ts": SCADA_TS, "mw": 1.0, "units": 1}}
+        text = exporter.render_intraday(self.scada, False, self.isr, True, 1.5, self.now)
+        self.assertNotIn("aemo_battery_region_fossil_generation_mw", text)
 
 
 # --------------------------------------------------------------------------- #
@@ -1213,6 +1324,112 @@ class IntradayPollerTest(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn('aemo_battery_power_mw{duid="WTAHB1"}', body)
         self.assertIn("aemo_battery_scada_success 1", body)
+
+    # -- fossil generation (region = OE fleet metadata) --------------------- #
+
+    def fossil_fetcher(self):
+        return IntradayFetcher(
+            scada_zips={SCADA_ZIP: scada_zip(rows=[
+                scada_row("D", duid="WTAHB1", value="-34.072630"),
+                scada_row("D", duid="DPNTB1", value="-6.790540"),
+                scada_row("D", duid="BW01", value="500.0"),
+                scada_row("D", duid="TORRB1", value="300.0"),
+            ])},
+            is_zips={IS_ZIP: IS_SAMPLE_ZIP},
+        )
+
+    def fossil_cache_payload(self):
+        return {"cached_at": 1.0, "data": [
+            {"code": "BW01", "network_region": "NSW1", "units": [
+                {"code": "BW01", "fueltech_id": "coal_black",
+                 "capacity_storage": None}]},
+            {"code": "TORRB1", "network_region": "VIC1", "units": [
+                {"code": "TORRB1", "fueltech_id": "gas_ocgt",
+                 "capacity_storage": None}]},
+            # A battery in the same cache must not count as fossil.
+            {"code": "WTAHB1", "network_region": "NSW1", "units": [
+                {"code": "WTAHB1", "fueltech_id": "battery",
+                 "capacity_storage": 200.0}]},
+        ]}
+
+    def write_fossil_cache(self, tmp):
+        path = os.path.join(tmp, "fleet.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(self.fossil_cache_payload(), handle)
+        return path
+
+    def test_fossil_generation_is_summed_per_region(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_fossil_cache(tmp)
+            poller, body, ok = polled_intraday(
+                self.fossil_fetcher(), battery_duids={"WTAHB1"}, fleet_cache_file=path
+            )
+        self.assertTrue(ok)
+        self.assertIn('aemo_battery_region_fossil_generation_mw{region="NSW1"} 500', body)
+        self.assertIn('aemo_battery_region_fossil_generation_mw{region="VIC1"} 300', body)
+        self.assertIn("aemo_battery_fossil_units 2", body)
+
+    def test_fossil_excludes_batteries_and_unmapped_units(self):
+        # WTAHB1 is a battery and DPNTB1 is not in the cache; neither counts.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_fossil_cache(tmp)
+            poller, body, ok = polled_intraday(
+                self.fossil_fetcher(), battery_duids={"WTAHB1"}, fleet_cache_file=path
+            )
+        self.assertIn("aemo_battery_fossil_units 2", body)
+
+    def test_no_fleet_cache_publishes_no_fossil_series(self):
+        poller, body, ok = polled_intraday(
+            self.fossil_fetcher(), battery_duids={"WTAHB1"}
+        )
+        self.assertTrue(ok)
+        self.assertNotIn("aemo_battery_region_fossil_generation_mw", body)
+
+    def test_fossil_survives_an_unchanged_file_reuse(self):
+        # The reused-state path must not recompute fossil from the already
+        # battery-filtered units, which would drop it on every second cycle.
+        fetcher = self.fossil_fetcher()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_fossil_cache(tmp)
+            with mock.patch.object(exporter, "http_get", fetcher):
+                poller = make_intraday(
+                    battery_duids={"WTAHB1"}, fleet_cache_file=path
+                )
+                poller.poll_once()
+                body, ok = poller.poll_once()
+        self.assertTrue(ok)
+        self.assertIn('aemo_battery_region_fossil_generation_mw{region="NSW1"} 500', body)
+
+    def test_an_old_battery_only_cache_is_replaced_and_picked_up(self):
+        # A cache written by the previous exporter holds battery capacity but
+        # no fossil metadata. It fills the capacity map, so the poller has to
+        # keep retrying (past the 300s throttle) to notice the OE exporter's
+        # in-place rewrite instead of leaving the fossil map empty forever.
+        fetcher = self.fossil_fetcher()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "fleet.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"cached_at": 1.0, "data": [
+                    {"code": "WTAHB1", "network_region": "NSW1", "units": [
+                        {"code": "WTAHB1", "fueltech_id": "battery",
+                         "capacity_storage": 200.0}]},
+                ]}, handle)
+            with mock.patch.object(exporter, "http_get", fetcher):
+                poller = make_intraday(
+                    battery_duids={"WTAHB1"}, fleet_cache_file=path
+                )
+                poller.poll_once()
+                # Capacity loaded, so a stop-on-capacity guard would give up
+                # here and never see the fossil units.
+                self.assertEqual(poller._fleet_capacity, {"WTAHB1": 200.0})
+                self.assertEqual(poller._fossil_region, {})
+                with open(path, "w", encoding="utf-8") as handle:
+                    json.dump(self.fossil_cache_payload(), handle)
+                poller._fleet_metadata_last_attempt = 0.0
+                poller.poll_once()
+        self.assertEqual(
+            poller._fossil_region, {"BW01": "NSW1", "TORRB1": "VIC1"}
+        )
 
 
 # --------------------------------------------------------------------------- #

@@ -1427,11 +1427,16 @@ dispatch interval. Verified against the live site on 2026-10-08:
   learned (seeded from the state file at startup).
 - **`DispatchIS_Reports`** — `PUBLIC_DISPATCHIS_<YYYYMMDDHHMM>_<seq>.zip`,
   ~23KB, one interval per file. `DISPATCH,REGIONSUM` table carries
-  `BDU_INITIAL_ENERGY_STORAGE` at column 124 and `BDU_ENERGY_STORAGE` at
+  `BDU_ENERGY_STORAGE` at column 124 and `BDU_INITIAL_ENERGY_STORAGE` at
   column 129 (of 130): the reported aggregate stored MWh of all battery
   dispatch units per region (verified 15:20: NSW1 5063.4→5084.6 MWh, QLD1
   4207.2→4238.3, SA1 1967.2→1973.3, VIC1 3881.4→3881.8; TAS1 blanks, no BDU
-  storage — skipped). The file also carries `DISPATCH,PRICE` (live 5-min RRP).
+  storage — skipped for storage). The same row carries the four semi-scheduled
+  curtailment columns `SS_SOLAR_UIGF` (109), `SS_WIND_UIGF` (110),
+  `SS_SOLAR_CLEAREDMW` (111), `SS_WIND_CLEAREDMW` (112), plus
+  `SS_{SOLAR,WIND}_AVAILABILITY` (122/123) and the compliance columns (113/114),
+  which the exporter does not read. The file also carries `DISPATCH,PRICE`
+  (live 5-min RRP).
 - **There is no public per-DUID live SOC.** `UNIT_SOLUTION` `ENERGY_STORAGE`
   exists only in the daily file; the intraday `PUBLIC_DISPATCH`/`DispatchIS`
   files have no per-unit solution table. NEMPulse's own docs say their live SOC
@@ -1455,6 +1460,31 @@ dispatch interval. Verified against the live site on 2026-10-08:
   knows which DUIDs are storage units (67 of 572). Startup seeds the set from
   the state file so a restart filters correctly before the first daily poll
   completes; every cycle then refreshes it from the live daily scraper state.
+- **Curtailment is AEMO's own forecast-vs-cleared gap, floored at zero.** The
+  `SS_*_UIGF` (self-forecast) and `SS_*_CLEAREDMW` columns are in the
+  `DISPATCH,REGIONSUM` row already being read for storage, so curtailment costs
+  no extra request: `UIGF − CLEAREDMW` per region per fuel, wind and solar as
+  separate series (`aemo_battery_region_curtailment_mw{region,fuel}`). It is
+  floored at 0 because a unit can beat its own forecast and drive the raw gap
+  negative. The region map is built independently of the storage map, so a
+  region with no BDU storage (TAS1) still reports curtailment; when the four
+  columns are missing the curtailment map is empty and only the series drop.
+- **Fossil generation needs a fuel map AEMO does not publish.** No per-region
+  fossil feed exists (`Next_Day_Actual_Gen` is per-DUID MWh, the regional
+  summary is weekly, `DUDETAILSUMMARY` has no fuel type), so the fleet cache is
+  the source: the OE exporter caches the whole facility list unfiltered, and the
+  aemo side joins `Dispatch_SCADA` MW to each unit's `fueltech_id` +
+  `network_region`. Coal (`coal_black`/`coal_brown`), gas (`gas_ccgt`/
+  `gas_ocgt`/`gas_steam`/`gas_recip`/`gas_wcmg`) and `distillate` are summed;
+  bioenergy and hydro are excluded; unmapped DUIDs (and units absent from the
+  cache) contribute nothing. No readable cache means the series is omitted, not
+  a zero. The sum runs on the *unfiltered* SCADA units — before the battery
+  filter — and is skipped on a reused poll (the reused units are already
+  battery-only, so recomputing there would drop fossil every other cycle). The
+  cache is (re)loaded while *either* map is still empty, not just the capacity
+  map: a cache written before this feature holds battery capacity but no fossil
+  units, so a stop-on-capacity guard would leave the fossil map empty forever
+  after the OE exporter rewrites the file in place.
 - **Per-unit inferred stored MWh.** Since no public per-DUID live SOC exists,
   the intraday poller anchors each storage unit at the daily report's
   `ENERGY_STORAGE` and integrates the measured `Dispatch_SCADA` MW across each
@@ -1513,9 +1543,29 @@ dispatch interval. Verified against the live site on 2026-10-08:
 - **SCADA `SCADAVALUE` is signed by AEMO's screen convention** — negative
   while charging — matching `TOTALCLEARED`, not OE's sign. Do not "correct"
   it to positive-when-absorbing.
-- **REGIONSUM rows exist only for regions with BDU storage**, and the BDU
-  columns are blank (not zero) for TAS1; skip on *blank*, not on zero, so a
-  region that drains to 0 MWh stays reported.
+- **REGIONSUM rows exist for every region, but the BDU columns are blank (not
+  zero) where there is no battery storage** (TAS1); skip storage on *blank*, not
+  on zero, so a region that drains to 0 MWh stays reported. The curtailment
+  columns are independent — a region skipped for storage still curtails.
+- **Curtailment can be negative before the floor.** Cleared above the forecast
+  is real (a unit beating its UIGF); the exporter clamps to 0, so do not read a
+  0 as "no curtailment data" — read the timestamp series for that.
+- **The TAS1 fixture row is blank in both the BDU and SS columns on purpose.**
+  Blank BDU keeps TAS1 out of the storage map; blank SS keeps it out of the
+  curtailment map too, so the whole-text render assertion
+  `assertNotIn('region="TAS1"')` still holds now that curtailment can surface
+  regions storage skips. Do not "complete" the fixture by inventing TAS1 SS
+  numbers without revisiting that assertion.
+- **A reused SCADA state must not recompute fossil.** On reuse the held `units`
+  are already battery-filtered, so `region_fossil` is carried over from the
+  first pass and only recomputed when `not scada_state.get("reused")`. Removing
+  that guard makes fossil blink off every second cycle — pinned by
+  `test_fossil_survives_an_unchanged_file_reuse`.
+- **The fleet-cache load must stop on *both* maps, not either.** A pre-fossil
+  cache carries battery capacity but no fossil units; stopping the retry as soon
+  as capacity is loaded leaves the fossil map empty forever once the OE exporter
+  replaces the file in place. Pinned by
+  `test_an_old_battery_only_cache_is_replaced_and_picked_up`.
 - **`Dispatch_Reports` (`PUBLIC_DISPATCH_*.zip`) is NOT the SCADA feed.** Its
   ~13KB files carry only DREGION/P5MIN-type tables — no UNIT_SCADA, no
   UNIT_SOLUTION, no energy storage (checked an intraday capture byte-for-byte).

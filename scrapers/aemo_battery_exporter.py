@@ -41,8 +41,10 @@ does publish each interval:
   snapshot whose `DISPATCH,REGIONSUM` table carries the *reported* total stored
   energy of all battery dispatch units, per region (`BDU_ENERGY_STORAGE` /
   `BDU_INITIAL_ENERGY_STORAGE`, MWh) plus each region's 5-minute price. The
-  region-level stored MWh is the only AEMO figure that is both live and
-  "measured" rather than dispatched.
+  same table's `SS_*_UIGF` / `SS_*_CLEAREDMW` columns carry, per region per
+  variable renewable fuel, the self-forecast and the dispatch-cleared MW, whose
+  gap is that region's curtailment. The region-level stored MWh is the only
+  AEMO figure that is both live and "measured" rather than dispatched.
 
 Both files are identified by name in `/Reports/Current/`, both polled on their
 own short cadence, and both filtered to the units the daily report has learned
@@ -130,6 +132,20 @@ per region at the newest interval:
     aemo_battery_region_stored_mwh{region}            BDU_ENERGY_STORAGE (MWh)
     aemo_battery_region_initial_stored_mwh{region}    BDU_INITIAL_ENERGY_STORAGE
     aemo_battery_region_storage_timestamp_seconds{region}  interval SETTLEMENTDATE
+    aemo_battery_region_curtailment_mw{region,fuel}   SS_*_UIGF minus
+                                               SS_*_CLEAREDMW (MW, floored at 0;
+                                               fuel = wind or solar)
+    aemo_battery_region_fossil_generation_mw{region}  summed measured MW of the
+                                               region's coal/gas/distillate units
+    aemo_battery_fossil_units                  fossil units with a live reading
+
+The two derived region series both come from a DUID-level measurement paired
+with a map, because AEMO publishes neither directly at region granularity:
+curtailment is the DispatchIS REGIONSUM self-forecast minus the cleared MW per
+fuel, and fossil generation sums each measured Dispatch_SCADA unit that the OE
+fleet cache (`--fleet-cache-file`) tags as coal, gas or distillate. Absent
+cache, no fossil series; a DispatchIS file predating the SS_* columns yields
+no curtailment.
 
 and the intraday bookkeeping:
 
@@ -312,6 +328,35 @@ DEFAULT_RETRY_BUDGET = 30.0
 # tzdata, so ZoneInfo("Australia/Sydney") would raise in the container - and the
 # pinned offset is exact here, not an approximation.
 AEST_UTC_OFFSET_SECONDS = 10 * 3600
+
+# OpenElectricity `fueltech_id` values counted as fossil for the per-region
+# fossil generation series: coal, gas and distillate. Bioenergy and hydro are
+# deliberately excluded. OpenElectricity is the fuel/region source because AEMO
+# publishes no per-region fuel breakdown - Dispatch_SCADA carries measured MW
+# but only a DUID - so each measured unit is attributed with this map.
+FOSSIL_FUELTECHS = frozenset(
+    {
+        "coal_black",
+        "coal_brown",
+        "gas_ccgt",
+        "gas_ocgt",
+        "gas_steam",
+        "gas_recip",
+        "gas_wcmg",
+        "distillate",
+    }
+)
+
+# The DispatchIS REGIONSUM columns carrying, per region, the self-forecast
+# (`UIGF`) and dispatch-cleared (`CLEAREDMW`) MW for each variable renewable
+# fuel. The gap between them is that fuel's curtailment in the region: capacity
+# available in the forecast that the dispatch engine did not clear. Verified
+# present in the real 2026-10-08 file at SS_SOLAR_UIGF 109, SS_WIND_UIGF 110,
+# SS_SOLAR_CLEAREDMW 111, SS_WIND_CLEAREDMW 112 (of a 130-column row).
+CURTAILMENT_COLUMNS = (
+    ("SS_WIND_UIGF", "SS_WIND_CLEAREDMW", "wind"),
+    ("SS_SOLAR_UIGF", "SS_SOLAR_CLEAREDMW", "solar"),
+)
 
 # An error body from these listing pages is not meaningful, but the cap keeps a
 # misrouted HTML page from bloating a log line.
@@ -748,6 +793,11 @@ def _region_sum_indices(header_row: list[str]) -> dict[str, int] | None:
     region and are empty for regions with none (TAS1). The table never appears
     for regions with no storage, and a region whose BDU columns are both empty
     is skipped.
+
+    The SS_* curtailment columns are recorded when present but are not required:
+    a REGIONSUM table without them still yields region storage, and any header a
+    synthetic test builds may omit them. Everything is indexed by name so a
+    column reorder upstream cannot silently read the wrong number.
     """
     positions = {}
     for name in ("SETTLEMENTDATE", "REGIONID", "BDU_INITIAL_ENERGY_STORAGE",
@@ -756,16 +806,26 @@ def _region_sum_indices(header_row: list[str]) -> dict[str, int] | None:
             positions[name] = header_row.index(name)
         except ValueError:
             return None
+    for name in ("SS_WIND_UIGF", "SS_WIND_CLEAREDMW",
+                 "SS_SOLAR_UIGF", "SS_SOLAR_CLEAREDMW"):
+        try:
+            positions[name] = header_row.index(name)
+        except ValueError:
+            pass
     return positions
 
 
 def parse_dispatchis_region_storage(data: bytes) -> dict:
-    """Reduce one DispatchIS CSV into per-region reported stored MWh.
+    """Reduce one DispatchIS CSV into per-region storage and curtailment.
 
     Returns {"file": str, "newest_interval": float, "regions": {region: {"ts":
-    float, "initial": float, "energy": float}}}. Only regions that report a
-    non-empty BDU_ENERGY_STORAGE or BDU_INITIAL_ENERGY_STORAGE are kept; the
-    stored figure inside each row falls back to the initial when blank.
+    float, "initial": float, "energy": float}}, "curtailment": {region: {"ts":
+    float, "wind"?: float, "solar"?: float}}}. Storage keeps only regions that
+    report a non-empty BDU_ENERGY_STORAGE or BDU_INITIAL_ENERGY_STORAGE (the
+    stored figure falls back to the initial when blank); curtailment keeps any
+    region whose SS_* columns are present, per fuel, as the self-forecast minus
+    the cleared MW floored at zero. The two maps are independent, so a region
+    with renewables but no batteries still contributes curtailment.
     """
     try:
         archive = zipfile.ZipFile(io.BytesIO(data))
@@ -781,8 +841,12 @@ def parse_dispatchis_region_storage(data: bytes) -> dict:
     filename = members[0].rsplit(".", 1)[0]
 
     regions: dict[str, dict] = {}
+    curtailment: dict[str, dict] = {}
     newest: float | None = None
     indices: dict[str, int] | None = None
+    # Which (UIGF index, CLEAREDMW index, fuel) triples this header can supply;
+    # empty when the file predates the SS_* columns.
+    curtail_fields: list[tuple[int, int, str]] = []
     handled_rows = 0
     with archive.open(members[0]) as member:
         for row in csv_row_reader(member):
@@ -791,39 +855,81 @@ def parse_dispatchis_region_storage(data: bytes) -> dict:
             if row[0] == "I":
                 if len(row) >= 3 and row[1] == "DISPATCH" and row[2] == "REGIONSUM":
                     indices = _region_sum_indices(row)
+                    if indices is not None:
+                        curtail_fields = [
+                            (indices[uigf], indices[cleared], fuel)
+                            for uigf, cleared, fuel in CURTAILMENT_COLUMNS
+                            if uigf in indices and cleared in indices
+                        ]
                 continue
             if row[0] != "D" or indices is None:
                 continue
             if len(row) < 3 or row[1] != "DISPATCH" or row[2] != "REGIONSUM":
-                continue
-            if len(row) <= indices["BDU_ENERGY_STORAGE"]:
                 continue
             stamp = parse_aest(row[indices["SETTLEMENTDATE"]])
             region = row[indices["REGIONID"]]
             if stamp is None or not region:
                 continue
             handled_rows += 1
-            initial_text = row[indices["BDU_INITIAL_ENERGY_STORAGE"]]
-            energy_text = row[indices["BDU_ENERGY_STORAGE"]]
-            if not initial_text and not energy_text:
-                continue  # TAS1: a region with no BDU storage reports blanks
-            try:
-                initial = float(initial_text) if initial_text else None
-                energy = float(energy_text) if energy_text else initial
-            except ValueError:
-                log.warning("region %s: non-numeric BDU storage at %s", region, stamp)
-                continue
-            entry = regions.get(region)
-            if entry is None or stamp >= entry["ts"]:
-                regions[region] = {"ts": stamp, "initial": initial, "energy": energy}
-            if newest is None or stamp > newest:
-                newest = stamp
+            if len(row) > max(indices["BDU_ENERGY_STORAGE"],
+                              indices["BDU_INITIAL_ENERGY_STORAGE"]):
+                initial_text = row[indices["BDU_INITIAL_ENERGY_STORAGE"]]
+                energy_text = row[indices["BDU_ENERGY_STORAGE"]]
+                if initial_text or energy_text:
+                    try:
+                        initial = float(initial_text) if initial_text else None
+                        energy = float(energy_text) if energy_text else initial
+                    except ValueError:
+                        log.warning(
+                            "region %s: non-numeric BDU storage at %s", region, stamp
+                        )
+                    else:
+                        entry = regions.get(region)
+                        if entry is None or stamp >= entry["ts"]:
+                            regions[region] = {
+                                "ts": stamp, "initial": initial, "energy": energy,
+                            }
+                        if newest is None or stamp > newest:
+                            newest = stamp
+            if curtail_fields:
+                readings: dict[str, float] | None = {}
+                for uigf_idx, cleared_idx, fuel in curtail_fields:
+                    if uigf_idx >= len(row) or cleared_idx >= len(row):
+                        continue
+                    uigf_text = row[uigf_idx]
+                    cleared_text = row[cleared_idx]
+                    if not uigf_text and not cleared_text:
+                        continue
+                    try:
+                        uigf = float(uigf_text) if uigf_text else 0.0
+                        cleared = float(cleared_text) if cleared_text else 0.0
+                    except ValueError:
+                        log.warning(
+                            "region %s: non-numeric %s curtailment at %s",
+                            region, fuel, stamp,
+                        )
+                        readings = None
+                        break
+                    # Floored at zero: the gap is legitimately negative when a
+                    # unit generates above its own self-forecast.
+                    readings[fuel] = max(0.0, uigf - cleared)
+                if readings:
+                    entry = curtailment.get(region)
+                    if entry is None or stamp >= entry["ts"]:
+                        curtailment[region] = {"ts": stamp, **readings}
+                    if newest is None or stamp > newest:
+                        newest = stamp
 
-    if not regions:
+    if not regions and not curtailment:
         raise ScrapeError(
-            "no REGIONSUM BDU storage in %s (handled %d)" % (filename, handled_rows)
+            "no REGIONSUM rows in %s (handled %d)" % (filename, handled_rows)
         )
-    return {"file": filename, "newest_interval": newest, "regions": regions}
+    return {
+        "file": filename,
+        "newest_interval": newest,
+        "regions": regions,
+        "curtailment": curtailment,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -964,12 +1070,13 @@ def render_intraday(
 ) -> str:
     """Exposition for the intraday cycle's last readings.
 
-    Each side is independent: a failed SCADA read omits the per-unit power
-    series while a healthy DispatchIS read still publishes the region storage
-    (and vice versa); each has its own success gauge, and neither repeats a
-    measurement it did not verify this cycle. The per-unit *inferred* stored MWh
-    is a fourth, coupled side: it is served only when a daily anchor exists AND
-    the SCADA feed is live this cycle, since it is built from SCADA.
+    Each side is independent: a failed SCADA read omits the per-unit power and
+    per-region fossil series while a healthy DispatchIS read still publishes the
+    region storage and curtailment (and vice versa); each has its own success
+    gauge, and neither repeats a measurement it did not verify this cycle. The
+    per-unit *inferred* stored MWh is a coupled side: it is served only when a
+    daily anchor exists AND the SCADA feed is live this cycle, since it is built
+    from SCADA.
     """
     lines: list[str] = []
     units = scada.get("units") or {}
@@ -1037,6 +1144,61 @@ def render_intraday(
             "# TYPE aemo_battery_region_storage_interval_timestamp_seconds gauge",
             "aemo_battery_region_storage_interval_timestamp_seconds %s"
             % fmt(region_storage.get("newest_interval")),
+        ]
+
+    curtailment = region_storage.get("curtailment") or {}
+    if curtailment and region_ok:
+        lines += [
+            "# HELP aemo_battery_region_curtailment_mw Renewable capacity the "
+            "dispatch engine did not clear, at the newest interval, MW: the "
+            "self-forecast (SS_*_UIGF) minus the cleared MW (SS_*_CLEAREDMW), "
+            "per region and fuel. Floored at zero; the raw gap is negative when "
+            "a unit generates above its own forecast.",
+            "# TYPE aemo_battery_region_curtailment_mw gauge",
+            "# HELP aemo_battery_region_curtailment_timestamp_seconds Newest "
+            "interval behind the region curtailment readings.",
+            "# TYPE aemo_battery_region_curtailment_timestamp_seconds gauge",
+        ]
+        for region in sorted(curtailment):
+            r = curtailment[region]
+            for fuel in ("wind", "solar"):
+                if fuel in r:
+                    lines.append(
+                        'aemo_battery_region_curtailment_mw{region="%s",fuel="%s"} %s'
+                        % (escape_label(region), fuel, fmt(r[fuel]))
+                    )
+            lines.append(
+                'aemo_battery_region_curtailment_timestamp_seconds{region="%s"} %s'
+                % (escape_label(region), fmt(r["ts"]))
+            )
+
+    fossil = scada.get("region_fossil") or {}
+    if fossil and scada_ok:
+        lines += [
+            "# HELP aemo_battery_region_fossil_generation_mw Measured output of "
+            "coal, gas and distillate units, summed per region, MW. The MW are "
+            "AEMO Dispatch_SCADA; the fuel and region attribution is "
+            "OpenElectricity fleet metadata (--fleet-cache-file), the only "
+            "source of a per-region fuel breakdown.",
+            "# TYPE aemo_battery_region_fossil_generation_mw gauge",
+            "# HELP aemo_battery_region_fossil_timestamp_seconds Newest SCADA "
+            "interval behind the region fossil generation.",
+            "# TYPE aemo_battery_region_fossil_timestamp_seconds gauge",
+        ]
+        for region in sorted(fossil):
+            f = fossil[region]
+            lines += [
+                'aemo_battery_region_fossil_generation_mw{region="%s"} %s'
+                % (escape_label(region), fmt(f["mw"])),
+                'aemo_battery_region_fossil_timestamp_seconds{region="%s"} %s'
+                % (escape_label(region), fmt(f["ts"])),
+            ]
+        lines += [
+            "# HELP aemo_battery_fossil_units Fossil units with a live reading "
+            "this cycle.",
+            "# TYPE aemo_battery_fossil_units gauge",
+            "aemo_battery_fossil_units %d"
+            % sum(f["units"] for f in fossil.values()),
         ]
 
     infer_units = (infer or {}).get("units") or {}
@@ -1443,15 +1605,18 @@ class IntradayPoller:
         # tried and unusable (do not re-download the archive every cycle).
         self._backfilled_end: float | None = None
         self.now_fn = time.time
-        # Registered storage capacity per DUID, read from the OE fleet cache so
-        # charging clamps at the battery's capacity as well as at zero. Absent
-        # (no --fleet-cache-file, or one not yet written) means the top clamp is
-        # simply not available and units stay floored at zero only. Loaded
+        # The OE fleet cache serves two derived maps. Registered storage
+        # capacity per DUID lets charging clamp at the battery's capacity as
+        # well as at zero; absent (no --fleet-cache-file, or one not yet
+        # written) means the top clamp is simply not available and units stay
+        # floored at zero only. DUID -> region for fossil units lets each
+        # measured coal/gas/distillate MW be attributed to a region. Loaded
         # before the state restore so a restored value above capacity is pinned.
         self.fleet_cache_file = fleet_cache_file
         self._fleet_capacity: dict[str, float] = {}
-        self._fleet_capacity_last_attempt = 0.0
-        self._maybe_load_fleet_capacity(force=True)
+        self._fossil_region: dict[str, str] = {}
+        self._fleet_metadata_last_attempt = 0.0
+        self._maybe_load_fleet_metadata(force=True)
         self._inferred: dict[str, dict] = {}
         if infer_state_file:
             self._load_infer_state()
@@ -1478,8 +1643,9 @@ class IntradayPoller:
         started = time.monotonic()
         # Pick up the OE fleet cache if it was not there at startup (a cold
         # start usually beats the OE exporter to the shared volume), so this
-        # cycle's integration already clamps at the units' capacities.
-        self._maybe_load_fleet_capacity()
+        # cycle's integration already clamps at the units' capacities and the
+        # fossil region map is available.
+        self._maybe_load_fleet_metadata()
         scada_ok = region_ok = False
         scada_state: dict = {}
         is_state: dict = {}
@@ -1503,8 +1669,15 @@ class IntradayPoller:
             log.error("DispatchIS poll failed: %s", exc)
 
         if scada_ok:
-            batteries = self._learned_batteries()
             units = scada_state.get("units") or {}
+            # Fossil generation is summed from the *unfiltered* SCADA rows,
+            # before the battery filter below narrows `units`; it needs only the
+            # DUID -> region map, not the battery set. A reused state already
+            # carries its region_fossil from the cycle that parsed the file, and
+            # its `units` are already filtered, so it must not be recomputed.
+            if not scada_state.get("reused"):
+                scada_state["region_fossil"] = self._fossil_generation(units)
+            batteries = self._learned_batteries()
             if batteries:
                 scada_state["units"] = {
                     duid: u for duid, u in units.items() if duid in batteries
@@ -1850,56 +2023,101 @@ class IntradayPoller:
             )
         self._prune_stale(now)
 
-    def _maybe_load_fleet_capacity(self, force: bool = False) -> None:
-        """Load DUID -> registered storage capacity (MWh) from the OE fleet cache.
+    def _maybe_load_fleet_metadata(self, force: bool = False) -> None:
+        """Derive the two DUID maps this exporter needs from the OE fleet cache.
 
-        The OE exporter writes this cache for the whole fleet, so it carries a
-        capacity for units this exporter never anchors - exactly the set the
-        top clamp needs. Missing or unreadable is not fatal: the map stays
-        empty (or keeps its last good contents) and units are floored at zero
-        only, so a malformed cache degrades to the pre-capacity behaviour
-        instead of dropping the inferred series.
+        The OE exporter writes this cache for the whole NEM fleet, so it carries
+        a registered storage capacity for units this exporter never anchors
+        (exactly the set the top clamp needs) and a fueltech/region for every
+        unit, from which the fossil set is built. Missing or unreadable is not
+        fatal: the maps stay empty (or keep their last good contents), units are
+        floored at zero only, and no fossil series is published, so a malformed
+        cache degrades instead of dropping the inferred series.
+
+        The stop condition is *both* maps, not either. A cache written by the
+        previous exporter holds only battery capacity, so an early return on
+        capacity alone would leave the fossil map empty forever - the file is
+        replaced in place by the OE exporter's next fleet refresh, and this
+        poller has to notice. Retrying until the fossil map is populated (at
+        most once per 300s, below) picks that up within a cycle or two.
         """
         if not self.fleet_cache_file:
             return
-        if self._fleet_capacity and not force:
+        if not force and self._fleet_capacity and self._fossil_region:
             return
         now = self.now_fn()
         # A cold start routinely beats the OE exporter to the shared volume;
         # retry at most once per poll cycle rather than on every integration
         # step, and never spam the log in between.
-        if not force and now - self._fleet_capacity_last_attempt < 300.0:
+        if not force and now - self._fleet_metadata_last_attempt < 300.0:
             return
-        self._fleet_capacity_last_attempt = now
+        self._fleet_metadata_last_attempt = now
         try:
             with open(self.fleet_cache_file, "r", encoding="utf-8") as handle:
                 payload = json.load(handle)
         except (OSError, ValueError) as exc:
             log.warning(
-                "fleet capacity cache %s unreadable (%s); inference is floored "
-                "at zero only", self.fleet_cache_file, exc,
+                "fleet cache %s unreadable (%s); inference is floored at zero "
+                "only and fossil generation is omitted",
+                self.fleet_cache_file, exc,
             )
             return
         data = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(data, list):
             return
         caps: dict[str, float] = {}
+        fossil_region: dict[str, str] = {}
         for facility in data:
             if not isinstance(facility, dict):
                 continue
+            region = facility.get("network_region")
             for unit in facility.get("units") or ():
                 if not isinstance(unit, dict):
                     continue
                 code = unit.get("code")
+                if not isinstance(code, str):
+                    continue
                 cap = unit.get("capacity_storage")
-                if isinstance(code, str) and isinstance(cap, (int, float)) and cap > 0:
+                if isinstance(cap, (int, float)) and cap > 0:
                     caps[code] = float(cap)
+                if isinstance(region, str) and unit.get("fueltech_id") in FOSSIL_FUELTECHS:
+                    fossil_region[code] = region
         if caps:
             self._fleet_capacity = caps
             log.info(
                 "fleet capacity loaded: %d units from %s",
                 len(caps), self.fleet_cache_file,
             )
+        if fossil_region:
+            self._fossil_region = fossil_region
+            log.info(
+                "fossil region map loaded: %d units from %s",
+                len(fossil_region), self.fleet_cache_file,
+            )
+
+    def _fossil_generation(self, units: dict) -> dict:
+        """Per-region measured fossil MW from the unfiltered SCADA rows.
+
+        AEMO publishes no per-region fuel breakdown, so each measured DUID's MW
+        is attributed to its region with the map read from the OE fleet cache
+        and summed. Returns {region: {"ts": newest interval that region saw,
+        "mw": total MW, "units": contributing units}}; regions with no mapped
+        unit are absent. Positive MW is generation.
+        """
+        regions: dict[str, dict] = {}
+        for duid, u in units.items():
+            region = self._fossil_region.get(duid)
+            if region is None:
+                continue
+            entry = regions.get(region)
+            if entry is None:
+                regions[region] = {"ts": u["ts"], "mw": u["scada"], "units": 1}
+            else:
+                entry["mw"] += u["scada"]
+                entry["units"] += 1
+                if u["ts"] > entry["ts"]:
+                    entry["ts"] = u["ts"]
+        return regions
 
     def _infer_view(self, now: float) -> dict:
         """Snapshot for rendering: live units only, plus the anchor's age."""
@@ -2029,8 +2247,10 @@ INDEX_BODY = """<!doctype html>
 <b>Next_Day_Dispatch</b> UNIT_SOLUTION ENERGY_STORAGE gives measured stored MWh
 per unit but is published once a day (~04:11 AEST) and is the day's dispatch
 target, not a live view. The intraday pair - <b>Dispatch_SCADA</b> (measured
-output MW per unit) and <b>DispatchIS_Reports</b> (region-level BDU stored MWh) -
-updates every 5-minute interval and is what moves the chart through the day.</p>
+output MW per unit) and <b>DispatchIS_Reports</b> (region-level BDU stored MWh
+and SS_* wind/solar curtailment) - updates every 5-minute interval and is what
+moves the chart through the day. Per-region fossil generation is summed from
+Dispatch_SCADA using the OpenElectricity fleet cache for fuel and region.</p>
 <ul>
   <li><a href="/metrics">/metrics</a></li>
   <li><a href="/healthz">/healthz</a></li>
@@ -2143,8 +2363,10 @@ def main(argv: list[str] | None = None) -> int:
         "--fleet-cache-file",
         help="JSON file the OE exporter writes (its --fleet-cache-file), read "
         "for the per-DUID registered storage capacity that the inference top "
-        "clamps at 100%%. Read-only; a missing or unreadable file degrades to "
-        "the zero floor only.",
+        "clamps at 100%%, and for the per-DUID fuel and region that attribute "
+        "measured Dispatch_SCADA MW to the per-region fossil series. Read-only; "
+        "a missing or unreadable file degrades to the zero floor only and "
+        "omits fossil generation.",
     )
     parser.add_argument(
         "--infer-backfill",

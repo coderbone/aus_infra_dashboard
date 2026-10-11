@@ -83,6 +83,22 @@ def fast_chargers_not_nearly_full():
     )
 
 
+def fossil_runtime():
+    """Seconds the region's stored battery energy would carry the region's
+    *current* fossil generation if the fossil fleet stopped at once:
+    `stored MWh / fossil MW` (x3600 for seconds). Fanciful - lossless
+    discharge, unbounded rate, fossil output taken as the load left behind.
+
+    `clamp_min` keeps a denominator that momentarily reads zero from dividing
+    by it, and `clamp_max` pins the display at a week (in seconds) so a
+    near-zero denominator cannot blow the axis. Regions with no fossil units
+    publish no fossil series, so they simply have no line here."""
+    return (
+        "clamp_max(3600 * aemo_battery_region_stored_mwh / on(region) "
+        "clamp_min(aemo_battery_region_fossil_generation_mw, 1), 604800)"
+    )
+
+
 def ds_():
     return dict(DS)
 
@@ -1320,9 +1336,44 @@ panels.append(
 
 
 panels.append(
+    timeseries(
+        "Fossil-load runtime by region: stored MWh / fossil MW (fanciful)",
+        {"h": 9, "w": 24, "x": 0, "y": 150},
+        [
+            target(
+                fossil_runtime(),
+                instant=False,
+                legend="{{region}}",
+            )
+        ],
+        "How long the region's stored battery energy would carry the region's "
+        "**current** fossil generation if the whole fossil fleet stopped at "
+        "once: `stored MWh / fossil MW` (x3600 for seconds, which Grafana's "
+        "time unit renders as h/d). Fanciful on every axis - it assumes "
+        "lossless discharge at an unbounded rate, that fossil output is exactly "
+        "the load left behind, and that nothing else picks up the slack - so "
+        "read it as a mood, not a plan. It nevertheless *moves* the way one "
+        "wants: it rises as batteries fill and as fossil backs off (midday "
+        "solar) and falls as fossil ramps. `clamp_min` keeps a momentary zero "
+        "denominator from dividing by it and the value is pinned at a week so "
+        "one cannot blow the axis. Regions with no fossil units at all publish "
+        "no fossil series and so have no line here.\n\n"
+        "The numerator is AEMO's reported region `BDU_ENERGY_STORAGE` "
+        "(`aemo_battery_region_stored_mwh`); the denominator is measured "
+        "`Dispatch_SCADA` MW attributed to coal/gas/distillate by the OE fleet "
+        "cache (`aemo_battery_region_fossil_generation_mw`).",
+        axis="fossil-load runtime",
+        unit="s",
+        decimals=1,
+        span_nulls=False,
+    )
+)
+
+
+panels.append(
     gauge(
         "Most active batteries (charging): stored energy vs capacity",
-        {"h": 9, "w": 24, "x": 0, "y": 150},
+        {"h": 9, "w": 24, "x": 0, "y": 159},
         [
             target(
                 "100 * aemo_battery_inferred_stored_mwh / on(duid) "
@@ -1364,7 +1415,7 @@ panels.append(
 panels.append(
     gauge(
         "Most active batteries (discharging): stored energy vs capacity",
-        {"h": 9, "w": 24, "x": 0, "y": 159},
+        {"h": 9, "w": 24, "x": 0, "y": 168},
         [
             target(
                 "100 * aemo_battery_inferred_stored_mwh / on(duid) "

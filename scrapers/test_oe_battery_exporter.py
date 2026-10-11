@@ -1941,13 +1941,13 @@ class ClientTest(unittest.TestCase):
     def test_missing_data_key_is_an_empty_list(self):
         client = self._client()
         client._request = lambda url: {"success": True}
-        self.assertEqual(client.battery_fleet(), [])
+        self.assertEqual(client.facilities(), [])
 
     def test_fleet_payload_must_be_a_list(self):
         client = self._client()
         client._request = lambda url: {"success": True, "data": {"nope": 1}}
         with self.assertRaises(ScrapeError):
-            client.battery_fleet()
+            client.facilities()
 
     def test_invalid_json_is_a_scrape_error(self):
         client = exporter.OpenElectricityClient("k", retries=0, request_interval=0.0)
@@ -2015,7 +2015,7 @@ class ScraperClient(FakeClient):
         self.fleet = fleet
         self.fleet_calls = 0
 
-    def battery_fleet(self):
+    def facilities(self):
         self.fleet_calls += 1
         return facilities() if self.fleet is None else self.fleet
 
@@ -2417,7 +2417,7 @@ class ScraperTest(unittest.TestCase):
         self.assertTrue(os.path.exists(scorer_fleet := scraper.fleet_file))
         del scorer_fleet
         broken = ScraperClient(series={})
-        broken.battery_fleet = lambda: (_ for _ in ()).throw(ScrapeError("no api"))
+        broken.facilities = lambda: (_ for _ in ()).throw(ScrapeError("no api"))
         second = make_scraper(broken, fleet_file=scraper.fleet_file)
         body, ok = second.poll_once()
         self.assertTrue(ok)

@@ -4,9 +4,14 @@
 Source: the OpenElectricity API (formerly OpenNEM), at
 https://api.openelectricity.org.au . Two endpoints, both bearer-authenticated:
 
-    GET /facilities/?fueltech_id=battery
-        Fleet metadata. Every battery facility, its units, and per unit the
-        fields that matter here: `capacity_storage` (MWh) and `data_last_seen`.
+    GET /facilities/
+        Fleet metadata for the whole NEM, one request. Every facility, its
+        region, its units, and per unit the fields that matter here:
+        `fueltech_id`, `capacity_storage` (MWh) and `data_last_seen`. Fetched
+        unfiltered (not `?fueltech_id=battery`) because the same response is
+        cached to disk and read by the AEMO exporter, which needs the
+        fueltech/region of *every* unit; `unit_rows` narrows it to batteries
+        for this exporter's own series.
 
     GET /data/facilities/NEM?metrics=storage_battery&metrics=power&facility_code=<CODE>
         Time series for one facility, one series per *unit* per metric, named
@@ -274,9 +279,10 @@ DEFAULT_NETWORK = "NEM"
 # "Python-urllib" string, so a truthful UA is both allowed and correct.
 USER_AGENT = "aus-infra-dashboard/1.0 (+battery-soc-exporter)"
 
-# Fueltech filter for the fleet call. The API separates a battery into
-# `battery`, `battery_charging` and `battery_discharging`; `battery` is the
-# facility classification and is what carries capacity_storage.
+# Fueltech this exporter keeps when flattening the (unfiltered) fleet response
+# into battery rows. The API separates a battery into `battery`,
+# `battery_charging` and `battery_discharging`; `battery` is the facility
+# classification and is what carries capacity_storage.
 BATTERY_FUELTECH = "battery"
 
 # Statuses worth exporting. `committed` units have not operated yet and return
@@ -540,8 +546,17 @@ class OpenElectricityClient:
 
     # -- endpoints ---------------------------------------------------------- #
 
-    def battery_fleet(self) -> list[dict]:
-        payload = self.get("/facilities/", {"fueltech_id": BATTERY_FUELTECH})
+    def facilities(self) -> list[dict]:
+        """The whole NEM facility list, one request.
+
+        Deliberately unfiltered: the exporter only needs the battery units, but
+        the same response is cached to disk and read by the sibling AEMO
+        exporter, which needs every unit's fueltech and region to attribute its
+        measured SCADA MW. `unit_rows` narrows this to batteries for the
+        battery-specific series. WEM facilities ride along harmlessly - their
+        unit codes never match an AEMO dispatch DUID.
+        """
+        payload = self.get("/facilities/")
         facilities = payload.get("data") or []
         if not isinstance(facilities, list):
             raise ScrapeError("/facilities/ -> data is %s, not a list" % type(facilities).__name__)
@@ -2261,7 +2276,7 @@ class BatteryScraper:
         if fresh:
             return self._fleet
         try:
-            facilities = self.client.battery_fleet()
+            facilities = self.client.facilities()
         except (ScrapeError, AuthError) as exc:
             cached = self.cached_fleet()
             if cached is None:

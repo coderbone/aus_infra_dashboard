@@ -269,6 +269,30 @@ function unitLiveStatus(facility) {
 
 function radiusFor(mwh) { return Math.min(14800, 2800 + 12000 * mwh / (mwh + 3000)); }
 
+function unitPower(code) {
+  const m = state.batteries[code];
+  if (!m) return null;
+  const oe = (typeof m.power_mw === "number")
+    ? { mw: m.power_mw, src: "oe", age: typeof m.age_s === "number" ? m.age_s : Infinity }
+    : null;
+  const aemo = (typeof m.aemo_power_mw === "number")
+    ? { mw: m.aemo_power_mw, src: "aemo", age: typeof m.aemo_power_age_s === "number" ? m.aemo_power_age_s : Infinity }
+    : null;
+  if (!oe && !aemo) return null;
+  if (!aemo) return oe;
+  if (!oe) return aemo;
+  return oe.age <= aemo.age ? oe : aemo;
+}
+function facilityPower(fac) {
+  let sumMw = 0;
+  let has = false;
+  for (const u of fac.units) {
+    const p = unitPower(u.code);
+    if (p) { sumMw += p.mw; has = true; }
+  }
+  return has ? { mw: sumMw } : null;
+}
+
 function unitSoc(code, capacityMwh) {
   const m = state.batteries[code];
   if (!m) return null;
@@ -315,14 +339,19 @@ function applyBatteries() {
     }
     const total = facilityTotal(fac);
     const soc = s ? s.soc : (monitored && typeof live.m.soc_ratio === "number" ? live.m.soc_ratio : null);
+    const fp = facilityPower(fac);
+    const ring = fp && Math.abs(fp.mw) > 5 ? true : false;
+    const ringWeight = fp ? Math.min(6, 2 + Math.abs(fp.mw) / 20) : 0;
+    const ringColor = fp && fp.mw < 0 ? "#22c55e" : (fp && fp.mw > 0 ? "#ef4444" : "#101a2b");
     const opts = {
       radius: radiusFor(total),
-      weight: s ? 1.5 : (monitored ? 1.5 : 1),
-      color: s ? "#101a2b" : (monitored ? "#101a2b" : "#3a4c63"),
+      weight: ring ? ringWeight : (s ? 1.5 : (monitored ? 1.5 : 1)),
+      color: ring ? ringColor : (s ? "#101a2b" : (monitored ? "#101a2b" : "#3a4c63")),
       fillColor: soc != null
         ? ramp(soc, STOPS_SOC)
         : (STATUS_COLOR[fac.units[0].status] || "#54657a"),
       fillOpacity: soc != null ? 0.85 : 0.45,
+      className: ring ? "bat-ring-pulse" : "",
     };
     const pos = L.latLng(loc.lat, loc.lng);
     if (!layer) {
@@ -337,6 +366,13 @@ function applyBatteries() {
       layer.setStyle(opts);
       layer.setPopupContent(batteryPopup(fac));
     }
+    try {
+      const path = layer._path;
+      if (path) {
+        if (ring) path.classList.add("bat-ring-pulse");
+        else path.classList.remove("bat-ring-pulse");
+      }
+    } catch (e) {}
     layer.setTooltipContent(batteryTip(fac, live, soc, total));
   }
 }

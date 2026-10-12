@@ -131,3 +131,5 @@ html, body {
 .pop table { border-collapse: collapse; margin-top: 4px; }
 .pop td { padding: 1px 8px 1px 0; }
 .pop td.num { text-align: right; color: #cfe0f2; }
+@keyframes bat-ring-pulse { 0%,100% { opacity: 0.9; } 50% { opacity: 0.25; } }
+.bat-ring-pulse { animation: bat-ring-pulse 1.2s ease-in-out infinite; }

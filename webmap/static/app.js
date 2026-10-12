@@ -106,7 +106,8 @@ async function initGeometry() {
     const isSchematic = p.kind === "schematic";
     const live = p.kind !== "schematic";
     const snow = p.kind === "snowy";
-    const layer = L.polyline(feat.geometry.coordinates, {
+    const latlngs = feat.geometry.coordinates.map((c) => [c[1], c[0]]);
+    const layer = L.polyline(latlngs, {
       color: snow ? LINE_COLORS.snowy : LINE_COLORS.nodata,
       weight: snow ? 2 : 1.2,
       opacity: 0.9,

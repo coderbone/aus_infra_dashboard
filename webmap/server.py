@@ -52,6 +52,14 @@ LIVE_QUERIES = {
         "stored_mwh": {"expr": "oe_battery_energy_stored_mwh", "key": "unit"},
         "capacity_mwh": {"expr": "oe_battery_capacity_storage_mwh", "key": "unit"},
         "age_s": {"expr": "oe_battery_sample_age_seconds", "key": "unit"},
+        # whole-fleet live coverage from the AEMO exporter's per-duid estimates
+        "inf_stored_mwh": {"expr": "aemo_battery_inferred_stored_mwh", "key": "duid"},
+        "inf_age_s": {"expr": "aemo_battery_inferred_age_seconds", "key": "duid"},
+        "inf_timestamp": {"expr": "aemo_battery_inferred_timestamp_seconds", "key": "duid"},
+        # fresh 5-min SCADA power from AEMO
+        "aemo_power_mw": {"expr": "aemo_battery_power_mw", "key": "duid"},
+        "aemo_power_age_s": {"expr": "aemo_battery_power_age_seconds", "key": "duid"},
+        "aemo_power_ts": {"expr": "aemo_battery_power_timestamp_seconds", "key": "duid"},
     },
 }
 
@@ -176,6 +184,7 @@ class Handler(BaseHTTPRequestHandler):
             body = body.encode()
         self.send_response(code)
         self.send_header("Content-Type", ctype)
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)

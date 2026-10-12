@@ -19,3 +19,17 @@
    is not published by AEMO at all and remains impossible; binding constraint IDs and the
    locally-constrained flags are still noted as future work. See scrapers/NOTES.md.
 
+
+5. investigate the negative `aemo_interconnector_age_seconds`. Observed 2026-10-12: the gauge
+   is ~-97s for all seven links, while the corresponding
+   `aemo_interconnector_timestamp_seconds` is a *positive* ~91s old when re-read later. Cause
+   is not clock skew (the exporter container's `date +%s` equals the host's). `age` is computed
+   once per export as `now - ts` and cached (aemo_battery_exporter.py ~line 1440), and at export
+   time `ts` is ~97s *ahead* of the exporter clock — i.e. DispatchIS `SETTLEMENTDATE` looks like
+   the interval's **ending** stamp, so it is briefly in the future when the file is processed.
+   Consequences: tooltips/stale checks read "-97s old"; any age<=0 treated as fresh is fine here
+   but the sign is misleading. To close this out, confirm SETTLEMENTDATE semantics against the
+   file's own publish time across several intervals, then either base `age` on the interval start
+   (`SETTLEMENTDATE` minus the 5-minute dispatch interval, inferred from consecutive stamps) or
+   clamp at 0 and document that SETTLEMENTDATE is the interval end. Verify the battery
+   `*_age_seconds` (different tables) are unaffected — they read positive (~200s), so likely are.

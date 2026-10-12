@@ -269,6 +269,35 @@ function unitLiveStatus(facility) {
 
 function radiusFor(mwh) { return Math.min(14800, 2800 + 12000 * mwh / (mwh + 3000)); }
 
+function unitSoc(code, capacityMwh) {
+  const m = state.batteries[code];
+  if (!m) return null;
+  const measured = typeof m.soc_ratio === "number"
+    ? { soc: m.soc_ratio, src: "measured", age: typeof m.age_s === "number" ? m.age_s : Infinity }
+    : null;
+  const inferred = (typeof m.inf_stored_mwh === "number" && capacityMwh > 0)
+    ? { soc: m.inf_stored_mwh / capacityMwh, src: "inferred", age: typeof m.inf_age_s === "number" ? m.inf_age_s : Infinity }
+    : null;
+  if (!measured && !inferred) return null;
+  if (!inferred) return measured;
+  if (!measured) return inferred;
+  return measured.age <= inferred.age ? measured : inferred;
+}
+
+function facilitySoc(fac) {
+  let wsum = 0, w = 0, src = null;
+  for (const u of fac.units) {
+    const s = unitSoc(u.code, u.capacity_mwh);
+    if (!s) continue;
+    wsum += s.soc * u.capacity_mwh;
+    w += u.capacity_mwh;
+    if (s.src === "measured") src = "measured";
+    else if (src !== "measured") src = "inferred";
+  }
+  if (!w) return null;
+  return { soc: wsum / w, src };
+}
+
 function applyBatteries() {
   for (const fac of state.fleet) {
     const loc = fac.location;
@@ -279,20 +308,21 @@ function applyBatteries() {
     }
     const live = unitLiveStatus(fac.facility);
     const monitored = !!live;
-    if (!monitored && !showUnmonitored) {
+    const s = facilitySoc(fac);
+    if (!monitored && !showUnmonitored && !s) {
       if (layer) { map.removeLayer(layer); delete batteryLayers[fac.facility]; }
       continue;
     }
     const total = facilityTotal(fac);
-    const soc = monitored && typeof live.m.soc_ratio === "number" ? live.m.soc_ratio : null;
+    const soc = s ? s.soc : (monitored && typeof live.m.soc_ratio === "number" ? live.m.soc_ratio : null);
     const opts = {
       radius: radiusFor(total),
-      weight: monitored ? 1.5 : 1,
-      color: monitored ? "#101a2b" : "#3a4c63",
-      fillColor: monitored && soc != null
+      weight: s ? 1.5 : (monitored ? 1.5 : 1),
+      color: s ? "#101a2b" : (monitored ? "#101a2b" : "#3a4c63"),
+      fillColor: soc != null
         ? ramp(soc, STOPS_SOC)
         : (STATUS_COLOR[fac.units[0].status] || "#54657a"),
-      fillOpacity: monitored && soc != null ? 0.85 : 0.45,
+      fillOpacity: soc != null ? 0.85 : 0.45,
     };
     const pos = L.latLng(loc.lat, loc.lng);
     if (!layer) {

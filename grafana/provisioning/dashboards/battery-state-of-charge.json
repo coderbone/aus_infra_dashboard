@@ -3058,6 +3058,67 @@
       ],
       "title": "Most active batteries (discharging): stored energy vs capacity",
       "type": "gauge"
+    },
+    {
+      "id": 29,
+      "type": "timeseries",
+      "title": "Interconnector load factor (directional)",
+      "description": "Load factor in the direction of flow vs applicable limit; bidirectional limits may differ (AEMO export/import limits).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "grafana-prometheus-datasource"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 177
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 120,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 70
+              },
+              {
+                "color": "orange",
+                "value": 85
+              },
+              {
+                "color": "red",
+                "value": 95
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "expr": "(aemo_interconnector_flow_mw > 0) * (aemo_interconnector_flow_mw / clamp_min(aemo_interconnector_export_limit_mw, 1)) * 100 + (aemo_interconnector_flow_mw < 0) * ((-aemo_interconnector_flow_mw) / clamp_min(aemo_interconnector_import_limit_mw, 1)) * 100",
+          "legendFormat": "{{interconnector}}",
+          "refId": "A"
+        }
+      ],
+      "pluginVersion": "12.1.0"
     }
   ],
   "preload": false,

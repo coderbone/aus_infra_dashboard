@@ -3063,10 +3063,10 @@
       "id": 29,
       "type": "timeseries",
       "title": "Interconnector load factor (directional)",
-      "description": "Load factor in the direction of flow vs applicable limit; bidirectional limits may differ (AEMO export/import limits).",
+      "description": "Load factor in the direction of flow vs nominal capacity (directional), derived from AEMO Interconnector Capabilities (3.13.3(p)) and DispatchIS flow.",
       "datasource": {
         "type": "prometheus",
-        "uid": "grafana-prometheus-datasource"
+        "uid": "PBFA97CFB590B2093"
       },
       "gridPos": {
         "h": 8,
@@ -3113,7 +3113,7 @@
       },
       "targets": [
         {
-          "expr": "(aemo_interconnector_flow_mw > 0) * (aemo_interconnector_flow_mw / clamp_min(aemo_interconnector_export_limit_mw, 1)) * 100 + (aemo_interconnector_flow_mw < 0) * ((-aemo_interconnector_flow_mw) / clamp_min(aemo_interconnector_import_limit_mw, 1)) * 100",
+          "expr": "100 * abs(aemo_interconnector_flow_mw) / ((aemo_interconnector_flow_mw>bool 0) * aemo_interconnector_nominal_forward_mw + (aemo_interconnector_flow_mw<bool 0) * aemo_interconnector_nominal_reverse_mw)",
           "legendFormat": "{{interconnector}}",
           "refId": "A"
         }

@@ -17,12 +17,15 @@ const state = {
 let metric = "stored";
 let showSchematic = true;
 let showUnmonitored = true;
+let showSolar = true;
+let showWind = true;
 
 const map = L.map("map", { zoomControl: true, attributionControl: false }).setView([-33.2, 145.0], 5);
 
 const regionLayers = {}; // code -> path layer
 const lineLayers = [];   // {feat, layer, arrow}
 const batteryLayers = {}; // facility -> circle layer
+const renLayers = {}; // key -> marker
 
 /* ---------- colour helpers ---------- */
 
@@ -442,7 +445,9 @@ function updateLegend() {
   }
   el.innerHTML = '<h4>' + label + '</h4>' + rows +
     '<div class="row"><span class="sw" style="background:#8ca3ba"></span><span>battery (live)</span></div>' +
-    '<div class="row"><span class="sw" style="background:#54657a"></span><span>battery (status)</span></div>';
+    '<div class="row"><span class="sw" style="background:#54657a"></span><span>battery (status)</span></div>' +
+    '<div class="row"><span class="sw" style="background:#ef4444"></span><span>solar</span></div>' +
+    '<div class="row"><span class="sw" style="background:#22c55e"></span><span>wind</span></div>';
 }
 
 /* ---------- controls ---------- */
@@ -460,6 +465,14 @@ function wireControls() {
   document.getElementById("tog-unmonitored").addEventListener("change", (ev) => {
     showUnmonitored = ev.target.checked;
     applyBatteries();
+  });
+  document.getElementById("tog-solar").addEventListener("change", (ev) => {
+    showSolar = ev.target.checked;
+    applyRenewables();
+  });
+  document.getElementById("tog-wind").addEventListener("change", (ev) => {
+    showWind = ev.target.checked;
+    applyRenewables();
   });
 }
 
@@ -480,11 +493,13 @@ async function poll() {
   state.interconnectors = data.interconnectors || {};
   state.batteries = data.batteries || {};
   state.fleet = data.fleet || [];
+  state.renewables = data.renewables || [];
   state.fetchedAt = data.fetched_at;
   state.prom = data.prometheus || "ok";
   applyRegions();
   applyLines();
   applyBatteries();
+  applyRenewables();
   updateHeader();
 }
 
@@ -494,3 +509,95 @@ initGeometry().then(() => {
   poll();
   setInterval(poll, POLL_MS);
 });
+
+function renMarkerKey(fac, unit) {
+  return (fac.facility || fac.name || "fac") + ":" + (unit.code || "u");
+}
+
+function applyRenewables() {
+  if (!state.renewables) state.renewables = [];
+  const existing = new Set(Object.keys(renLayers));
+  for (const fac of state.renewables) {
+    const loc = fac.location;
+    if (!loc || !loc.lat || !loc.lng) continue;
+    for (const u of fac.units || []) {
+      const ft = u.fueltech_id || (u.code && u.code.includes("WF") ? "wind" : "solar");
+      const isWind = (ft === "wind" || ft === "wind_farm");
+      const isSolar = (ft === "solar" || ft === "solar_utility");
+      if (isWind && !showWind) continue;
+      if (isSolar && !showSolar) continue;
+      const cap = u.capacity_mw || u.capacity || 0;
+      const key = renMarkerKey(fac, u);
+      existing.delete(key);
+      const size = Math.max(4, Math.min(18, 2 + Math.sqrt(Math.max(0, cap)) / 2));
+      const fill = isWind ? "#22c55e" : "#ef4444";
+      const svg = [
+        '<svg width="'+(size*2)+'" height="'+(size*2)+'" viewBox="0 0 '+(size*2)+' '+(size*2)+'" xmlns="http://www.w3.org/2000/svg">',
+        isWind
+          ? '<polygon points="' + size + ' 3 ' + (size*2-3) + ' ' + (size*2-3) + ' 3 ' + (size*2-3) + '" fill="'+fill+'" stroke="#101a2b" stroke-width="1.5" opacity="0.85"/>'
+          : '<rect x="2" y="2" width="'+(size*2-4)+'" height="'+(size*2-4)+'" fill="'+fill+'" stroke="#101a2b" stroke-width="1.5" opacity="0.85" transform="rotate(45,'+size+','+size+')"/>',
+        '</svg>'
+      ].join("");
+      const icon = L.divIcon({ html: svg, className: "leaflet-ren-marker", iconSize: [size*2, size*2], iconAnchor: [size, size] });
+      let layer = renLayers[key];
+      if (!layer) {
+        layer = L.marker([loc.lat, loc.lng], { icon }).addTo(map);
+        renLayers[key] = layer;
+      } else {
+        layer.setIcon(icon);
+        layer.setLatLng([loc.lat, loc.lng]);
+      }
+      const txt = '<div class="pop"><b>' + (u.code || fac.facility) + '</b><table>' +
+        '<tr><td>type</td><td>' + (isWind ? "wind" : "solar") + '</td></tr>' +
+        (cap ? '<tr><td>capacity</td><td class="num">'+cap.toFixed(1)+' MW</td></tr>' : "") +
+        '</table></div>';
+      layer.bindPopup(txt);
+    }
+  }
+  for (const k of existing) { if (renLayers[k]) { map.removeLayer(renLayers[k]); delete renLayers[k]; } }
+}
+
+
+function renMarkerKey(fac, unit) {
+  return (fac.facility || fac.name || "fac") + ":" + (unit.code || "u");
+}
+
+function applyRenewables() {
+  if (!state.renewables) state.renewables = [];
+  const existing = new Set(Object.keys(renLayers));
+  for (const fac of state.renewables) {
+    const loc = fac.location;
+    if (!loc || !loc.lat || !loc.lng) continue;
+    for (const u of fac.units || []) {
+      const ft = u.fueltech_id || "";
+      const isWind = (ft === "wind" || ft === "wind_farm");
+      const isSolar = (ft === "solar" || ft === "solar_utility");
+      if (isWind && !showWind) continue;
+      if (isSolar && !showSolar) continue;
+      const cap = u.capacity_mw || u.capacity || 0;
+      const key = renMarkerKey(fac, u);
+      existing.delete(key);
+      const size = Math.max(4, Math.min(16, 2 + Math.sqrt(cap) / 2.5));
+      const fill = isWind ? "#22c55e" : "#ef4444";
+      const svg = [];
+      svg.push('<svg width="' + (size*2) + '" height="' + (size*2) + '" xmlns="http://www.w3.org/2000/svg">');
+      if (isWind) {
+        svg.push('<polygon points="' + size + ' 3 ' + (size*2-3) + ' ' + (size*2-3) + ' 3 ' + (size*2-3) + '" fill="'+fill+'" stroke="#101a2b" stroke-width="1.5" opacity="0.9"/></svg>');
+      } else {
+        svg.push('<rect x="4" y="4" width="' + (size*2-8) + '" height="' + (size*2-8) + '" fill="' + fill + '" stroke="#101a2b" stroke-width="1.5" opacity="0.9" transform="rotate(45,' + size + ',' + size + ')"/></svg>');
+      }
+      const icon = L.divIcon({ html: svg.join(""), className: "leaflet-ren-marker", iconSize: [size*2, size*2], iconAnchor: [size, size] });
+      let layer = renLayers[key];
+      if (!layer) {
+        layer = L.marker([loc.lat, loc.lng], { icon }).addTo(map);
+        renLayers[key] = layer;
+      } else {
+        layer.setIcon(icon);
+        layer.setLatLng([loc.lat, loc.lng]);
+      }
+      const txt = '<div class="pop"><b>' + (u.code || fac.facility) + '</b></div>';
+      layer.bindPopup(txt);
+    }
+  }
+  for (const k of existing) { if (renLayers[k]) { map.removeLayer(renLayers[k]); delete renLayers[k]; } }
+}

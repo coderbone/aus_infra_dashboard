@@ -1391,7 +1391,55 @@ class RenderIntradayTest(unittest.TestCase):
             text,
         )
 
-    def test_interconnector_age_is_computed_from_now(self):
+        self.assertIn(
+            'aemo_interconnector_export_limit_mw{interconnector="VIC1-NSW1"} 690.8012',
+            text,
+        )
+
+    def test_interconnector_nominal_capacity_is_static_and_directional(self):
+        text = self.text()
+        fwd = next(
+            l for l in lines_named(text, "aemo_interconnector_nominal_forward_mw")
+            if 'interconnector="NSW1-QLD1"' in l
+        )
+        self.assertEqual(float(fwd.rsplit(" ", 1)[1]), 900.0)
+        rev = next(
+            l for l in lines_named(text, "aemo_interconnector_nominal_reverse_mw")
+            if 'interconnector="NSW1-QLD1"' in l
+        )
+        self.assertEqual(float(rev.rsplit(" ", 1)[1]), 1400.0)
+        self.assertIn(
+            'aemo_interconnector_nominal_forward_mw{interconnector="VIC1-NSW1"} 1700',
+            text,
+        )
+        self.assertIn(
+            'aemo_interconnector_nominal_reverse_mw{interconnector="T-V-MNSP1"} 478',
+            text,
+        )
+
+    def test_interconnector_nominal_is_independent_of_the_dispatch_limits(self):
+        # The nominal rating is static: it does not move with the interval's
+        # EXPORTLIMIT/IMPORTLIMIT, which is the whole point of using it.
+        rows = interconnector_sample_rows()
+        self.isr["interconnectors"] = exporter.parse_dispatchis_interconnectors(
+            make_zip(IS_CSV, [interconnector_header(), *rows])
+        )["interconnectors"]
+        text_a = self.text()
+        rows[0][15] = "1.0"  # EXPORTLIMIT of NSW1-QLD1
+        self.isr["interconnectors"] = exporter.parse_dispatchis_interconnectors(
+            make_zip(IS_CSV, [interconnector_header(), *rows])
+        )["interconnectors"]
+        text_b = self.text()
+        for name in (
+            "aemo_interconnector_nominal_forward_mw",
+            "aemo_interconnector_nominal_reverse_mw",
+        ):
+            self.assertEqual(
+                [l for l in lines_named(text_a, name)],
+                [l for l in lines_named(text_b, name)],
+            )
+
+
         text = self.text()
         line = next(
             l for l in lines_named(text, "aemo_interconnector_age_seconds")

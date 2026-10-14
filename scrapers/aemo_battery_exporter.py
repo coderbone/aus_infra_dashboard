@@ -143,6 +143,10 @@ per region at the newest interval:
     aemo_interconnector_metered_flow_mw{interconnector}  metered MW flow
     aemo_interconnector_export_limit_mw{interconnector}  EXPORTLIMIT, verbatim
     aemo_interconnector_import_limit_mw{interconnector}  IMPORTLIMIT, verbatim
+    aemo_interconnector_nominal_forward_mw{interconnector}  static nominal MW,
+                                               FROM->TO direction (positive flow)
+    aemo_interconnector_nominal_reverse_mw{interconnector}  static nominal MW,
+                                               TO->FROM direction (negative flow)
     aemo_interconnector_losses_mw{interconnector}  MWLOSSES
     aemo_interconnector_marginal_value{interconnector}  MARGINALVALUE ($/MWh)
     aemo_interconnector_marginal_loss_factor{interconnector}  MARGINALLOSS
@@ -401,6 +405,26 @@ INTERCONNECTOR_OPTIONAL = (
     "IMPORTLIMIT",
     "MARGINALLOSS",
 )
+
+# Nominal interconnector transfer capability, MW, per direction, from AEMO's
+# "Interconnector Capabilities" report (NER clause 3.13.3(p)). "forward" is the
+# FROM->TO direction, which is the sign convention AEMO's MWFLOW uses (a
+# positive flow leaves the first region of the id for the second). These are
+# the system-normal nominal ratings, deliberately *not* the dynamic
+# EXPORTLIMIT/IMPORTLIMIT the dispatch engine publishes: those bend to the
+# binding constraint, go negative on some links and even collapse onto the flow
+# itself, so a load factor taken against them is meaningless. A link absent
+# here publishes no nominal series. VNI's rating is a range under different
+# network conditions (400-1700 MW); the upper bound is used as the nominal.
+INTERCONNECTOR_NOMINAL_MW = {
+    "NSW1-QLD1": (900.0, 1400.0),   # QNI
+    "VIC1-NSW1": (1700.0, 1450.0),  # VNI
+    "V-SA": (600.0, 550.0),         # Heywood
+    "V-S-MNSP1": (220.0, 200.0),    # Murraylink
+    "T-V-MNSP1": (594.0, 478.0),    # Basslink
+    "N-Q-MNSP1": (107.0, 210.0),    # Terranora / Directlink
+    "NSW1-SA1": (150.0, 150.0),     # Project EnergyConnect (stage 1)
+}
 
 # An error body from these listing pages is not meaningful, but the cap keeps a
 # misrouted HTML page from bloating a log line.
@@ -1397,6 +1421,14 @@ def render_intraday(
             "dispatch solution, MW. Carried verbatim; a negative value is "
             "AEMO's own, not a sign error here.",
             "# TYPE aemo_interconnector_import_limit_mw gauge",
+            "# HELP aemo_interconnector_nominal_forward_mw Nominal transfer "
+            "capability, MW, in the FROM->TO direction (positive flow). Static "
+            "system-normal rating from AEMO's Interconnector Capabilities "
+            "report, unlike the dynamic EXPORTLIMIT/IMPORTLIMIT.",
+            "# TYPE aemo_interconnector_nominal_forward_mw gauge",
+            "# HELP aemo_interconnector_nominal_reverse_mw Nominal transfer "
+            "capability, MW, in the TO->FROM direction (negative flow).",
+            "# TYPE aemo_interconnector_nominal_reverse_mw gauge",
             "# HELP aemo_interconnector_losses_mw Interconnector losses at the "
             "newest interval, MW.",
             "# TYPE aemo_interconnector_losses_mw gauge",
@@ -1447,6 +1479,14 @@ def render_intraday(
                     ),
                 ),
             ]
+            nominal = INTERCONNECTOR_NOMINAL_MW.get(ic)
+            if nominal is not None:
+                lines += [
+                    'aemo_interconnector_nominal_forward_mw{interconnector="%s"} %s'
+                    % (escape_label(ic), fmt(nominal[0])),
+                    'aemo_interconnector_nominal_reverse_mw{interconnector="%s"} %s'
+                    % (escape_label(ic), fmt(nominal[1])),
+                ]
         lines += [
             "# HELP aemo_interconnector_report_info Processed DispatchIS file.",
             "# TYPE aemo_interconnector_report_info gauge",

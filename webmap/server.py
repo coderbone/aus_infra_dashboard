@@ -105,7 +105,9 @@ def build_live():
             except Exception as exc:  # noqa: BLE001 - one bad metric must not sink the page
                 out["prometheus"] = "degraded"
                 out["errors"].append(f"{spec['expr']}: {exc}")
-    out["fleet"] = build_fleet()
+    fl = build_fleet()
+    out["fleet"] = fl.get("fleet", []) if isinstance(fl, dict) else fl
+    out["renewables"] = fl.get("renewables", []) if isinstance(fl, dict) else []
     return out
 
 
@@ -127,36 +129,57 @@ def build_fleet():
     except Exception:  # noqa: BLE001
         return []
     fleet = []
+    renewables = []
     for facility in raw:
         if not isinstance(facility, dict):
             continue
-        units = []
+        units_bat = []
+        units_ren = []
         for unit in facility.get("units") or []:
             if not isinstance(unit, dict):
                 continue
-            capacity = unit.get("capacity_storage")
-            if not isinstance(capacity, (int, float)) or isinstance(capacity, bool) or capacity <= 0:
-                continue
-            if unit.get("fueltech_id") != "battery":
-                continue
-            units.append({
-                "code": unit.get("code") or "",
-                "capacity_mwh": float(capacity),
-                "registered_mw": unit.get("capacity_registered"),
-                "status": unit.get("status_id") or "",
-                "data_last_seen": unit.get("data_last_seen"),
-            })
-        if units:
+            ft = unit.get("fueltech_id") or ""
+            if ft == "battery":
+                capacity = unit.get("capacity_storage")
+                if isinstance(capacity, (int, float)) and not isinstance(capacity, bool) and capacity > 0:
+                    units_bat.append({
+                        "code": unit.get("code") or "",
+                        "capacity_mwh": float(capacity),
+                        "registered_mw": unit.get("capacity_registered"),
+                        "status": unit.get("status_id") or "",
+                        "data_last_seen": unit.get("data_last_seen"),
+                        "fueltech_id": "battery",
+                    })
+            elif ft in ("solar", "solar_utility", "wind", "wind_farm"):
+                cap = unit.get("capacity_registered") or unit.get("capacity_maximum")
+                if isinstance(cap, (int, float)) and not isinstance(cap, bool) and cap > 0:
+                    units_ren.append({
+                        "code": unit.get("code") or "",
+                        "capacity_mw": float(cap),
+                        "fueltech_id": ft if ft in ("solar", "solar_utility", "wind") else ("solar" if "solar" in str(ft) else "wind"),
+                        "status": unit.get("status_id") or "",
+                    })
+        if units_bat:
             fleet.append({
                 "facility": facility.get("code") or "",
                 "name": facility.get("facility_name") or facility.get("name") or "",
                 "region": facility.get("network_region") or "",
                 "location": facility.get("location"),
-                "units": units,
+                "units": units_bat,
+                "kind": "battery",
+            })
+        if units_ren:
+            renewables.append({
+                "facility": facility.get("code") or "",
+                "name": facility.get("facility_name") or facility.get("name") or "",
+                "region": facility.get("network_region") or "",
+                "location": facility.get("location"),
+                "units": units_ren,
+                "kind": "renewable",
             })
     _fleet_cache["mtime"] = mtime
-    _fleet_cache["data"] = fleet
-    return fleet
+    _fleet_cache["data"] = {"fleet": fleet, "renewables": renewables}
+    return _fleet_cache["data"]
 
 
 def _read_file(path, root):

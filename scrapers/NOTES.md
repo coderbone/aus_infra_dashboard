@@ -1482,6 +1482,15 @@ dispatch interval. Verified against the live site on 2026-10-08:
   negative. The region map is built independently of the storage map, so a
   region with no BDU storage (TAS1) still reports curtailment; when the four
   columns are missing the curtailment map is empty and only the series drop.
+- **There is no per-facility curtailment, only per-region.** `REGIONSUM` gives
+  the regional `UIGF − CLEAREDMW` gap; nothing in the intraday feed breaks it
+  down per DUID, so the map cannot show which wind/solar facilities inside a
+  region are curtailed. The webmap therefore dropped its curtailment-driven
+  visuals (the region-estimate marker colour and the pulsing). **If AEMO ever
+  publishes per-facility curtailment (e.g. a `UIGF` column in `Dispatch_SCADA`),
+  scrape it and use it for the marker colour/pulse** — that was the original
+  point of the visuals (spotting facilities curtailed harder than their
+  neighbours), and it is not achievable from region totals.
 - **Fossil generation needs a fuel map AEMO does not publish.** No per-region
   fossil feed exists (`Next_Day_Actual_Gen` is per-DUID MWh, the regional
   summary is weekly, `DUDETAILSUMMARY` has no fuel type), so the fleet cache is

@@ -16,6 +16,7 @@ const state = {
 };
 let metric = "stored";
 let showSchematic = true;
+let showMonitored = true;
 let showUnmonitored = true;
 let showSolar = true;
 let showWind = true;
@@ -266,9 +267,10 @@ function facilityTotal(fac) {
   return total;
 }
 
-function unitLiveStatus(facility) {
-  for (const [unit, m] of Object.entries(state.batteries)) {
-    if (m.facility === facility) return { unit, m };
+function unitLiveStatus(fac) {
+  for (const u of fac.units || []) {
+    const m = state.batteries[u.code];
+    if (m) return { unit: u.code, m };
   }
   return null;
 }
@@ -297,6 +299,14 @@ function facilityPower(fac) {
     if (p) { sumMw += p.mw; has = true; }
   }
   return has ? { mw: sumMw } : null;
+}
+
+// AEMO sign convention: positive = discharging, negative = charging.
+function rateLabel(mw) {
+  if (typeof mw !== "number" || !isFinite(mw)) return "&ndash;";
+  if (mw > 0.5) return '<span style="color:#ef4444">discharging ' + mw.toFixed(1) + " MW</span>";
+  if (mw < -0.5) return '<span style="color:#22c55e">charging ' + Math.abs(mw).toFixed(1) + " MW</span>";
+  return "idle";
 }
 
 function unitSoc(code, capacityMwh) {
@@ -336,15 +346,19 @@ function applyBatteries() {
       if (layer) { map.removeLayer(layer); delete batteryLayers[fac.facility]; }
       continue;
     }
-    const live = unitLiveStatus(fac.facility);
-    const monitored = !!live;
+    const live = unitLiveStatus(fac);
     const s = facilitySoc(fac);
-    if (!monitored && !showUnmonitored && !s) {
+    const monitored = !!live || !!s;
+    if (monitored && !showMonitored) {
+      if (layer) { map.removeLayer(layer); delete batteryLayers[fac.facility]; }
+      continue;
+    }
+    if (!monitored && !showUnmonitored) {
       if (layer) { map.removeLayer(layer); delete batteryLayers[fac.facility]; }
       continue;
     }
     const total = facilityTotal(fac);
-    const soc = s ? s.soc : (monitored && typeof live.m.soc_ratio === "number" ? live.m.soc_ratio : null);
+    const soc = s ? s.soc : (live && typeof live.m.soc_ratio === "number" ? live.m.soc_ratio : null);
     const fp = facilityPower(fac);
     const ring = fp && Math.abs(fp.mw) > 5 ? true : false;
     const ringWeight = fp ? Math.min(6, 2 + Math.abs(fp.mw) / 20) : 0;
@@ -397,25 +411,29 @@ function batteryTip(fac, live, soc, total) {
 }
 
 function batteryPopup(fac) {
-  const live = unitLiveStatus(fac.facility);
+  const live = unitLiveStatus(fac);
   const total = facilityTotal(fac);
-  let rows = "";
+  const fp = facilityPower(fac);
+  const fsoc = facilitySoc(fac);
+  const st = fac.units.map((u) => u.status).filter(Boolean)[0] || "";
+  let rows = '<tr><th>unit</th><th class="num">cap</th><th class="num">SoC</th><th class="num">rate</th></tr>';
   for (const u of fac.units) {
-    rows += '<tr><td>' + u.code + '</td><td>' + (u.status || "&ndash;") + '</td>' +
-            '<td class="num">' + (u.capacity_mwh || 0).toFixed(0) + ' MWh</td></tr>';
+    const soc = unitSoc(u.code, u.capacity_mwh);
+    const p = unitPower(u.code);
+    rows += '<tr><td>' + u.code + '</td>' +
+      '<td class="num">' + (u.capacity_mwh || 0).toFixed(0) + ' MWh</td>' +
+      '<td class="num">' + (soc != null ? (soc.soc * 100).toFixed(0) + '%' : '&ndash;') + '</td>' +
+      '<td class="num">' + rateLabel(p ? p.mw : undefined) + '</td></tr>';
   }
-  let liveRow = "";
-  if (live) {
-    liveRow = '<tr><td colspan="2">SoC</td><td class="num">' +
-              (typeof live.m.soc_ratio === "number" ? (live.m.soc_ratio * 100).toFixed(0) + "%" : "&ndash;") + '</td></tr>' +
-              '<tr><td colspan="2">Power</td><td class="num">' +
-              (typeof live.m.power_mw === "number" ? live.m.power_mw.toFixed(0) + " MW" : "&ndash;") + '</td></tr>' +
-              '<tr><td colspan="2">Stored</td><td class="num">' +
-              (typeof live.m.stored_mwh === "number" ? live.m.stored_mwh.toFixed(0) + " MWh" : "&ndash;") + '</td></tr>';
-  }
-  return '<div class="pop"><b>' + fac.name + '</b> <k>' + fac.region + '</k><br>' +
-         'facility ' + fac.facility + ' &middot; ' + total.toFixed(0) + ' MWh total' +
-         '<table>' + liveRow + rows + '</table></div>';
+  rows += '<tr class="sum"><td>facility</td>' +
+    '<td class="num">' + total.toFixed(0) + ' MWh</td>' +
+    '<td class="num">' + (fsoc ? (fsoc.soc * 100).toFixed(0) + '%' : '&ndash;') + '</td>' +
+    '<td class="num">' + rateLabel(fp ? fp.mw : undefined) + '</td></tr>';
+  return '<div class="pop"><b>' + fac.name + '</b> <k>' + fac.region + '</k>' +
+    (st ? ' &middot; ' + st : '') +
+    (live ? '' : ' &middot; <span style="color:#7d8fa5">unmonitored</span>') +
+    '<br>facility ' + fac.facility +
+    '<table>' + rows + '</table></div>';
 }
 
 /* ---------- header / legend ---------- */
@@ -435,6 +453,13 @@ function updateHeader() {
   promEl.className = state.prom === "ok" ? "fresh" : "down";
 }
 
+function legendGlyph(shape) {
+  const fill = "#8ca3ba";
+  const common = 'width="14" height="14" viewBox="0 0 14 14" fill="' + fill + '" stroke="#101a2b" stroke-width="1.3"';
+  if (shape === "wind") return '<span class="glyph"><svg ' + common + '><polygon points="7,1 13,12 1,12"/></svg></span>';
+  return '<span class="glyph"><svg ' + common + '><polygon points="7,1 13,7 7,13 1,7"/></svg></span>';
+}
+
 function updateLegend() {
   const el = document.getElementById("legend");
   if (metric === "none") { el.innerHTML = ""; return; }
@@ -449,8 +474,9 @@ function updateLegend() {
   el.innerHTML = '<h4>' + label + '</h4>' + rows +
     '<div class="row"><span class="sw" style="background:#8ca3ba"></span><span>battery (live)</span></div>' +
     '<div class="row"><span class="sw" style="background:#54657a"></span><span>battery (status)</span></div>' +
-    '<div class="row"><span class="sw" style="background:#ef4444"></span><span>solar</span></div>' +
-    '<div class="row"><span class="sw" style="background:#22c55e"></span><span>wind</span></div>';
+    '<div class="row">' + legendGlyph("solar") + '<span>solar</span></div>' +
+    '<div class="row">' + legendGlyph("wind") + '<span>wind</span></div>' +
+    '<div class="cap">solar/wind: shape = type, colour = generation (% of capacity)</div>';
 }
 
 /* ---------- controls ---------- */
@@ -464,6 +490,10 @@ function wireControls() {
   document.getElementById("tog-schematic").addEventListener("change", (ev) => {
     showSchematic = ev.target.checked;
     applyLines();
+  });
+  document.getElementById("tog-monitored").addEventListener("change", (ev) => {
+    showMonitored = ev.target.checked;
+    applyBatteries();
   });
   document.getElementById("tog-unmonitored").addEventListener("change", (ev) => {
     showUnmonitored = ev.target.checked;
@@ -518,24 +548,51 @@ function renMarkerKey(fac, unit) {
   return (fac.facility || fac.name || "fac") + ":" + (unit.code || "u");
 }
 
+// Solar/wind are drawn as vector polygons sized in metres (like the battery
+// L.circle), so they reproject and scale with zoom instead of sitting at a fixed
+// pixel size. Wind is a triangle pointing up, solar a diamond.
+function renShape(isWind, lat, lng, rMeters) {
+  const dLat = rMeters / 111320;
+  const dLng = rMeters / (111320 * Math.max(0.2, Math.cos(lat * Math.PI / 180)));
+  if (isWind) {
+    return [
+      [lat + dLat, lng],
+      [lat - dLat * 0.5, lng - dLng],
+      [lat - dLat * 0.5, lng + dLng],
+    ];
+  }
+  return [
+    [lat + dLat, lng],
+    [lat, lng + dLng],
+    [lat - dLat, lng],
+    [lat, lng - dLng],
+  ];
+}
+
+function renewablePopup(fac, u, isWind, cap, unitPow, measured, genFrac) {
+  const rows = [
+    '<tr><td>type</td><td class="num">' + (isWind ? "wind" : "solar") + '</td></tr>',
+    '<tr><td>capacity</td><td class="num">' + (cap > 0 ? cap.toFixed(1) + " MW" : "&ndash;") + '</td></tr>',
+  ];
+  if (measured && typeof unitPow === "number") {
+    rows.push('<tr><td>generation</td><td class="num">' + unitPow.toFixed(1) + ' MW</td></tr>');
+    if (cap > 0) {
+      rows.push('<tr><td>of capacity</td><td class="num">' + Math.round(genFrac * 100) + '%</td></tr>');
+    }
+  } else {
+    rows.push('<tr><td>generation</td><td class="num" style="color:#7d8fa5">no live data</td></tr>');
+  }
+  return '<div class="pop"><b>' + (u.code || fac.facility) + '</b> <k>' + (fac.name || "") + '</k><br>' +
+    (fac.region || "") + ' &middot; ' + (isWind ? "wind" : "solar") +
+    '<table>' + rows.join("") + '</table></div>';
+}
+
 function applyRenewables() {
   if (!state.renewables) state.renewables = [];
   const existing = new Set(Object.keys(renLayers));
-  const regionCap = {};
-  for (const fac of state.renewables || []) {
-    const reg = fac.region;
-    for (const u of fac.units || []) {
-      const ft = u.fueltech_id || "";
-      const fuel = ft.indexOf('wind') !== -1 ? 'wind' : (ft.indexOf('solar') !== -1 ? 'solar' : null);
-      if (!fuel || !reg) continue;
-      const k = reg + ':' + fuel;
-      regionCap[k] = (regionCap[k] || 0) + (u.capacity_mw || 0);
-    }
-  }
   for (const fac of state.renewables) {
     const loc = fac.location;
     if (!loc || !loc.lat || !loc.lng) continue;
-    const reg = fac.region;
     for (const u of fac.units || []) {
       const ft = u.fueltech_id || (u.code && u.code.includes("WF") ? "wind" : "solar");
       const isWind = (ft === "wind" || ft === "wind_farm");
@@ -545,51 +602,38 @@ function applyRenewables() {
       const cap = u.capacity_mw || u.capacity || 0;
       const key = renMarkerKey(fac, u);
       existing.delete(key);
-      const fuel = isWind ? 'wind' : 'solar';
-      // Prefer the unit's own measured MW (aemo_unit_power_mw, keyed by DUID);
-      // fall back to the region curtailment estimate when the unit is not in
-      // the live SCADA feed.
+      // Only the unit's own measured MW (aemo_unit_power_mw, keyed by DUID) drives
+      // the marker. We deliberately do NOT fall back to the region-level curtailment
+      // estimate, and do not pulse on it: per-facility curtailment is unavailable,
+      // so a region value cannot show which facilities inside the region are
+      // curtailed. If AEMO ever publishes per-facility curtailment, scrape it and
+      // restore both the fallback colour and the pulsing — see scrapers/NOTES.md.
       const unitPow = (state.units && state.units[u.code] && state.units[u.code].power_mw);
-      let genFrac = 0.7;
-      let measured = false;
-      if (typeof unitPow === 'number' && cap > 0) {
-        genFrac = Math.max(0, Math.min(1, unitPow / cap));
-        measured = true;
-      }
-      const kreg = reg + ':' + fuel;
-      const rcap = regionCap[kreg] || cap;
-      const rcur = (state.regions && state.regions[reg] && state.regions[reg].curtail && state.regions[reg].curtail[fuel]);
-      if (!measured && typeof rcur === 'number' && rcap > 0) {
-        genFrac = Math.max(0, Math.min(1, (rcap - rcur) / rcap));
-      }
-      const fill = ramp(genFrac, STOPS_GEN);
-      const size = Math.max(4, Math.min(18, 2 + Math.sqrt(Math.max(0, cap)) / 2));
-      const pulsing = (typeof rcur === 'number' && rcur > 1);
-      const svg = [
-        '<svg width="' + (size*2) + '" height="' + (size*2) + '" viewBox="0 0 ' + (size*2) + ' ' + (size*2) + '" xmlns="http://www.w3.org/2000/svg">',
-        isWind
-          ? '<polygon points="' + size + ' 3 ' + (size*2-3) + ' ' + (size*2-3) + ' 3 ' + (size*2-3) + '" fill="'+fill+'" stroke="#101a2b" stroke-width="' + (pulsing?2.5:1.5) + '" opacity="0.85"/>'
-          : '<rect x="2" y="2" width="'+(size*2-4)+'" height="'+(size*2-4)+'" fill="'+fill+'" stroke="#101a2b" stroke-width="' + (pulsing?2.5:1.5) + '" opacity="0.85" transform="rotate(45,'+size+','+size+')"/>',
-        '</svg>'
-      ].join("");
-      const cls = 'leaflet-ren-marker' + (pulsing ? ' bat-ring-pulse' : '');
-      const icon = L.divIcon({ html: svg, className: cls, iconSize: [size*2, size*2], iconAnchor: [size, size] });
+      const measured = typeof unitPow === 'number' && cap > 0;
+      const genFrac = measured ? Math.max(0, Math.min(1, unitPow / cap)) : null;
+      const fill = measured ? ramp(genFrac, STOPS_GEN) : "#54657a";
+      const pts = renShape(isWind, loc.lat, loc.lng, radiusFor(cap));
+      const opts = {
+        color: "#101a2b",
+        weight: 1.5,
+        fillColor: fill,
+        fillOpacity: measured ? 0.85 : 0.5,
+      };
       let layer = renLayers[key];
       if (!layer) {
-        layer = L.marker([loc.lat, loc.lng], { icon }).addTo(map);
+        layer = L.polygon(pts, opts).addTo(map);
         renLayers[key] = layer;
+        layer.bindTooltip("", { direction: "top" });
+        layer.bindPopup("", { maxWidth: 320 });
       } else {
-        layer.setIcon(icon);
-        layer.setLatLng([loc.lat, loc.lng]);
+        layer.setLatLngs(pts);
+        layer.setStyle(opts);
       }
-      const txt = '<div class="pop"><b>' + (u.code || fac.facility) + '</b><table>' +
-        '<tr><td>type</td><td>' + (isWind ? "wind" : "solar") + '</td></tr>' +
-        (cap ? '<tr><td>capacity</td><td class="num">'+cap.toFixed(1)+' MW</td></tr>' : "") +
-        (measured ? '<tr><td>output</td><td class="num">'+Math.round(unitPow)+' MW</td></tr>' : "") +
-        (typeof genFrac === 'number' ? '<tr><td>gen'+(measured?'':' (est)')+'</td><td class="num">'+Math.round(genFrac*100)+'%</td></tr>' : "") +
-        (typeof rcur === 'number' ? '<tr><td>curtail (reg)</td><td class="num">'+Math.round(rcur)+' MW</td></tr>' : "") +
-        '</table></div>';
-      layer.bindPopup(txt);
+      layer.setPopupContent(renewablePopup(fac, u, isWind, cap, unitPow, measured, genFrac));
+      layer.setTooltipContent(
+        '<b>' + (u.code || fac.facility) + '</b> &middot; ' + (isWind ? "wind" : "solar") +
+        (cap ? ' &middot; ' + cap.toFixed(0) + ' MW' : '') +
+        (measured ? '<br>' + Math.round(unitPow) + ' MW (' + Math.round(genFrac * 100) + '%)' : ''));
     }
   }
   for (const k of existing) { if (renLayers[k]) { map.removeLayer(renLayers[k]); delete renLayers[k]; } }

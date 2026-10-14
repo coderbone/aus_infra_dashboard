@@ -56,6 +56,9 @@ const STOPS_CURTAIL = [
   { v: 2000, c: [106, 77, 160] }, { v: 3000, c: [169, 68, 127] },
   { v: 4000, c: [225, 59, 59] },
 ];
+const STOPS_GEN = [
+  { v: 0, c: [217, 48, 70] }, { v: 0.5, c: [224, 179, 67] }, { v: 1, c: [94, 193, 107] },
+];
 const STOPS_SOC = [
   { v: 0, c: [217, 48, 70] }, { v: 0.25, c: [229, 119, 60] },
   { v: 0.5, c: [224, 179, 67] }, { v: 0.75, c: [156, 200, 79] },
@@ -517,9 +520,21 @@ function renMarkerKey(fac, unit) {
 function applyRenewables() {
   if (!state.renewables) state.renewables = [];
   const existing = new Set(Object.keys(renLayers));
+  const regionCap = {};
+  for (const fac of state.renewables || []) {
+    const reg = fac.region;
+    for (const u of fac.units || []) {
+      const ft = u.fueltech_id || "";
+      const fuel = ('wind' in ft) ? 'wind' : (('solar' in ft) ? 'solar' : null);
+      if (!fuel || !reg) continue;
+      const k = reg + ':' + fuel;
+      regionCap[k] = (regionCap[k] || 0) + (u.capacity_mw || 0);
+    }
+  }
   for (const fac of state.renewables) {
     const loc = fac.location;
     if (!loc || !loc.lat || !loc.lng) continue;
+    const reg = fac.region;
     for (const u of fac.units || []) {
       const ft = u.fueltech_id || (u.code && u.code.includes("WF") ? "wind" : "solar");
       const isWind = (ft === "wind" || ft === "wind_farm");
@@ -529,16 +544,26 @@ function applyRenewables() {
       const cap = u.capacity_mw || u.capacity || 0;
       const key = renMarkerKey(fac, u);
       existing.delete(key);
+      const fuel = isWind ? 'wind' : 'solar';
+      let genFrac = 0.7;
+      const kreg = reg + ':' + fuel;
+      const rcap = regionCap[kreg] || cap;
+      const rcur = (state.regions && state.regions[reg] && state.regions[reg].curtail && state.regions[reg].curtail[fuel]);
+      if (typeof rcur === 'number' && rcap > 0) {
+        genFrac = Math.max(0, Math.min(1, (rcap - rcur) / rcap));
+      }
+      const fill = ramp(genFrac, STOPS_GEN);
       const size = Math.max(4, Math.min(18, 2 + Math.sqrt(Math.max(0, cap)) / 2));
-      const fill = isWind ? "#22c55e" : "#ef4444";
+      const pulsing = (typeof rcur === 'number' && rcur > 1);
       const svg = [
-        '<svg width="'+(size*2)+'" height="'+(size*2)+'" viewBox="0 0 '+(size*2)+' '+(size*2)+'" xmlns="http://www.w3.org/2000/svg">',
+        '<svg width="' + (size*2) + '" height="' + (size*2) + '" viewBox="0 0 ' + (size*2) + ' ' + (size*2) + '" xmlns="http://www.w3.org/2000/svg">',
         isWind
-          ? '<polygon points="' + size + ' 3 ' + (size*2-3) + ' ' + (size*2-3) + ' 3 ' + (size*2-3) + '" fill="'+fill+'" stroke="#101a2b" stroke-width="1.5" opacity="0.85"/>'
-          : '<rect x="2" y="2" width="'+(size*2-4)+'" height="'+(size*2-4)+'" fill="'+fill+'" stroke="#101a2b" stroke-width="1.5" opacity="0.85" transform="rotate(45,'+size+','+size+')"/>',
+          ? '<polygon points="' + size + ' 3 ' + (size*2-3) + ' ' + (size*2-3) + ' 3 ' + (size*2-3) + '" fill="'+fill+'" stroke="#101a2b" stroke-width="' + (pulsing?2.5:1.5) + '" opacity="0.85"/>'
+          : '<rect x="2" y="2" width="'+(size*2-4)+'" height="'+(size*2-4)+'" fill="'+fill+'" stroke="#101a2b" stroke-width="' + (pulsing?2.5:1.5) + '" opacity="0.85" transform="rotate(45,'+size+','+size+')"/>',
         '</svg>'
       ].join("");
-      const icon = L.divIcon({ html: svg, className: "leaflet-ren-marker", iconSize: [size*2, size*2], iconAnchor: [size, size] });
+      const cls = 'leaflet-ren-marker' + (pulsing ? ' bat-ring-pulse' : '');
+      const icon = L.divIcon({ html: svg, className: cls, iconSize: [size*2, size*2], iconAnchor: [size, size] });
       let layer = renLayers[key];
       if (!layer) {
         layer = L.marker([loc.lat, loc.lng], { icon }).addTo(map);
@@ -550,14 +575,14 @@ function applyRenewables() {
       const txt = '<div class="pop"><b>' + (u.code || fac.facility) + '</b><table>' +
         '<tr><td>type</td><td>' + (isWind ? "wind" : "solar") + '</td></tr>' +
         (cap ? '<tr><td>capacity</td><td class="num">'+cap.toFixed(1)+' MW</td></tr>' : "") +
+        (typeof genFrac === 'number' ? '<tr><td>gen (est)</td><td class="num">'+Math.round(genFrac*100)+'%</td></tr>' : "") +
+        (typeof rcur === 'number' ? '<tr><td>curtail (reg)</td><td class="num">'+Math.round(rcur)+' MW</td></tr>' : "") +
         '</table></div>';
       layer.bindPopup(txt);
     }
   }
   for (const k of existing) { if (renLayers[k]) { map.removeLayer(renLayers[k]); delete renLayers[k]; } }
 }
-
-
 function renMarkerKey(fac, unit) {
   return (fac.facility || fac.name || "fac") + ":" + (unit.code || "u");
 }

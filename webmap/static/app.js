@@ -495,6 +495,7 @@ async function poll() {
   state.regions = data.regions || {};
   state.interconnectors = data.interconnectors || {};
   state.batteries = data.batteries || {};
+  state.units = data.units || {};
   state.fleet = data.fleet || [];
   state.renewables = data.renewables || [];
   state.fetchedAt = data.fetched_at;
@@ -525,7 +526,7 @@ function applyRenewables() {
     const reg = fac.region;
     for (const u of fac.units || []) {
       const ft = u.fueltech_id || "";
-      const fuel = ('wind' in ft) ? 'wind' : (('solar' in ft) ? 'solar' : null);
+      const fuel = ft.indexOf('wind') !== -1 ? 'wind' : (ft.indexOf('solar') !== -1 ? 'solar' : null);
       if (!fuel || !reg) continue;
       const k = reg + ':' + fuel;
       regionCap[k] = (regionCap[k] || 0) + (u.capacity_mw || 0);
@@ -545,11 +546,20 @@ function applyRenewables() {
       const key = renMarkerKey(fac, u);
       existing.delete(key);
       const fuel = isWind ? 'wind' : 'solar';
+      // Prefer the unit's own measured MW (aemo_unit_power_mw, keyed by DUID);
+      // fall back to the region curtailment estimate when the unit is not in
+      // the live SCADA feed.
+      const unitPow = (state.units && state.units[u.code] && state.units[u.code].power_mw);
       let genFrac = 0.7;
+      let measured = false;
+      if (typeof unitPow === 'number' && cap > 0) {
+        genFrac = Math.max(0, Math.min(1, unitPow / cap));
+        measured = true;
+      }
       const kreg = reg + ':' + fuel;
       const rcap = regionCap[kreg] || cap;
       const rcur = (state.regions && state.regions[reg] && state.regions[reg].curtail && state.regions[reg].curtail[fuel]);
-      if (typeof rcur === 'number' && rcap > 0) {
+      if (!measured && typeof rcur === 'number' && rcap > 0) {
         genFrac = Math.max(0, Math.min(1, (rcap - rcur) / rcap));
       }
       const fill = ramp(genFrac, STOPS_GEN);
@@ -575,7 +585,8 @@ function applyRenewables() {
       const txt = '<div class="pop"><b>' + (u.code || fac.facility) + '</b><table>' +
         '<tr><td>type</td><td>' + (isWind ? "wind" : "solar") + '</td></tr>' +
         (cap ? '<tr><td>capacity</td><td class="num">'+cap.toFixed(1)+' MW</td></tr>' : "") +
-        (typeof genFrac === 'number' ? '<tr><td>gen (est)</td><td class="num">'+Math.round(genFrac*100)+'%</td></tr>' : "") +
+        (measured ? '<tr><td>output</td><td class="num">'+Math.round(unitPow)+' MW</td></tr>' : "") +
+        (typeof genFrac === 'number' ? '<tr><td>gen'+(measured?'':' (est)')+'</td><td class="num">'+Math.round(genFrac*100)+'%</td></tr>' : "") +
         (typeof rcur === 'number' ? '<tr><td>curtail (reg)</td><td class="num">'+Math.round(rcur)+' MW</td></tr>' : "") +
         '</table></div>';
       layer.bindPopup(txt);
@@ -583,46 +594,4 @@ function applyRenewables() {
   }
   for (const k of existing) { if (renLayers[k]) { map.removeLayer(renLayers[k]); delete renLayers[k]; } }
 }
-function renMarkerKey(fac, unit) {
-  return (fac.facility || fac.name || "fac") + ":" + (unit.code || "u");
-}
 
-function applyRenewables() {
-  if (!state.renewables) state.renewables = [];
-  const existing = new Set(Object.keys(renLayers));
-  for (const fac of state.renewables) {
-    const loc = fac.location;
-    if (!loc || !loc.lat || !loc.lng) continue;
-    for (const u of fac.units || []) {
-      const ft = u.fueltech_id || "";
-      const isWind = (ft === "wind" || ft === "wind_farm");
-      const isSolar = (ft === "solar" || ft === "solar_utility");
-      if (isWind && !showWind) continue;
-      if (isSolar && !showSolar) continue;
-      const cap = u.capacity_mw || u.capacity || 0;
-      const key = renMarkerKey(fac, u);
-      existing.delete(key);
-      const size = Math.max(4, Math.min(16, 2 + Math.sqrt(cap) / 2.5));
-      const fill = isWind ? "#22c55e" : "#ef4444";
-      const svg = [];
-      svg.push('<svg width="' + (size*2) + '" height="' + (size*2) + '" xmlns="http://www.w3.org/2000/svg">');
-      if (isWind) {
-        svg.push('<polygon points="' + size + ' 3 ' + (size*2-3) + ' ' + (size*2-3) + ' 3 ' + (size*2-3) + '" fill="'+fill+'" stroke="#101a2b" stroke-width="1.5" opacity="0.9"/></svg>');
-      } else {
-        svg.push('<rect x="4" y="4" width="' + (size*2-8) + '" height="' + (size*2-8) + '" fill="' + fill + '" stroke="#101a2b" stroke-width="1.5" opacity="0.9" transform="rotate(45,' + size + ',' + size + ')"/></svg>');
-      }
-      const icon = L.divIcon({ html: svg.join(""), className: "leaflet-ren-marker", iconSize: [size*2, size*2], iconAnchor: [size, size] });
-      let layer = renLayers[key];
-      if (!layer) {
-        layer = L.marker([loc.lat, loc.lng], { icon }).addTo(map);
-        renLayers[key] = layer;
-      } else {
-        layer.setIcon(icon);
-        layer.setLatLng([loc.lat, loc.lng]);
-      }
-      const txt = '<div class="pop"><b>' + (u.code || fac.facility) + '</b></div>';
-      layer.bindPopup(txt);
-    }
-  }
-  for (const k of existing) { if (renLayers[k]) { map.removeLayer(renLayers[k]); delete renLayers[k]; } }
-}

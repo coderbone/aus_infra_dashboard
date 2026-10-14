@@ -989,12 +989,16 @@ A second thread polls two tiny archives on `--intraday-poll-interval` (default
 
 1. `https://nemweb.com.au/Reports/Current/Dispatch_SCADA/` lists
    `PUBLIC_DISPATCHSCADA_<YYYYMMDDHHMM>_<seq>.zip`, a ~4KB single-interval
-   snapshot whose `UNIT_SCADA` table carries, per DUID, the *measured*
    `SCADAVALUE` in MW (negative = charging/absorbing). Verified live
-   2026-10-08 15:20: ERB01 −120, WTAHB1 −34, LIMBESS1 +0.9. Rows are filtered to
-   the units the daily report has learned are storage units (the battery set is
-   seeded from the state file at startup so a restart does not wait for the
-   daily poll); a DUID the daily file has never clocked as storage is ignored.
+   2026-10-08 15:20: ERB01 −120, WTAHB1 −34, LIMBESS1 +0.9. Every row is
+   published as `aemo_unit_power_mw{duid,fueltech,region}` — generators, loads
+   and storage alike, labelled from the OE fleet cache (empty labels for a unit
+   the cache does not know). The legacy `aemo_battery_power_mw` series stays
+   filtered to the units the daily report has learned are storage units (the
+   battery set is seeded from the state file at startup so a restart does not
+   wait for the daily poll); a DUID the daily file has never clocked as storage
+   is absent from the battery series but still present in the unit series. The
+   unit series is the migration target for consumers of the battery one.
 2. `https://nemweb.com.au/Reports/Current/DispatchIS_Reports/` lists
    `PUBLIC_DISPATCHIS_<YYYYMMDDHHMM>_<seq>.zip`, a ~23KB interim-solution
    snapshot whose `DISPATCH,REGIONSUM` table carries `BDU_INITIAL_ENERGY_STORAGE`
@@ -1112,12 +1116,18 @@ wrong number — until a fresh daily report re-anchors it.
 | `aemo_battery_report_reused` | 1 if served from the state-file cache this poll |
 | `aemo_battery_scrape_success` | 1 on success, 0 on failure (daily only) |
 | `aemo_battery_poll_duration_seconds`, `aemo_battery_last_poll_timestamp_seconds` | poll timing |
-| `aemo_battery_power_mw{duid}` | live measured output from `UNIT_SCADA` `SCADAVALUE`, MW (negative = charging) |
+| `aemo_battery_power_mw{duid}` | live measured output from `UNIT_SCADA` `SCADAVALUE`, MW (negative = charging). Legacy storage-filtered series; superseded by `aemo_unit_power_mw` |
 | `aemo_battery_power_timestamp_seconds{duid}` | the 5-minute interval behind the power reading |
 | `aemo_battery_power_age_seconds{duid}` | its age at export time |
 | `aemo_battery_power_report_info{file}` | the processed `PUBLIC_DISPATCHSCADA` file |
 | `aemo_battery_power_interval_timestamp_seconds` | its interval |
 | `aemo_battery_units_with_power` | storage units with a reading in the SCADA snapshot |
+| `aemo_unit_power_mw{duid,fueltech,region}` | live measured output from `UNIT_SCADA` `SCADAVALUE`, MW, for **every** dispatch unit in the file (generators, loads, storage; negative = charging/absorbing). Superset of `aemo_battery_power_mw`; `fueltech`/`region` come from the OE fleet cache (empty when a unit is absent from it) |
+| `aemo_unit_power_timestamp_seconds{duid}` | the 5-minute interval behind the unit reading |
+| `aemo_unit_power_age_seconds{duid}` | its age at export time |
+| `aemo_unit_power_report_info{file}` | the processed `PUBLIC_DISPATCHSCADA` file |
+| `aemo_unit_power_interval_timestamp_seconds` | its interval |
+| `aemo_unit_power_units` | dispatch units with a reading in the SCADA snapshot |
 | `aemo_battery_region_stored_mwh{region}` | live region aggregate from `BDU_ENERGY_STORAGE`, MWh |
 | `aemo_battery_region_initial_stored_mwh{region}` | from `BDU_INITIAL_ENERGY_STORAGE`, MWh |
 | `aemo_battery_region_storage_timestamp_seconds{region}` | the 5-minute interval behind the region reading |

@@ -61,6 +61,14 @@ LIVE_QUERIES = {
         "aemo_power_age_s": {"expr": "aemo_battery_power_age_seconds", "key": "duid"},
         "aemo_power_ts": {"expr": "aemo_battery_power_timestamp_seconds", "key": "duid"},
     },
+    # Every dispatch unit (generators, loads, storage) with its live measured MW
+    # and fueltech/region labels, keyed by DUID. This is what lets the map shade
+    # each wind/solar marker by its own generation instead of a region estimate.
+    "units": {
+        "power_mw": {"expr": "aemo_unit_power_mw", "key": "duid"},
+        "age_s": {"expr": "aemo_unit_power_age_seconds", "key": "duid"},
+        "timestamp": {"expr": "aemo_unit_power_timestamp_seconds", "key": "duid"},
+    },
 }
 
 STATIC_TYPES = {
@@ -96,7 +104,7 @@ def _merge(accum, field, spec, labels, value):
 
 def build_live():
     out = {"fetched_at": time.time(), "prometheus": "ok", "errors": [],
-           "interconnectors": {}, "regions": {}, "batteries": {}}
+           "interconnectors": {}, "regions": {}, "batteries": {}, "units": {}}
     for group, fields in LIVE_QUERIES.items():
         for field, spec in fields.items():
             try:

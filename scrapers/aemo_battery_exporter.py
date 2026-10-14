@@ -1268,6 +1268,7 @@ def render_intraday(
     now: float,
     infer: dict | None = None,
     infer_ok: bool = False,
+    unit_meta: dict | None = None,
 ) -> str:
     """Exposition for the intraday cycle's last readings.
 
@@ -1278,13 +1279,62 @@ def render_intraday(
     per-unit *inferred* stored MWh is a coupled side: it is served only when a
     daily anchor exists AND the SCADA feed is live this cycle, since it is built
     from SCADA.
+
+    The `aemo_unit_power_mw` series carries every dispatch unit in the SCADA
+    file - generators, loads and storage alike - labelled with its fueltech and
+    region from the OE fleet cache (`unit_meta`). It is the superset of the
+    legacy `aemo_battery_power_mw` series, which stays filtered to storage units
+    so existing dashboards keep their exact semantics while consumers migrate.
     """
     lines: list[str] = []
+    all_units = scada.get("all_units") or {}
+    if all_units and scada_ok:
+        meta = unit_meta or {}
+        lines += [
+            "# HELP aemo_unit_power_mw Measured output at the newest interval, "
+            "MW, for every dispatch unit in Dispatch_SCADA "
+            "(negative = charging/absorbing). Supersedes aemo_battery_power_mw.",
+            "# TYPE aemo_unit_power_mw gauge",
+        ]
+        for duid in sorted(all_units):
+            u = all_units[duid]
+            m = meta.get(duid) or {}
+            lines += [
+                'aemo_unit_power_mw{duid="%s",fueltech="%s",region="%s"} %s'
+                % (
+                    escape_label(duid),
+                    escape_label(m.get("fueltech") or ""),
+                    escape_label(m.get("region") or ""),
+                    fmt(u["scada"]),
+                ),
+                'aemo_unit_power_timestamp_seconds{duid="%s"} %s'
+                % (escape_label(duid), fmt(u["ts"])),
+                'aemo_unit_power_age_seconds{duid="%s"} %s'
+                % (escape_label(duid), fmt(now - u["ts"])),
+            ]
+        lines += [
+            "# HELP aemo_unit_power_report_info Processed Dispatch_SCADA file.",
+            "# TYPE aemo_unit_power_report_info gauge",
+            'aemo_unit_power_report_info{file="%s"} 1'
+            % escape_label(scada.get("file", "")),
+            "# HELP aemo_unit_power_interval_timestamp_seconds "
+            "Newest 5-minute interval in the SCADA file.",
+            "# TYPE aemo_unit_power_interval_timestamp_seconds gauge",
+            "aemo_unit_power_interval_timestamp_seconds %s"
+            % fmt(scada.get("newest_interval")),
+            "# HELP aemo_unit_power_units Number of dispatch units in the "
+            "SCADA file.",
+            "# TYPE aemo_unit_power_units gauge",
+            "aemo_unit_power_units %d" % len(all_units),
+        ]
+
     units = scada.get("units") or {}
     if units and scada_ok:
         lines += [
             "# HELP aemo_battery_power_mw Measured output at the newest interval, "
-            "MW (negative = charging/absorbing).",
+            "MW (negative = charging/absorbing). Deprecated in favour of "
+            "aemo_unit_power_mw, which carries the same measurement for every "
+            "dispatch unit with fueltech/region labels.",
             "# TYPE aemo_battery_power_mw gauge",
         ]
         for duid in sorted(units):
@@ -1913,6 +1963,7 @@ class IntradayPoller:
         self.fleet_cache_file = fleet_cache_file
         self._fleet_capacity: dict[str, float] = {}
         self._fossil_region: dict[str, str] = {}
+        self._unit_meta: dict[str, dict] = {}
         self._fleet_metadata_last_attempt = 0.0
         self._maybe_load_fleet_metadata(force=True)
         self._inferred: dict[str, dict] = {}
@@ -1975,6 +2026,10 @@ class IntradayPoller:
             # its `units` are already filtered, so it must not be recomputed.
             if not scada_state.get("reused"):
                 scada_state["region_fossil"] = self._fossil_generation(units)
+                # The unit-level series wants every dispatch unit, so the full
+                # parsed set is kept before the battery filter narrows `units`.
+                # A reused state already carries it from the parsing cycle.
+                scada_state["all_units"] = dict(units)
             batteries = self._learned_batteries()
             if batteries:
                 scada_state["units"] = {
@@ -2012,7 +2067,7 @@ class IntradayPoller:
         return (
             render_intraday(
                 scada_state, scada_ok, is_state, region_ok, duration, finished,
-                infer, infer_ok,
+                infer, infer_ok, self._unit_meta,
             ),
             scada_ok and region_ok,
         )
@@ -2382,6 +2437,7 @@ class IntradayPoller:
             return
         caps: dict[str, float] = {}
         fossil_region: dict[str, str] = {}
+        unit_meta: dict[str, dict] = {}
         for facility in data:
             if not isinstance(facility, dict):
                 continue
@@ -2395,8 +2451,18 @@ class IntradayPoller:
                 cap = unit.get("capacity_storage")
                 if isinstance(cap, (int, float)) and cap > 0:
                     caps[code] = float(cap)
-                if isinstance(region, str) and unit.get("fueltech_id") in FOSSIL_FUELTECHS:
-                    fossil_region[code] = region
+                fueltech = unit.get("fueltech_id")
+                if isinstance(fueltech, str) and isinstance(region, str):
+                    unit_meta[code] = {
+                        "fueltech": fueltech,
+                        "region": region,
+                    }
+                    if fueltech in FOSSIL_FUELTECHS:
+                        fossil_region[code] = region
+                elif isinstance(fueltech, str):
+                    unit_meta[code] = {"fueltech": fueltech, "region": region or ""}
+                elif isinstance(region, str):
+                    unit_meta[code] = {"fueltech": fueltech or "", "region": region}
         if caps:
             self._fleet_capacity = caps
             log.info(
@@ -2408,6 +2474,12 @@ class IntradayPoller:
             log.info(
                 "fossil region map loaded: %d units from %s",
                 len(fossil_region), self.fleet_cache_file,
+            )
+        if unit_meta:
+            self._unit_meta = unit_meta
+            log.info(
+                "unit metadata loaded: %d units from %s",
+                len(unit_meta), self.fleet_cache_file,
             )
 
     def _fossil_generation(self, units: dict) -> dict:
@@ -2521,6 +2593,7 @@ class IntradayPoller:
             is_state or {}, is_health[0],
             duration, now,
             self._infer_view(now), scada_health[0] and self._anchor_file is not None,
+            self._unit_meta,
         )
         return body, scada_health[0] and is_health[0]
 

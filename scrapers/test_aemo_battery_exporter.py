@@ -1486,9 +1486,17 @@ class IntradayPollerTest(unittest.TestCase):
         poller, body, ok = polled_intraday(fetcher, battery_duids=duids)
         self.assertTrue(ok)
         self.assertEqual(self.zip_fetches(fetcher), 2)  # one SCADA + one DispatchIS zip
-        self.assertEqual(len([l for l in body.splitlines() if l.startswith('aemo_battery_power_mw{')]), 3)
+        battery_lines = [
+            l for l in body.splitlines() if l.startswith("aemo_battery_power_mw{")
+        ]
+        self.assertEqual(len(battery_lines), 3)
         self.assertIn('aemo_battery_power_mw{duid="ERB01"} -120.0092', body)
-        self.assertNotIn('duid="DPNTB1"', body)
+        # The legacy battery series stays filtered to storage; the unit series
+        # carries every dispatch unit in the SCADA file, DPNTB1 included.
+        self.assertNotIn('aemo_battery_power_mw{duid="DPNTB1"', body)
+        self.assertIn('aemo_unit_power_mw{duid="DPNTB1"', body)
+        self.assertIn('aemo_unit_power_mw{duid="ERB01"', body)
+        self.assertIn("aemo_unit_power_units 4", body)
         self.assertIn('aemo_battery_region_stored_mwh{region="NSW1"}', body)
         self.assertIn("aemo_battery_scada_success 1", body)
         self.assertIn('aemo_interconnector_flow_mw{interconnector="NSW1-QLD1"}', body)
@@ -1698,6 +1706,99 @@ class IntradayPollerTest(unittest.TestCase):
         self.assertEqual(
             poller._fossil_region, {"BW01": "NSW1", "TORRB1": "VIC1"}
         )
+
+    # -- unit power (every dispatch unit, labelled from OE fleet metadata) ---- #
+
+    def mixed_fetcher(self):
+        return IntradayFetcher(
+            scada_zips={SCADA_ZIP: scada_zip(rows=[
+                scada_row("D", duid="WTAHB1", value="-34.072630"),
+                scada_row("D", duid="BW01", value="500.0"),
+                scada_row("D", duid="MACARTH1", value="210.5"),   # wind
+                scada_row("D", duid="SUNSHINE1", value="88.0"),   # solar
+                scada_row("D", duid="TUMUT3", value="120.0"),     # hydro
+                scada_row("D", duid="MURRAY1", value="-45.0"),    # pump (load)
+                scada_row("D", duid="UNKNOWN1", value="7.0"),     # no metadata
+            ])},
+            is_zips={IS_ZIP: IS_SAMPLE_ZIP},
+        )
+
+    def mixed_cache_payload(self):
+        return {"cached_at": 1.0, "data": [
+            {"code": "BW01", "network_region": "NSW1", "units": [
+                {"code": "BW01", "fueltech_id": "coal_black",
+                 "capacity_storage": None}]},
+            {"code": "MACARTH1", "network_region": "NSW1", "units": [
+                {"code": "MACARTH1", "fueltech_id": "wind",
+                 "capacity_storage": None}]},
+            {"code": "SUNSHINE1", "network_region": "VIC1", "units": [
+                {"code": "SUNSHINE1", "fueltech_id": "solar_utility",
+                 "capacity_storage": None}]},
+            {"code": "TUMUT3", "network_region": "NSW1", "units": [
+                {"code": "TUMUT3", "fueltech_id": "hydro",
+                 "capacity_storage": None}]},
+            {"code": "MURRAY1", "network_region": "VIC1", "units": [
+                {"code": "MURRAY1", "fueltech_id": "pumps",
+                 "capacity_storage": None}]},
+            {"code": "WTAHB1", "network_region": "NSW1", "units": [
+                {"code": "WTAHB1", "fueltech_id": "battery",
+                 "capacity_storage": 200.0}]},
+        ]}
+
+    def test_unit_power_carries_every_unit_with_metadata_labels(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "fleet.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(self.mixed_cache_payload(), handle)
+            poller, body, ok = polled_intraday(
+                self.mixed_fetcher(), battery_duids={"WTAHB1"},
+                fleet_cache_file=path,
+            )
+        self.assertTrue(ok)
+        self.assertIn(
+            'aemo_unit_power_mw{duid="BW01",fueltech="coal_black",region="NSW1"} 500', body
+        )
+        self.assertIn(
+            'aemo_unit_power_mw{duid="MACARTH1",fueltech="wind",region="NSW1"} 210.5', body
+        )
+        self.assertIn(
+            'aemo_unit_power_mw{duid="SUNSHINE1",fueltech="solar_utility",region="VIC1"} 88', body
+        )
+        self.assertIn(
+            'aemo_unit_power_mw{duid="TUMUT3",fueltech="hydro",region="NSW1"} 120', body
+        )
+        # Pumps are loads: the negative value is carried verbatim.
+        self.assertIn(
+            'aemo_unit_power_mw{duid="MURRAY1",fueltech="pumps",region="VIC1"} -45', body
+        )
+        # The new series is a superset: the storage unit is present too.
+        self.assertIn('aemo_unit_power_mw{duid="WTAHB1",fueltech="battery",region="NSW1"}', body)
+        self.assertIn("aemo_unit_power_units 7", body)
+        # A unit absent from the cache still appears, with empty labels.
+        self.assertIn('aemo_unit_power_mw{duid="UNKNOWN1",fueltech="",region=""} 7', body)
+
+    def test_unit_power_omitted_when_the_scada_read_fails(self):
+        fetcher = IntradayFetcher(
+            scada_zips={}, is_zips={IS_ZIP: IS_SAMPLE_ZIP}
+        )
+        with mock.patch.object(exporter, "http_get", fetcher):
+            poller = make_intraday(battery_duids={"WTAHB1"})
+            body, _ = poller.poll_once()
+        self.assertNotIn("aemo_unit_power_mw", body)
+        self.assertNotIn("aemo_unit_power_units", body)
+
+    def test_unit_power_survives_an_unchanged_file_reuse(self):
+        fetcher = self.fossil_fetcher()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_fossil_cache(tmp)
+            with mock.patch.object(exporter, "http_get", fetcher):
+                poller = make_intraday(
+                    battery_duids={"WTAHB1"}, fleet_cache_file=path
+                )
+                poller.poll_once()
+                body, ok = poller.poll_once()
+        self.assertTrue(ok)
+        self.assertIn('aemo_unit_power_mw{duid="BW01",fueltech="coal_black",region="NSW1"} 500', body)
 
 
 # --------------------------------------------------------------------------- #

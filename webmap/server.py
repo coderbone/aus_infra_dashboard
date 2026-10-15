@@ -19,6 +19,7 @@ Stdlib only; runs inside python:3.12-alpine.
 import argparse
 import json
 import os
+import re
 import threading
 import time
 import urllib.parse
@@ -56,6 +57,9 @@ LIVE_QUERIES = {
         "inf_stored_mwh": {"expr": "aemo_battery_inferred_stored_mwh", "key": "duid"},
         "inf_age_s": {"expr": "aemo_battery_inferred_age_seconds", "key": "duid"},
         "inf_timestamp": {"expr": "aemo_battery_inferred_timestamp_seconds", "key": "duid"},
+        # peak stored energy over the commissioning window (recording rule), used
+        # to shade a commissioning facility's progress arc
+        "peak_stored_mwh": {"expr": "aemo_battery_peak_stored_mwh", "key": "duid"},
         # fresh 5-min SCADA power from AEMO
         "aemo_power_mw": {"expr": "aemo_battery_power_mw", "key": "duid"},
         "aemo_power_age_s": {"expr": "aemo_battery_power_age_seconds", "key": "duid"},
@@ -68,6 +72,20 @@ LIVE_QUERIES = {
         "power_mw": {"expr": "aemo_unit_power_mw", "key": "duid"},
         "age_s": {"expr": "aemo_unit_power_age_seconds", "key": "duid"},
         "timestamp": {"expr": "aemo_unit_power_timestamp_seconds", "key": "duid"},
+    },
+    # Snowy Hydro reservoir levels, reported per reservoir label by the
+    # reservoir-exporter (compose runs it with --all-reservoirs). Wrapped in
+    # last_over_time because this job is scraped hourly while Prometheus's
+    # default lookback delta is 5m: a bare selector is only answerable for the
+    # five minutes after each scrape and would blank the card for most of the
+    # hour. A 2h window survives a skipped scrape and still clears the card
+    # within 2h if the exporter dies - generous is safe here because the
+    # upstream publishes these levels once a day. An absent exporter yields an
+    # empty result, not an error, so it never degrades the whole page.
+    "reservoirs": {
+        "level": {"expr": "last_over_time(snowy_tantangara_level_percent[2h])", "key": "reservoir"},
+        "change_7d": {"expr": "last_over_time(snowy_tantangara_level_change_7d_percentage_points[2h])", "key": "reservoir"},
+        "last_sample": {"expr": "last_over_time(snowy_tantangara_last_sample_timestamp_seconds[2h])", "key": "reservoir"},
     },
 }
 
@@ -104,7 +122,8 @@ def _merge(accum, field, spec, labels, value):
 
 def build_live():
     out = {"fetched_at": time.time(), "prometheus": "ok", "errors": [],
-           "interconnectors": {}, "regions": {}, "batteries": {}, "units": {}}
+           "interconnectors": {}, "regions": {}, "batteries": {}, "units": {},
+           "reservoirs": {}}
     for group, fields in LIVE_QUERIES.items():
         for field, spec in fields.items():
             try:
@@ -116,10 +135,17 @@ def build_live():
     fl = build_fleet()
     out["fleet"] = fl.get("fleet", []) if isinstance(fl, dict) else fl
     out["renewables"] = fl.get("renewables", []) if isinstance(fl, dict) else []
+    out["hydro"] = fl.get("hydro", []) if isinstance(fl, dict) else []
     return out
 
 
 _fleet_cache = {"mtime": None, "data": None}
+
+# OpenNEM has no "pumped hydro" fueltech: pumped stations report `hydro`
+# (+ a sibling `pumps` unit where the load DUID is in the fleet) and their
+# facility description is free text. Classify a facility as pumped storage
+# from any of three independent signals; otherwise draw it as classic hydro.
+_PUMPED_DESC_RE = re.compile(r"pumped|pump[- ]?storage", re.I)
 
 
 def build_fleet():
@@ -138,11 +164,14 @@ def build_fleet():
         return []
     fleet = []
     renewables = []
+    hydro = []
     for facility in raw:
         if not isinstance(facility, dict):
             continue
         units_bat = []
         units_ren = []
+        units_hyd = []
+        pumped_hint = False
         for unit in facility.get("units") or []:
             if not isinstance(unit, dict):
                 continue
@@ -167,6 +196,24 @@ def build_fleet():
                         "fueltech_id": ft if ft in ("solar", "solar_utility", "wind") else ("solar" if "solar" in str(ft) else "wind"),
                         "status": unit.get("status_id") or "",
                     })
+            elif ft in ("hydro", "pumps"):
+                # pumped-hydro detection runs over every unit (a retired pump
+                # DUID still identifies the scheme); retired units themselves
+                # are dropped from the drawn capacity below.
+                storage = unit.get("capacity_storage")
+                if isinstance(storage, (int, float)) and not isinstance(storage, bool) and storage > 0:
+                    pumped_hint = True
+                if ft == "pumps":
+                    pumped_hint = True
+                if (unit.get("status_id") or "") != "retired":
+                    cap = unit.get("capacity_registered") or unit.get("capacity_maximum")
+                    if isinstance(cap, (int, float)) and not isinstance(cap, bool) and cap > 0:
+                        units_hyd.append({
+                            "code": unit.get("code") or "",
+                            "capacity_mw": float(cap),
+                            "fueltech_id": ft,
+                            "status": unit.get("status_id") or "",
+                        })
         if units_bat:
             fleet.append({
                 "facility": facility.get("code") or "",
@@ -185,8 +232,20 @@ def build_fleet():
                 "units": units_ren,
                 "kind": "renewable",
             })
+        if units_hyd:
+            loc = facility.get("location")
+            if isinstance(loc, dict) and loc.get("lat") and loc.get("lng"):
+                hydro.append({
+                    "facility": facility.get("code") or "",
+                    "name": facility.get("facility_name") or facility.get("name") or "",
+                    "region": facility.get("network_region") or "",
+                    "location": loc,
+                    "units": units_hyd,
+                    "kind": "hydro",
+                    "pumped": bool(pumped_hint) or bool(_PUMPED_DESC_RE.search(str(facility.get("description") or ""))),
+                })
     _fleet_cache["mtime"] = mtime
-    _fleet_cache["data"] = {"fleet": fleet, "renewables": renewables}
+    _fleet_cache["data"] = {"fleet": fleet, "renewables": renewables, "hydro": hydro}
     return _fleet_cache["data"]
 
 

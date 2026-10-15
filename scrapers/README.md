@@ -251,7 +251,11 @@ endpoint, and the "−2.73 m/week" figure in the project's own copy is the same
 **Only Tantangara is exported by default.** The feed also carries Lake Jindabyne
 and Lake Eucumbene, which are pre-2.0 scheme infrastructure — scheme context, not
 project status. Exposing them by default would dress them up as 2.0 data. Use
-`--all-reservoirs` or a repeatable `--reservoir` to include them.
+`--all-reservoirs` or a repeatable `--reservoir` to include them. **The compose
+service does pass `--all-reservoirs`**, because the web map's "Snowy reservoirs"
+card shows all three; that is the deployment's choice, not the exporter's
+default, and the Grafana dashboard is unaffected because its `reservoir`
+variable has `current` pinned to Tantangara (see NOTES.md).
 
 **There is deliberately no `config_stale` metric and no persistent cache.** This
 exporter has no discovery step and no configuration to cache, so a
@@ -1201,7 +1205,8 @@ exporter outside compose.
 The seventh service in the compose file is not an exporter. `webmap` is a
 stdlib-only `ThreadingHTTPServer` (same `python:3.12-alpine` image, mounted the
 same way) serving a **standalone Leaflet page with no tile dependency** — it
-draws region polygons, the interconnector lines and the battery circles onto a
+draws region polygons, the interconnector lines, the battery circles, the
+solar/wind and hydro markers and a Snowy reservoirs card onto a
 plain dark background, so it renders with no internet at all. `./webmap/data`
 is hand-authored schematic `*.geojson` (six regions, the seven
 interconnectors/MNSP links plus the Snowy link, and intra-regional corridors
@@ -1221,6 +1226,60 @@ fetched. The unmonitored ~110 batteries render grey at their cached capacity,
 which is why the whole-fleet cache (facility coordinates included) is the map's
 data source rather than a fresh API call. Healthcheck hits `127.0.0.1:9119`
 like the other services.
+
+Battery markers carry two status features. A **`committed` (planned) checkbox**
+hides the units that have never dispatched. And **commissioning** units — built
+but not yet fully energised — are drawn as a dim disc with a coloured arc over
+the fraction of registered storage actually energised: peak stored MWh over
+`capacity_storage_mwh`. That ratio is the physical proxy for how much of the
+battery exists, since AEMO publishes no module count; it is a lower bound,
+because a unit that has never charged to its ceiling reads low. The arc runs
+**red-yellow-green** by how charged the energised plant is *now* relative to
+that peak. Both numbers ride on `/data/live`; the peak comes from the
+`aemo_battery_peak_stored_mwh` recording rule
+(`max_over_time(aemo_battery_inferred_stored_mwh[90d])` in
+`../prometheus_rules.yml`) — recorded rather than queried per poll, so the
+90-day window is scanned once per interval instead of on every 30s request.
+WEM units have no `aemo_battery_inferred_stored_mwh` series and simply get no
+arc.
+
+Hydro generation is a **hexagon sized by registered capacity**, one marker per
+facility rather than per unit: Tumut 3's eight units share a single coordinate,
+so per-unit polygons would stack invisibly. Fill is output — generation plus
+pumping, as a fraction of capacity — on the same red-yellow-green ramp the
+solar/wind markers use, and grey when the facility has no live
+`aemo_unit_power_mw` reading (24 of the 63 drawn facilities, mostly the small
+irrigation and mini-hydro schemes AEMO does not meter). A marker **pulses while
+it is producing or pumping at least `max(1 MW, 5% of capacity)`**, so a station
+trickling a few MW out of a 1,500 MW scheme does not throb all day — hence the
+1 MW floor, since 5% of a 1.4 MW mini-hydro is noise. Generation (`hydro` DUIDs)
+and pumping (`pumps` DUIDs, which report pumping as a **positive** MW) are
+summed separately for the tooltip; the pulse fires on their sum.
+
+**OpenNEM has no `pumped_hydro` fueltech** — a pumped station reports `hydro`,
+plus a sibling `pumps` unit only where the load DUID is in the fleet — so
+`build_fleet()` in `webmap/server.py` classifies a facility as pumped storage
+when **any** of three independent signals agrees: a `pumps` unit, a non-zero
+`capacity_storage` on a unit, or the facility description matching
+`pumped|pump[- ]?storage`. All three agree on the same seven schemes (Tumut 3,
+Wivenhoe, Shoalhaven, Guthega/Snowy 2, Kidston, Snowy 2.0, Walpole); the other
+56 draw as classic hydro. Pumped markers add a **second, concentric hexagon
+outline** so the two are distinguishable at a glance. Retired units are dropped,
+so a half-demolished station is not counted at its historic capacity — Tumut 3's
+six retired 250 MW units would otherwise add 1,500 MW to a 2,100 MW facility.
+
+A **Snowy reservoirs** card (top right) shows the three published lakes'
+percent-of-gross-storage and 7-day direction, straight from the
+`snowy_tantangara_*` series on `/data/live`. They are catchment storages that map
+to no single station, so they get their own card rather than a fabricated
+per-facility tooltip, and the card simply stays hidden if the exporter is down.
+That needs the reservoir exporter running with `--all-reservoirs`, which the
+compose file passes. The server wraps these three queries in
+`last_over_time(...[2h])` — an hourly job against Prometheus's default 5m
+lookback delta means a bare selector is only answerable for five minutes in
+every hour (see NOTES.md). The card prints the reading's own observation date
+rather than an age, because a value published once a day has no meaningful
+"freshness".
 
 The WHT exporter's deployment is:
 

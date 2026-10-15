@@ -139,3 +139,37 @@ html, body {
 .pop tr.sum td { border-top: 1px solid var(--border); padding-top: 3px; }
 @keyframes bat-ring-pulse { 0%,100% { opacity: 0.9; } 50% { opacity: 0.25; } }
 .bat-ring-pulse { animation: bat-ring-pulse 1.2s ease-in-out infinite; }
+
+/* Hydro markers pulse on the stroke only, so the fill - and with it the
+   output colour - stays solid and readable while the outline throbs. */
+@keyframes hydro-pulse {
+  0%, 100% { stroke-width: 1.6px; stroke-opacity: 1; }
+  50%      { stroke-width: 4.5px; stroke-opacity: 0.45; }
+}
+.hydro-pulse { animation: hydro-pulse 1.3s ease-in-out infinite; }
+
+/* Snowy reservoir card. Top-right because Leaflet's zoom control owns
+   top-left and the legend is anchored bottom-right. */
+#resv {
+  position: absolute;
+  right: 10px;
+  top: 10px;
+  z-index: 1000;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 11px;
+  color: var(--muted);
+  min-width: 176px;
+}
+
+#resv[hidden] { display: none; }
+#resv h4 { margin: 0 0 5px; color: var(--text); font-weight: 600; }
+#resv .resv-row { display: flex; align-items: baseline; gap: 6px; margin: 3px 0; }
+#resv .resv-name { flex: 1; color: var(--text); }
+#resv .resv-pct { color: #cfe0f2; }
+#resv .resv-delta { width: 9px; text-align: center; }
+#resv .resv-delta.up { color: #6cd968; }
+#resv .resv-delta.down { color: #e5635b; }
+#resv .cap { margin-top: 5px; padding-top: 5px; border-top: 1px solid var(--border); font-size: 10px; line-height: 1.3; }

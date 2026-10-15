@@ -1042,8 +1042,12 @@ discovered.
 The `reservoir` template variable is
 `label_values(snowy_tantangara_level_percent, reservoir)` and **every per-reservoir
 query filters on `{reservoir="$reservoir"}`.** The exporter defaults to
-Tantangara alone but supports `--all-reservoirs`, so a variable that filtered
-nothing would silently show the first reservoir if that flag were ever set.
+Tantangara alone but supports `--all-reservoirs`, and **the compose service now
+passes that flag** (the web map's "Snowy reservoirs" card shows all three). That
+would have silently switched this dashboard to the first reservoir —
+alphabetically "Lake Eucumbene" — if the variable had been left empty, so the
+variable's `current` is pinned to `Tantangara Reservoir`; a variable that
+filtered nothing must never be allowed to drift with the option list.
 
 **The `timeInterval: 5m` on the datasource does not match this job's 1 h
 `scrape_interval`,** and that is fine here: no query on this dashboard uses
@@ -1051,6 +1055,21 @@ nothing would silently show the first reservoir if that flag were ever set.
 does not care about the step. The one place it would matter is `$__interval` on a
 range query, which would ask for 5 m resolution against 1 h data. The range
 queries therefore carry an explicit range. This is commented at the setting.
+
+**An hourly scrape interval against Prometheus's default 5 m
+`--query.lookback-delta` is a trap for *instant* queries, and it bit the web
+map.** A bare selector is only answerable for the five minutes following a
+scrape: measured, `snowy_tantangara_level_percent` returns 0 series for most of
+the hour after the scrape ages past the delta, while
+`last_over_time(snowy_tantangara_level_percent[2h])` returns all three lakes.
+The Grafana panels are unaffected because their range queries carry an explicit
+range whose step lands inside the lookback window (Tantangara yields ~167 of
+168 hourly points over 7 d); it is the map's per-poll instant query that would
+have shown a blank card for ~55 minutes in every hour, so `webmap/server.py`
+wraps the three reservoir queries in `last_over_time(...[2h])`. Prometheus was
+deliberately *not* started with a larger `--query.lookback-delta`: it is global,
+and a 5 m lookback is what lets a stalled exporter's last value fall out of the
+live battery/solar layers — precisely the staleness the map exists to surface.
 
 **The committed JSON is the source of truth; the generator is not kept.** It was
 a throwaway script, and it only existed because Grafana materialises several

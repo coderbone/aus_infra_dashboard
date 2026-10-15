@@ -91,6 +91,12 @@ services:
       - --cache-ttl=900
       - --retries=3
       - --retry-budget=6
+      # Export every named Snowy lake, not just the default Tantangara one: the
+      # webmap's "Snowy reservoirs" card shows all three. The Grafana dashboard
+      # keeps its Tantangara default because that variable's `current` is pinned
+      # to that value (NOTES.md warns it would otherwise fall back to the first
+      # series, alphabetically "Lake Eucumbene").
+      - --all-reservoirs
     # Same resolver override as tbm-exporter, for the same reason: Docker's
     # embedded resolver intermittently gives up with EAI_AGAIN and burns ~5s
     # doing it, which is what eats the retry budget. This one talks to

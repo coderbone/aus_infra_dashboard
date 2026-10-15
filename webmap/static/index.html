@@ -25,13 +25,21 @@
     </select>
   </label>
   <label class="opt chk"><input type="checkbox" id="tog-schematic" checked> schematic lines</label>
+  <label class="opt chk"><input type="checkbox" id="tog-committed" checked> committed (planned)</label>
   <label class="opt chk"><input type="checkbox" id="tog-monitored" checked> monitored batteries</label>
   <label class="opt chk"><input type="checkbox" id="tog-unmonitored" checked> unmonitored batteries</label>
   <label class="opt chk"><input type="checkbox" id="tog-solar" checked> solar</label>
   <label class="opt chk"><input type="checkbox" id="tog-wind" checked> wind</label>
+  <label class="opt chk"><input type="checkbox" id="tog-hydro" checked> hydro</label>
 </div>
 
 <div id="legend"></div>
+
+<div id="resv" hidden>
+  <h4>Snowy reservoirs</h4>
+  <div id="resv-rows"></div>
+  <div class="cap" id="resv-cap">% full, of gross storage &middot; arrow = 7-day change</div>
+</div>
 
 <script src="/static/lib/leaflet/leaflet.js"></script>
 <script src="/static/app.js"></script>

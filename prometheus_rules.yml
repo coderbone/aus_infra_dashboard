@@ -27,3 +27,16 @@ groups:
           aemo_battery_power_mw
             * on(duid) group_left(region)
               oe_battery_fleet_info
+
+  # Peak stored energy per unit, used by the web map to show how much of a
+  # commissioning battery has actually been energised (peak stored MWh divided
+  # by registered storage capacity). Recorded here rather than computed in the
+  # web server on every poll: max_over_time re-scans its whole window on each
+  # evaluation, so a recording rule pays that once per interval instead of on
+  # every /data/live request. 90d covers a commissioning build-out and is
+  # bounded, keeping the scan cheap; a unit with no inferred series simply has
+  # no peak, and the map omits its progress arc.
+  - name: aemo_battery_commissioning
+    rules:
+      - record: aemo_battery_peak_stored_mwh
+        expr: max_over_time(aemo_battery_inferred_stored_mwh[90d])

@@ -11,22 +11,29 @@ const state = {
   interconnectors: {},
   batteries: {},
   fleet: [],
+  hydro: [],
+  reservoirs: {},
   fetchedAt: 0,
   prom: "unknown",
 };
 let metric = "stored";
 let showSchematic = true;
+let showCommitted = true;
 let showMonitored = true;
 let showUnmonitored = true;
 let showSolar = true;
 let showWind = true;
+let showHydro = true;
 
 const map = L.map("map", { zoomControl: true, attributionControl: false }).setView([-33.2, 145.0], 5);
 
 const regionLayers = {}; // code -> path layer
 const lineLayers = [];   // {feat, layer, arrow}
 const batteryLayers = {}; // facility -> circle layer
+const batteryArcs = {}; // facility -> commissioning progress arc (donut sector)
 const renLayers = {}; // key -> marker
+const hydroLayers = {}; // facility -> hexagon
+const hydroRings = {}; // facility -> concentric inner hexagon (pumped storage only)
 
 /* ---------- colour helpers ---------- */
 
@@ -71,6 +78,15 @@ const STATUS_COLOR = {
   commissioning: "#7b6fae",
   committed: "#5a6b80",
 };
+// A commissioning facility is drawn as a dim "planned" disc with a bright arc
+// covering the fraction that has actually been energised (peak stored MWh over
+// registered storage capacity). The arc is a donut/sector band, coloured
+// red-yellow-green by how charged the energised plant is right now relative to
+// its own peak (see commissionColor). COMMISSION_BASE is the unbuilt remainder
+// and COMMISSION_ARC the fallback arc colour when no current reading exists.
+const COMMISSION_BASE = "#2b2740";
+const COMMISSION_ARC = "#ab9bf0";
+const COMMISSION_ARC_INNER = 0.58;
 const LINE_COLORS = { low: "#5ec1e6", mid: "#f2c84b", high: "#ef5b3f", nodata: "#64758b", snowy: "#3dd6c7" };
 
 function regionMetricValue(code) {
@@ -267,6 +283,66 @@ function facilityTotal(fac) {
   return total;
 }
 
+// A facility is "committed" when none of its units are yet active. Committed
+// facilities are built but not operating, so they are hidden when the toggle is
+// off while remaining available when thinking about future capacity.
+function isCommitted(fac) {
+  const units = fac.units || [];
+  return units.length > 0 && units.every((u) => u.status === "committed");
+}
+
+function isCommissioning(fac) {
+  return (fac.units || []).some((u) => u.status === "commissioning");
+}
+
+// Two numbers drive a commissioning facility's marker:
+//   frac  peak stored energy over the commissioning window / registered storage
+//         capacity - how much of the battery has been energised. There is no
+//         module count upstream, so this is the physical proxy - energy can only
+//         be stored in cells that exist and are connected - and it is a lower
+//         bound, since a unit that has never charged to its ceiling reads low.
+//   fill  current inferred stored energy / peak stored so far - how charged the
+//         energised plant is right now, as a fraction of the most it has ever
+//         held. This drives the arc's colour (red near empty, green near peak).
+// Null when the unit publishes no peak series (e.g. the WEM facilities), in
+// which case no arc is drawn.
+function facilityCommission(fac) {
+  let peak = 0, cur = 0, cap = 0, anyPeak = false, anyCur = false;
+  for (const u of fac.units || []) {
+    const c = u.capacity_mwh || 0;
+    if (c <= 0) continue;
+    cap += c;
+    const m = state.batteries[u.code];
+    if (m && typeof m.peak_stored_mwh === "number") { peak += m.peak_stored_mwh; anyPeak = true; }
+    if (m && typeof m.inf_stored_mwh === "number") { cur += m.inf_stored_mwh; anyCur = true; }
+  }
+  if (!anyPeak || cap <= 0) return null;
+  const frac = Math.max(0, Math.min(1, peak / cap));
+  const fill = anyCur && peak > 0 ? Math.max(0, Math.min(1, cur / peak)) : null;
+  return { frac, fill };
+}
+
+// A donut sector (annular wedge) sized in metres, drawn as a lat/lng polygon so
+// it overlays the L.circle. Leaflet renders that circle as an ellipse whose
+// semi-axes are r/111320 degrees of latitude and r/(111320*cos lat) of
+// longitude, which is exactly the metre->degree scaling used here (and by
+// renShape), so the two coincide. Sweeps clockwise from 12 o'clock.
+function commissionArc(lat, lng, rMeters, fraction) {
+  const dLat = 1 / 111320;
+  const dLng = 1 / (111320 * Math.max(0.2, Math.cos(lat * Math.PI / 180)));
+  const span = Math.max(0, Math.min(1, fraction)) * 360;
+  const steps = Math.max(2, Math.round(span / 6));
+  const outer = [], inner = [];
+  for (let i = 0; i <= steps; i++) {
+    const b = (span * i / steps) * Math.PI / 180;
+    const cos = Math.cos(b), sin = Math.sin(b);
+    outer.push([lat + rMeters * dLat * cos, lng + rMeters * dLng * sin]);
+    inner.push([lat + rMeters * COMMISSION_ARC_INNER * dLat * cos,
+                lng + rMeters * COMMISSION_ARC_INNER * dLng * sin]);
+  }
+  return outer.concat(inner.reverse());
+}
+
 function unitLiveStatus(fac) {
   for (const u of fac.units || []) {
     const m = state.batteries[u.code];
@@ -338,32 +414,45 @@ function facilitySoc(fac) {
   return { soc: wsum / w, src };
 }
 
+function removeBattery(facility) {
+  const layer = batteryLayers[facility];
+  if (layer) { map.removeLayer(layer); delete batteryLayers[facility]; }
+  const arc = batteryArcs[facility];
+  if (arc) { map.removeLayer(arc); delete batteryArcs[facility]; }
+}
+
 function applyBatteries() {
   for (const fac of state.fleet) {
     const loc = fac.location;
     let layer = batteryLayers[fac.facility];
-    if (!loc || !loc.lat || !loc.lng) {
-      if (layer) { map.removeLayer(layer); delete batteryLayers[fac.facility]; }
+    if (!loc || !loc.lat || !loc.lng || (!showCommitted && isCommitted(fac))) {
+      removeBattery(fac.facility);
       continue;
     }
     const live = unitLiveStatus(fac);
     const s = facilitySoc(fac);
     const monitored = !!live || !!s;
-    if (monitored && !showMonitored) {
-      if (layer) { map.removeLayer(layer); delete batteryLayers[fac.facility]; }
-      continue;
-    }
-    if (!monitored && !showUnmonitored) {
-      if (layer) { map.removeLayer(layer); delete batteryLayers[fac.facility]; }
-      continue;
-    }
+    if (monitored && !showMonitored) { removeBattery(fac.facility); continue; }
+    if (!monitored && !showUnmonitored) { removeBattery(fac.facility); continue; }
     const total = facilityTotal(fac);
     const soc = s ? s.soc : (live && typeof live.m.soc_ratio === "number" ? live.m.soc_ratio : null);
     const fp = facilityPower(fac);
-    const ring = fp && Math.abs(fp.mw) > 5 ? true : false;
+    const commissioning = isCommissioning(fac);
+    const commission = commissioning ? facilityCommission(fac) : null;
+    // Commissioning facilities carry the progress arc instead of the power
+    // ring, so the two indicators do not collide on the same circle edge.
+    const ring = !commissioning && fp && Math.abs(fp.mw) > 5 ? true : false;
     const ringWeight = fp ? Math.min(6, 2 + Math.abs(fp.mw) / 20) : 0;
     const ringColor = fp && fp.mw < 0 ? "#22c55e" : (fp && fp.mw > 0 ? "#ef4444" : "#101a2b");
-    const opts = {
+    const opts = commissioning ? {
+      radius: radiusFor(total),
+      weight: 1.4,
+      color: "#6f64a8",
+      dashArray: "4 3",
+      fillColor: COMMISSION_BASE,
+      fillOpacity: 0.55,
+      className: "",
+    } : {
       radius: radiusFor(total),
       weight: ring ? ringWeight : (s ? 1.5 : (monitored ? 1.5 : 1)),
       color: ring ? ringColor : (s ? "#101a2b" : (monitored ? "#101a2b" : "#3a4c63")),
@@ -393,14 +482,52 @@ function applyBatteries() {
         else path.classList.remove("bat-ring-pulse");
       }
     } catch (e) {}
-    layer.setTooltipContent(batteryTip(fac, live, soc, total));
+    applyCommissionArc(fac.facility, commissioning, commission, loc, radiusFor(total));
+    layer.setTooltipContent(batteryTip(fac, live, soc, total, commission));
   }
 }
 
-function batteryTip(fac, live, soc, total) {
+function commissionColor(commission) {
+  // Red near empty, through yellow, to green near the facility's own peak. Falls
+  // back to the flat commissioning purple only if no current reading exists.
+  return commission && commission.fill != null ? ramp(commission.fill, STOPS_GEN) : COMMISSION_ARC;
+}
+
+function applyCommissionArc(facility, commissioning, commission, loc, radius) {
+  const wantArc = commissioning && commission && commission.frac > 0;
+  const existing = batteryArcs[facility];
+  if (!wantArc) {
+    if (existing) { map.removeLayer(existing); delete batteryArcs[facility]; }
+    return;
+  }
+  const color = commissionColor(commission);
+  const pts = commissionArc(loc.lat, loc.lng, radius, commission.frac);
+  if (!existing) {
+    batteryArcs[facility] = L.polygon(pts, {
+      interactive: false,
+      color: color,
+      weight: 0,
+      fillColor: color,
+      fillOpacity: 0.95,
+    }).addTo(map);
+  } else {
+    existing.setLatLngs(pts);
+    existing.setStyle({ color: color, fillColor: color, fillOpacity: 0.95 });
+  }
+}
+
+function batteryTip(fac, live, soc, total, commission) {
   const st = fac.units.map((u) => u.status).filter(Boolean)[0] || "";
   let html = '<b>' + fac.name + '</b> (' + fac.facility + ')<br>' +
              fac.region + ' &middot; ' + total.toFixed(0) + ' MWh &middot; ' + st;
+  if (commission) {
+    html += '<br><span style="color:' + commissionColor(commission) + '">commissioning: ' +
+            (commission.frac * 100).toFixed(0) + '% energised';
+    if (commission.fill != null) {
+      html += ' &middot; now ' + (commission.fill * 100).toFixed(0) + '% of peak';
+    }
+    html += '</span>';
+  }
   if (!live) html += ' &middot; <span style="color:#7d8fa5">unmonitored</span>';
   else {
     if (soc != null) html += '<br>SoC ' + (soc * 100).toFixed(0) + '%';
@@ -460,6 +587,23 @@ function legendGlyph(shape) {
   return '<span class="glyph"><svg ' + common + '><polygon points="7,1 13,7 7,13 1,7"/></svg></span>';
 }
 
+// A stand-in donut sector for the legend: a ~70% arc, matching the marker, filled
+// with the same red-yellow-green ramp the arc colour uses.
+function commissionArcGlyph() {
+  const cx = 7, cy = 7, ro = 6, ri = 3.4, sweep = 0.7 * 2 * Math.PI, steps = 16;
+  const pt = (r, th) => (cx + r * Math.sin(th)).toFixed(2) + ' ' + (cy - r * Math.cos(th)).toFixed(2);
+  let d = 'M' + pt(ro, 0);
+  for (let i = 1; i <= steps; i++) d += 'L' + pt(ro, sweep * i / steps);
+  for (let i = steps; i >= 0; i--) d += 'L' + pt(ri, sweep * i / steps);
+  const rgb = (c) => "rgb(" + c.join(",") + ")";
+  return '<svg width="14" height="14" viewBox="0 0 14 14">' +
+    '<defs><linearGradient id="cmgrad" x1="0" y1="1" x2="0" y2="0">' +
+    '<stop offset="0" stop-color="' + rgb(STOPS_GEN[0].c) + '"/>' +
+    '<stop offset="0.5" stop-color="' + rgb(STOPS_GEN[1].c) + '"/>' +
+    '<stop offset="1" stop-color="' + rgb(STOPS_GEN[STOPS_GEN.length - 1].c) + '"/></linearGradient></defs>' +
+    '<path d="' + d + 'Z" fill="url(#cmgrad)" stroke="#101a2b" stroke-width="0.8"/></svg>';
+}
+
 function updateLegend() {
   const el = document.getElementById("legend");
   if (metric === "none") { el.innerHTML = ""; return; }
@@ -474,9 +618,14 @@ function updateLegend() {
   el.innerHTML = '<h4>' + label + '</h4>' + rows +
     '<div class="row"><span class="sw" style="background:#8ca3ba"></span><span>battery (live)</span></div>' +
     '<div class="row"><span class="sw" style="background:#54657a"></span><span>battery (status)</span></div>' +
+    '<div class="row"><span class="glyph">' + commissionArcGlyph() + '</span><span>commissioning (energised)</span></div>' +
     '<div class="row">' + legendGlyph("solar") + '<span>solar</span></div>' +
     '<div class="row">' + legendGlyph("wind") + '<span>wind</span></div>' +
-    '<div class="cap">solar/wind: shape = type, colour = generation (% of capacity)</div>';
+    '<div class="row">' + hydroGlyph(false) + '<span>hydro</span></div>' +
+    '<div class="row">' + hydroGlyph(true) + '<span>pumped hydro</span></div>' +
+    '<div class="cap">commissioning: arc length = % capacity energised, colour = stored now vs peak (red&rarr;green)</div>' +
+    '<div class="cap">solar/wind: shape = type, colour = generation (% of capacity)</div>' +
+    '<div class="cap">hydro: colour = output (% of capacity), pulse = &ge;5% (floor 1 MW) generating or pumping</div>';
 }
 
 /* ---------- controls ---------- */
@@ -490,6 +639,12 @@ function wireControls() {
   document.getElementById("tog-schematic").addEventListener("change", (ev) => {
     showSchematic = ev.target.checked;
     applyLines();
+  });
+  document.getElementById("tog-committed").addEventListener("change", (ev) => {
+    showCommitted = ev.target.checked;
+    applyHydro();
+    applyBatteries();
+    applyRenewables();
   });
   document.getElementById("tog-monitored").addEventListener("change", (ev) => {
     showMonitored = ev.target.checked;
@@ -506,6 +661,10 @@ function wireControls() {
   document.getElementById("tog-wind").addEventListener("change", (ev) => {
     showWind = ev.target.checked;
     applyRenewables();
+  });
+  document.getElementById("tog-hydro").addEventListener("change", (ev) => {
+    showHydro = ev.target.checked;
+    applyHydro();
   });
 }
 
@@ -528,12 +687,19 @@ async function poll() {
   state.units = data.units || {};
   state.fleet = data.fleet || [];
   state.renewables = data.renewables || [];
+  state.hydro = data.hydro || [];
+  state.reservoirs = data.reservoirs || {};
   state.fetchedAt = data.fetched_at;
   state.prom = data.prometheus || "ok";
   applyRegions();
   applyLines();
+  // Hydro first: its polygons are the broadest shape, and adding it before the
+  // others leaves the co-located solar/wind/battery shapes on top (Kidston has
+  // both a solar farm and pumped hydro on the same coordinate).
+  applyHydro();
   applyBatteries();
   applyRenewables();
+  updateReservoirs();
   updateHeader();
 }
 
@@ -594,6 +760,7 @@ function applyRenewables() {
     const loc = fac.location;
     if (!loc || !loc.lat || !loc.lng) continue;
     for (const u of fac.units || []) {
+      if (!showCommitted && u.status === "committed") continue;
       const ft = u.fueltech_id || (u.code && u.code.includes("WF") ? "wind" : "solar");
       const isWind = (ft === "wind" || ft === "wind_farm");
       const isSolar = (ft === "solar" || ft === "solar_utility");
@@ -637,5 +804,236 @@ function applyRenewables() {
     }
   }
   for (const k of existing) { if (renLayers[k]) { map.removeLayer(renLayers[k]); delete renLayers[k]; } }
+}
+
+/* ---------- hydro ---------- */
+
+// Output at or above which a hydro marker pulses. A station trickling a few MW
+// out of a 1,500 MW scheme is not "running", so the bar is 5% of registered
+// capacity - but never below 1 MW, since 5% of a 1.4 MW mini-hydro is noise.
+const HYDRO_PULSE_FRAC = 0.05;
+const HYDRO_PULSE_MIN_MW = 1;
+
+// Pumped storage and classic hydro share one upstream fueltech (OpenNEM has no
+// pumped_hydro), so the server tags each facility with a `pumped` flag derived
+// from the pump DUIDs, stored-energy capacity and the facility description. The
+// two get different shapes here: classic is a plain hexagon, pumped is the same
+// hexagon inside a concentric outline.
+
+// Regular n-gon sized in metres, using the same metre->degree scaling as
+// renShape and commissionArc, so a hexagon of radius r covers the same footprint
+// an L.circle(r) would. Vertex 0 sits at 12 o'clock (pointy-top), matching
+// commissionArc's sweep origin.
+function polyPoints(lat, lng, rMeters, sides, scale) {
+  const r = rMeters * (scale || 1);
+  const dLat = 1 / 111320;
+  const dLng = 1 / (111320 * Math.max(0.2, Math.cos(lat * Math.PI / 180)));
+  const pts = [];
+  for (let i = 0; i < sides; i++) {
+    const b = (i * 360 / sides) * Math.PI / 180;
+    pts.push([lat + r * dLat * Math.cos(b), lng + r * dLng * Math.sin(b)]);
+  }
+  return pts;
+}
+
+// One marker per facility rather than per unit: Tumut 3's eight units all share
+// a single coordinate, so per-unit polygons would stack invisibly. Generation
+// and pumping are summed separately - they come from different DUIDs (the
+// `hydro` unit vs the sibling `pumps` unit) and read differently in the tooltip.
+function hydroAgg(fac) {
+  let gen = 0, pump = 0, cap = 0, measured = false, age = Infinity;
+  for (const u of fac.units || []) {
+    cap += u.capacity_mw || 0;
+    const m = state.units && state.units[u.code];
+    if (!m || typeof m.power_mw !== "number") continue;
+    const mw = Math.max(0, m.power_mw);
+    measured = true;
+    if (u.fueltech_id === "pumps") pump += mw; else gen += mw;
+    if (typeof m.age_s === "number" && m.age_s < age) age = m.age_s;
+  }
+  const activity = gen + pump;
+  const frac = cap > 0 ? Math.max(0, Math.min(1, activity / cap)) : null;
+  const pulse = measured && activity >= Math.max(HYDRO_PULSE_MIN_MW, HYDRO_PULSE_FRAC * cap);
+  const status = (fac.units || []).map((u) => u.status).filter(Boolean)[0] || "";
+  return { gen, pump, cap, activity, frac, measured, pulse, age, status };
+}
+
+function hydroTip(fac, agg) {
+  const kind = fac.pumped ? "pumped hydro" : "hydro";
+  let html = '<b>' + fac.name + '</b> (' + fac.facility + ')<br>' +
+    fac.region + ' &middot; ' + kind + ' &middot; ' + agg.cap.toFixed(0) + ' MW';
+  if (agg.status) html += ' &middot; ' + agg.status;
+  if (!agg.measured) {
+    html += ' &middot; <span style="color:#7d8fa5">no live data</span>';
+    return html;
+  }
+  const lines = [];
+  if (agg.gen > 0.5) lines.push('<span style="color:#6cd968">generating ' + agg.gen.toFixed(0) + ' MW</span>');
+  if (agg.pump > 0.5) lines.push('<span style="color:#5ec1e6">pumping ' + agg.pump.toFixed(0) + ' MW</span>');
+  html += '<br>' + (lines.length ? lines.join(' + ') : 'idle');
+  if (agg.frac != null) html += ' &middot; ' + Math.round(agg.frac * 100) + '% of capacity';
+  if (isFinite(agg.age)) html += ' &middot; ' + agg.age.toFixed(0) + 's old';
+  return html;
+}
+
+function hydroPopup(fac, agg) {
+  const kind = fac.pumped ? "pumped hydro" : "hydro";
+  let rows = '<tr><th>unit</th><th>role</th><th class="num">cap</th><th class="num">now</th></tr>';
+  for (const u of fac.units || []) {
+    const m = state.units && state.units[u.code];
+    const mw = m && typeof m.power_mw === "number" ? Math.max(0, m.power_mw) : null;
+    rows += '<tr><td>' + u.code + '</td>' +
+      '<td>' + (u.fueltech_id === "pumps" ? "pump" : "gen") + '</td>' +
+      '<td class="num">' + (u.capacity_mw || 0).toFixed(1) + ' MW</td>' +
+      '<td class="num">' + (mw != null ? mw.toFixed(1) + ' MW' : '&ndash;') + '</td></tr>';
+  }
+  rows += '<tr class="sum"><td>facility</td><td>' + (fac.pumped ? "pumped" : "classic") + '</td>' +
+    '<td class="num">' + agg.cap.toFixed(0) + ' MW</td>' +
+    '<td class="num">' + (agg.measured ? agg.activity.toFixed(0) + ' MW' : '&ndash;') + '</td></tr>';
+  return '<div class="pop"><b>' + fac.name + '</b> <k>' + fac.region + '</k> &middot; ' + kind +
+    '<br>facility ' + fac.facility + '<table>' + rows + '</table></div>';
+}
+
+function removeHydro(facility) {
+  const layer = hydroLayers[facility];
+  if (layer) { map.removeLayer(layer); delete hydroLayers[facility]; }
+  const ring = hydroRings[facility];
+  if (ring) { map.removeLayer(ring); delete hydroRings[facility]; }
+}
+
+function applyHydro() {
+  if (!state.hydro) state.hydro = [];
+  for (const fac of state.hydro) {
+    const loc = fac.location;
+    const agg = hydroAgg(fac);
+    if (!showHydro || !loc || !loc.lat || !loc.lng || (!showCommitted && isCommitted(fac))) {
+      removeHydro(fac.facility);
+      continue;
+    }
+    const fill = agg.measured
+      ? ramp(agg.frac, STOPS_GEN)
+      : (STATUS_COLOR[agg.status] || "#54657a");
+    const r = radiusFor(agg.cap);
+    const opts = {
+      color: "#101a2b",
+      weight: 1.5,
+      fillColor: fill,
+      fillOpacity: agg.measured ? 0.85 : 0.5,
+    };
+    const pts = polyPoints(loc.lat, loc.lng, r, 6, 1);
+    let layer = hydroLayers[fac.facility];
+    if (!layer) {
+      layer = L.polygon(pts, opts).addTo(map);
+      hydroLayers[fac.facility] = layer;
+      layer.bindTooltip("", { direction: "top", className: "" });
+      layer.bindPopup("", { maxWidth: 320, className: "" });
+      layer.on("click", () => layer.setPopupContent(hydroPopup(fac, agg)));
+    } else {
+      layer.setLatLngs(pts);
+      layer.setStyle(opts);
+      layer.setPopupContent(hydroPopup(fac, agg));
+    }
+    // The pulse is on the stroke only (see .hydro-pulse), so the fill colour
+    // that encodes output stays steady while the outline throbs.
+    try {
+      const path = layer._path;
+      if (path) {
+        if (agg.pulse) path.classList.add("hydro-pulse");
+        else path.classList.remove("hydro-pulse");
+      }
+    } catch (e) {}
+    // Pumped storage gets a second, smaller outline laid over the fill. It is
+    // non-interactive so the tooltip and popup still belong to the outer shape,
+    // and it is drawn after the outer polygon so it stays on top of its fill.
+    const ringPts = fac.pumped ? polyPoints(loc.lat, loc.lng, r, 6, 0.55) : null;
+    let ring = hydroRings[fac.facility];
+    if (!ringPts) {
+      if (ring) { map.removeLayer(ring); delete hydroRings[fac.facility]; }
+    } else if (!ring) {
+      hydroRings[fac.facility] = L.polygon(ringPts, {
+        interactive: false,
+        color: "#101a2b",
+        weight: 1.3,
+        fill: false,
+        opacity: 0.9,
+      }).addTo(map);
+    } else {
+      ring.setLatLngs(ringPts);
+    }
+    layer.setTooltipContent(hydroTip(fac, agg));
+  }
+}
+
+/* ---------- reservoirs ---------- */
+
+// Only the Snowy Hydro lakes are published, and each is a catchment-wide storage
+// that maps to no single station, so they get their own card instead of a
+// per-facility tooltip. Data comes from the reservoir-exporter, which the compose
+// file runs with --all-reservoirs.
+const RESERVOIR_ORDER = ["Lake Eucumbene", "Lake Jindabyne", "Tantangara Reservoir"];
+
+// "Lake Eucumbene" -> "Eucumbene" (the card's heading already says where they are).
+function shortReservoirName(name) {
+  return String(name).replace(/^Lake\s+/i, "").replace(/\s+Reservoir$/i, "");
+}
+
+// The upstream publishes these once a day, so a reading is old by nature. Shown
+// as a date rather than a live age, because "as of 15 Oct" is the honest framing
+// for a daily figure and "% full, 12h old" would suggest a measurement cadence
+// that does not exist.
+function reservoirObserved(names) {
+  let newest = 0;
+  for (const n of names) {
+    const t = (state.reservoirs[n] || {}).last_sample;
+    if (typeof t === "number" && t > newest) newest = t;
+  }
+  if (!newest) return "";
+  const d = new Date(newest * 1000);
+  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  return "observed " + d.getDate() + " " + months[d.getMonth()];
+}
+
+function updateReservoirs() {
+  const el = document.getElementById("resv");
+  const rowsEl = document.getElementById("resv-rows");
+  const data = state.reservoirs || {};
+  const names = RESERVOIR_ORDER.filter((n) => data[n]);
+  for (const n of Object.keys(data)) if (names.indexOf(n) < 0) names.push(n);
+  if (!names.length) { el.hidden = true; return; }
+  let html = "";
+  for (const n of names) {
+    const d = data[n] || {};
+    const lvl = typeof d.level === "number" ? d.level.toFixed(0) + "%" : "&ndash;";
+    let delta = '<span class="resv-delta"></span>';
+    if (typeof d.change_7d === "number" && Math.abs(d.change_7d) >= 0.05) {
+      const up = d.change_7d > 0;
+      delta = '<span class="resv-delta ' + (up ? "up" : "down") + '" title="' +
+        (up ? "+" : "") + d.change_7d.toFixed(1) + ' pp over 7 days">' +
+        (up ? "&uarr;" : "&darr;") + '</span>';
+    }
+    html += '<div class="resv-row"><span class="resv-name">' + shortReservoirName(n) + '</span>' +
+      '<span class="resv-pct">' + lvl + '</span>' + delta + '</div>';
+  }
+  const observed = reservoirObserved(names);
+  const capEl = document.getElementById("resv-cap");
+  if (capEl) capEl.innerHTML = '% full, of gross storage &middot; arrow = 7-day change' +
+    (observed ? '<br>' + observed : '');
+  rowsEl.innerHTML = html;
+  el.hidden = false;
+}
+
+// A small hexagon, matching the markers, with the pumped variant's inner outline.
+function hydroGlyph(pumped) {
+  const hex = (r) => {
+    const pts = [];
+    for (let i = 0; i < 6; i++) {
+      const b = (i * 60) * Math.PI / 180;
+      pts.push((7 + r * Math.sin(b)).toFixed(2) + ',' + (7 - r * Math.cos(b)).toFixed(2));
+    }
+    return pts.join(' ');
+  };
+  let svg = '<polygon points="' + hex(6) + '" fill="#8ca3ba" stroke="#101a2b" stroke-width="1.1"/>';
+  if (pumped) svg += '<polygon points="' + hex(3.3) + '" fill="none" stroke="#101a2b" stroke-width="1.1"/>';
+  return '<span class="glyph"><svg width="14" height="14" viewBox="0 0 14 14">' + svg + '</svg></span>';
 }
 

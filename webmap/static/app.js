@@ -138,7 +138,7 @@ async function initGeometry() {
     const latlngs = feat.geometry.coordinates.map((c) => [c[1], c[0]]);
     const layer = L.polyline(latlngs, {
       color: snow ? LINE_COLORS.snowy : LINE_COLORS.nodata,
-      weight: snow ? 2 : 1.2,
+      weight: isSchematic ? 5.5 : (snow ? 2 : 1.2),
       opacity: 0.9,
       dashArray: snow ? null : "5 5",
       interactive: !!live,
@@ -357,7 +357,28 @@ function unitLiveStatus(fac) {
   return null;
 }
 
-function radiusFor(mwh) { return Math.min(14800, 2800 + 12000 * mwh / (mwh + 3000)); }
+// Marker radii are drawn in metres, so Leaflet reprojects them as the map zooms.
+// At the pure metre size a marker doubles on screen for every zoom level, and by
+// the time you are zoomed right in the big ones are hundreds of pixels across and
+// swallow their neighbours. Damping the metre size by the zoom makes the on-screen
+// growth sub-linear: markers still grow as you zoom in, so their relative sizes
+// stay meaningful, but slower than the map, so units stay separable. Zoomed out
+// they read a little larger than the pure metre size would give.
+// MARKER_ZOOM_DAMP is the knob: 0 restores the old pure-metre scaling, 1 pins
+// markers to a constant pixel size regardless of zoom.
+const MARKER_ZOOM_REF = 6;    // zoom at which the metre scale is left untouched
+const MARKER_ZOOM_DAMP = 0.6; // how hard the zoom growth is damped (see above)
+
+function viewScale() {
+  // Tolerant of a missing map.getZoom so the geometry helpers stay usable (and
+  // unit-testable) without a real Leaflet map.
+  const z = map && typeof map.getZoom === "function" ? map.getZoom() : MARKER_ZOOM_REF;
+  return Math.pow(2, -MARKER_ZOOM_DAMP * (z - MARKER_ZOOM_REF));
+}
+
+function radiusFor(mwh) {
+  return Math.min(14800, 2800 + 12000 * mwh / (mwh + 3000)) * viewScale();
+}
 
 function unitPower(code) {
   const m = state.batteries[code];
@@ -478,9 +499,11 @@ function applyBatteries() {
       layer.addTo(map);
     } else {
       layer.setLatLng(pos);
+      layer.setRadius(opts.radius); // setStyle does not touch an L.circle's radius
       layer.setStyle(opts);
       layer.setPopupContent(batteryPopup(fac));
     }
+    layer._sizeR = opts.radius;
     try {
       const path = layer._path;
       if (path) {
@@ -520,6 +543,8 @@ function applyCommissionArc(facility, commissioning, commission, loc, radius) {
     existing.setLatLngs(pts);
     existing.setStyle({ color: color, fillColor: color, fillOpacity: 0.95 });
   }
+  const cur = batteryArcs[facility];
+  if (cur) cur._sizeR = radius;
 }
 
 function batteryTip(fac, live, soc, total, commission) {
@@ -714,14 +739,15 @@ async function poll() {
   state.prom = data.prometheus || "ok";
   applyRegions();
   applyLines();
-  // Hydro and thermal first: their polygons are the broadest shape, and adding
-  // them before the others leaves the co-located solar/wind/battery shapes on
-  // top (Kidston has both a solar farm and pumped hydro on the same coordinate).
+  // Draw the broad shapes (hydro, then thermal) before the narrower solar/wind/
+  // battery ones; the final z-order is then set by restackMarkers() below, which
+  // fronts by size, so this order only needs to be stable, not exact.
   applyHydro();
   applyThermal("coal", state.coal, showCoal, coalLayers);
   applyThermal("gas", state.gas, showGas, gasLayers);
   applyBatteries();
   applyRenewables();
+  restackMarkers();
   updateReservoirs();
   updateHeader();
 }
@@ -732,6 +758,8 @@ initGeometry().then(() => {
   poll();
   setInterval(poll, POLL_MS);
 });
+
+map.on("zoomend", rescaleMarkers);
 
 function renMarkerKey(fac, unit) {
   return (fac.facility || fac.name || "fac") + ":" + (unit.code || "u");
@@ -802,7 +830,8 @@ function applyRenewables() {
       const measured = typeof unitPow === 'number' && cap > 0;
       const genFrac = measured ? Math.max(0, Math.min(1, unitPow / cap)) : null;
       const fill = measured ? ramp(genFrac, STOPS_GEN) : "#54657a";
-      const pts = renShape(isWind, loc.lat, loc.lng, radiusFor(cap));
+      const r = radiusFor(cap);
+      const pts = renShape(isWind, loc.lat, loc.lng, r);
       const opts = {
         color: "#101a2b",
         weight: 1.5,
@@ -819,6 +848,7 @@ function applyRenewables() {
         layer.setLatLngs(pts);
         layer.setStyle(opts);
       }
+      layer._sizeR = r;
       layer.setPopupContent(renewablePopup(fac, u, isWind, cap, unitPow, measured, genFrac));
       layer.setTooltipContent(
         '<b>' + (u.code || fac.facility) + '</b> &middot; ' + (isWind ? "wind" : "solar") +
@@ -958,6 +988,7 @@ function applyHydro() {
       layer.setStyle(opts);
       layer.setPopupContent(hydroPopup(fac, agg));
     }
+    layer._sizeR = r;
     // The pulse is on the stroke only (see .hydro-pulse), so the fill colour
     // that encodes output stays steady while the outline throbs.
     try {
@@ -985,6 +1016,8 @@ function applyHydro() {
     } else {
       ring.setLatLngs(ringPts);
     }
+    const liveRing = hydroRings[fac.facility];
+    if (liveRing) liveRing._sizeR = r * 0.55;
     layer.setTooltipContent(hydroTip(fac, agg));
   }
 }
@@ -1070,7 +1103,8 @@ function applyThermal(kind, facs, show, layers) {
       ? ramp(agg.frac, STOPS_GEN)
       : (STATUS_COLOR[agg.status] || "#54657a");
     const spec = THERMAL_SHAPE[kind];
-    const pts = polyPoints(loc.lat, loc.lng, radiusFor(agg.cap), spec.sides, 1, spec.offsetDeg);
+    const r = radiusFor(agg.cap);
+    const pts = polyPoints(loc.lat, loc.lng, r, spec.sides, 1, spec.offsetDeg);
     const opts = {
       color: "#101a2b",
       weight: 1.5,
@@ -1089,8 +1123,47 @@ function applyThermal(kind, facs, show, layers) {
       layer.setStyle(opts);
       layer.setPopupContent(thermalPopup(kind, fac, agg));
     }
+    layer._sizeR = r;
     layer.setTooltipContent(thermalTip(kind, fac, agg));
   }
+}
+
+/* ---------- zoom rescale ---------- */
+
+// Marker geometry is rebuilt at the current zoom on every poll, but a zoom between
+// polls would otherwise keep the size it was last drawn at (Leaflet just
+// reprojects the metre polygons, which grows them 2x a level). Re-running the
+// marker layers applies the damped size immediately. Only the marker layers are
+// re-applied; region fills, lines and arrows do not depend on viewScale().
+function rescaleMarkers() {
+  applyRenewables();
+  applyHydro();
+  applyThermal("coal", state.coal, showCoal, coalLayers);
+  applyThermal("gas", state.gas, showGas, gasLayers);
+  applyBatteries();
+  restackMarkers();
+}
+
+/* ---------- marker z-order ---------- */
+
+// Leaflet draws SVG vector layers in the order they were added, so a big plant
+// sits on top of a small neighbour and can hide it. Re-fronting every marker by
+// its drawn size after each pass puts the largest at the back and the smallest at
+// the front, so the little ones stay visible. The decorative pumped-hydro outline
+// and commissioning arc carry a size too (the ring is smaller than its hexagon,
+// the arc ties with its circle) so they ride just above their own marker instead
+// of being buried by it.
+function restackMarkers() {
+  const all = [];
+  for (const dict of [batteryLayers, hydroLayers, coalLayers, gasLayers, renLayers,
+                      hydroRings, batteryArcs]) {
+    for (const k in dict) {
+      const l = dict[k];
+      if (l && typeof l._sizeR === "number") all.push(l);
+    }
+  }
+  all.sort((a, b) => b._sizeR - a._sizeR); // largest first -> ends up lowest
+  for (const l of all) l.bringToFront();
 }
 
 /* ---------- reservoirs ---------- */

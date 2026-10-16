@@ -23,13 +23,13 @@
     },
     {
       "type": "Feature",
-      "properties": { "kind": "mnsp", "id": "T-V-MNSP1", "name": "Murraylink (HVDC)" },
-      "geometry": { "type": "LineString", "coordinates": [[142.2, -34.3], [140.6, -34.3]] }
+      "properties": { "kind": "mnsp", "id": "T-V-MNSP1", "name": "Basslink (Tasmania\u2011Victoria HVDC)" },
+      "geometry": { "type": "LineString", "coordinates": [[146.82, -41.1], [146.57, -38.25]] }
     },
     {
       "type": "Feature",
-      "properties": { "kind": "mnsp", "id": "V-S-MNSP1", "name": "Victoria\u2011South Australia MNSP" },
-      "geometry": { "type": "LineString", "coordinates": [[140.0, -37.3], [139.0, -36.6], [138.6, -36.0]] }
+      "properties": { "kind": "mnsp", "id": "V-S-MNSP1", "name": "Murraylink (Victoria\u2011South Australia HVDC)" },
+      "geometry": { "type": "LineString", "coordinates": [[142.2, -34.3], [140.6, -34.3]] }
     },
     {
       "type": "Feature",

@@ -189,3 +189,37 @@ html, body {
 #resv .resv-delta.up { color: #6cd968; }
 #resv .resv-delta.down { color: #e5635b; }
 #resv .cap { margin-top: 5px; padding-top: 5px; border-top: 1px solid var(--border); font-size: 10px; line-height: 1.3; }
+
+/* Graphics scale slider (bottom-left, near Leaflet zoom) */
+#gfx-scale {
+  position: absolute;
+  left: 10px;
+  bottom: 40px;
+  z-index: 1000;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px 2px;
+  color: var(--muted);
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 2px;
+  min-width: 180px;
+  pointer-events: auto;
+}
+#gfx-scale .gfx-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: 12px;
+  padding: 0 2px;
+}
+#gfx-scale #gfx-val {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+#gfx-slider {
+  width: 100%;
+  margin: 0;
+}

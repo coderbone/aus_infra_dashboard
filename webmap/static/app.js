@@ -549,7 +549,8 @@ function viewScale() {
   // Tolerant of a missing map.getZoom so the geometry helpers stay usable (and
   // unit-testable) without a real Leaflet map.
   const z = map && typeof map.getZoom === "function" ? map.getZoom() : MARKER_ZOOM_REF;
-  return Math.pow(2, -MARKER_ZOOM_DAMP * (z - MARKER_ZOOM_REF));
+  const g = (typeof gfxScale !== 'undefined' && isFinite(gfxScale)) ? gfxScale : 1.0;
+  return Math.pow(2, -MARKER_ZOOM_DAMP * (z - MARKER_ZOOM_REF)) * g;
 }
 
 function radiusFor(mwh) {
@@ -1425,5 +1426,30 @@ function thermalGlyph(sides, offsetDeg) {
   }
   return '<span class="glyph"><svg width="14" height="14" viewBox="0 0 14 14">' +
     '<polygon points="' + pts.join(' ') + '" fill="#8ca3ba" stroke="#101a2b" stroke-width="1.1"/></svg></span>';
+}
+
+
+function updateGfxScaleLabel() {
+  const el = document.getElementById('gfx-val');
+  if (el) el.textContent = gfxScale.toFixed(2);
+}
+
+function bindGfxScale() {
+  const s = document.getElementById('gfx-slider');
+  if (s) {
+    s.value = String(gfxScale);
+    s.addEventListener('input', (e) => {
+      gfxScale = Math.max(GFX_SCALE_MIN, Math.min(GFX_SCALE_MAX, parseFloat(e.target.value)));
+      updateGfxScaleLabel();
+      rescaleMarkers();
+    });
+    updateGfxScaleLabel();
+  }
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', bindGfxScale);
+} else {
+  bindGfxScale();
 }
 

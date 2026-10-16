@@ -137,6 +137,22 @@ html, body {
 .pop th { padding: 1px 8px 2px 0; color: var(--muted); font-weight: 600; text-align: left; }
 .pop th.num { text-align: right; }
 .pop tr.sum td { border-top: 1px solid var(--border); padding-top: 3px; }
+
+/* Region popup: donut ring plus a two-section generation/load list. */
+.rpop .rhead { margin-bottom: 2px; }
+.rpop .rring { display: block; margin: 2px auto 4px; }
+.rpop .rsect { margin-top: 6px; }
+.rpop .rtitle { color: var(--muted); margin-bottom: 1px; }
+.rpop .rtitle b { color: var(--text); }
+.rpop .rrow { font-size: 12px; line-height: 1.45; }
+.rsw {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  margin-right: 6px;
+  vertical-align: -1px;
+}
 @keyframes bat-ring-pulse { 0%,100% { opacity: 0.9; } 50% { opacity: 0.25; } }
 .bat-ring-pulse { animation: bat-ring-pulse 1.2s ease-in-out infinite; }
 

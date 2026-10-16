@@ -127,6 +127,9 @@ async function initGeometry() {
     onEachFeature: (feat, layer) => {
       regionLayers[feat.properties.code] = layer;
       layer.bindTooltip("", { direction: "top", className: "" });
+      layer.bindPopup("", { maxWidth: 300, className: "" });
+      layer.on("click", () =>
+        layer.setPopupContent(regionPopup(feat.properties.code, feat.properties.name)));
     },
   }).addTo(map);
 
@@ -179,6 +182,179 @@ function regionTip(code, r) {
     for (const [fuel, mw] of Object.entries(r.curtail)) if (typeof mw === "number") bits.push("curtail " + fuel + " " + mw.toFixed(0) + " MW");
   }
   return bits.join(" &middot; ");
+}
+
+// Region ring colours. Generation and load read from separate ends of the
+// palette so the two bands never share a hue by accident: cool slate/orange/
+// sky/emerald/amber plus the storage purple in the generation band, teal for
+// pumping in the load band. A curtailed fuel reuses its own hue as a stripe
+// (see ringSwatch / regionRingSVG) so "spilled generation" reads as the same
+// resource the region could have used, not a separate one.
+const RING_COLOR = {
+  coal: "#94a3b8", gas: "#fb923c", hydro: "#38bdf8", wind: "#34d399",
+  solar: "#fbbf24", battery: "#c084fc", pumps: "#2dd4bf",
+};
+
+// Everything the region popup needs, aggregated from data already on the page:
+// the per-DUID live MW in state.units (all generators and loads), the freshest
+// battery power (unitPower, OpenNEM or AEMO) and the per-fuel curtailment the
+// AEMO exporter publishes per region. Generation and load are kept apart; within
+// each, a fuel total can net several units. A category with no live series is
+// left out rather than drawn as zero.
+function regionFlows(code) {
+  const gen = [], load = [];
+  const add = (arr, key, label, color, value) => {
+    if (typeof value !== "number" || !isFinite(value) || value <= 0.5) return;
+    const hit = arr.find((s) => s.key === key);
+    if (hit) hit.value += value; else arr.push({ key, label, color, value });
+  };
+  const unitMw = (duid) => {
+    const m = state.units && state.units[duid];
+    return m && typeof m.power_mw === "number" ? m.power_mw : null;
+  };
+  // Sum the positive output of a region's facilities, optionally filtered to one
+  // fueltech; null (rather than 0) when nothing in the region reported.
+  const genSum = (facs, pick) => {
+    let sum = 0, any = false;
+    for (const fac of facs || []) {
+      if (fac.region !== code) continue;
+      for (const u of fac.units || []) {
+        if (pick && !pick(u)) continue;
+        const mw = unitMw(u.code);
+        if (typeof mw !== "number") continue;
+        any = true;
+        sum += Math.max(0, mw);
+      }
+    }
+    return any ? sum : null;
+  };
+  add(gen, "coal", "Coal", RING_COLOR.coal, genSum(state.coal));
+  add(gen, "gas", "Gas", RING_COLOR.gas, genSum(state.gas));
+  add(gen, "hydro", "Hydro", RING_COLOR.hydro, genSum(state.hydro, (u) => u.fueltech_id === "hydro"));
+  add(gen, "wind", "Wind", RING_COLOR.wind, genSum(state.renewables, (u) => u.fueltech_id === "wind" || u.fueltech_id === "wind_farm"));
+  add(gen, "solar", "Solar", RING_COLOR.solar, genSum(state.renewables, (u) => u.fueltech_id === "solar" || u.fueltech_id === "solar_utility"));
+
+  // Batteries are bidirectional: discharging is generation, charging is load.
+  // unitPower picks the freshest of the two power sources, exactly as the
+  // markers do, so the ring agrees with what is on the map.
+  let batGen = 0, batLoad = 0, batAny = false;
+  for (const fac of state.fleet || []) {
+    if (fac.region !== code) continue;
+    for (const u of fac.units || []) {
+      const p = unitPower(u.code);
+      if (!p || typeof p.mw !== "number") continue;
+      batAny = true;
+      if (p.mw > 0) batGen += p.mw; else batLoad += -p.mw;
+    }
+  }
+  add(gen, "battery", "Battery", RING_COLOR.battery, batAny ? batGen : null);
+  add(load, "battery", "Battery charge", RING_COLOR.battery, batAny ? batLoad : null);
+
+  // Pumps are the load DUIDs behind pumped hydro; AEMO signs them negative.
+  let pumpLoad = 0, pumpAny = false;
+  for (const fac of state.hydro || []) {
+    if (fac.region !== code) continue;
+    for (const u of fac.units || []) {
+      if (u.fueltech_id !== "pumps") continue;
+      const mw = unitMw(u.code);
+      if (typeof mw !== "number") continue;
+      pumpAny = true;
+      pumpLoad += Math.max(0, -mw);
+    }
+  }
+  add(load, "pumps", "Pumps", RING_COLOR.pumps, pumpAny ? pumpLoad : null);
+
+  // Per-region curtailment, added to the generation band as unrealised output.
+  const cur = (state.regions[code] || {}).curtail || {};
+  add(gen, "wind_curt", "Wind curtailed", RING_COLOR.wind, cur.wind);
+  add(gen, "solar_curt", "Solar curtailed", RING_COLOR.solar, cur.solar);
+
+  const totalGen = gen.reduce((a, s) => a + s.value, 0);
+  const totalLoad = load.reduce((a, s) => a + s.value, 0);
+  return { gen, load, totalGen, totalLoad, max: Math.max(totalGen, totalLoad) };
+}
+
+// A point on a circle whose 0 degrees is 12 o'clock, sweeping clockwise - the
+// same convention as commissionArc, so ring segments start at the top.
+function ringPoint(cx, cy, r, deg) {
+  const a = deg * Math.PI / 180;
+  return [cx + r * Math.sin(a), cy - r * Math.cos(a)];
+}
+
+// SVG path for an annular wedge (donut segment), drawn as an outer clockwise arc
+// closed back along an inner anti-clockwise arc.
+function annularSector(cx, cy, rIn, rOut, a0, a1) {
+  if (a1 - a0 <= 0) return "";
+  const large = a1 - a0 > 180 ? 1 : 0;
+  const [ox0, oy0] = ringPoint(cx, cy, rOut, a0);
+  const [ox1, oy1] = ringPoint(cx, cy, rOut, a1);
+  const [ix1, iy1] = ringPoint(cx, cy, rIn, a1);
+  const [ix0, iy0] = ringPoint(cx, cy, rIn, a0);
+  const n = (v) => v.toFixed(2);
+  return "M" + n(ox0) + " " + n(oy0) +
+    "A" + rOut + " " + rOut + " 0 " + large + " 1 " + n(ox1) + " " + n(oy1) +
+    "L" + n(ix1) + " " + n(iy1) +
+    "A" + rIn + " " + rIn + " 0 " + large + " 0 " + n(ix0) + " " + n(iy0) + "Z";
+}
+
+// Two concentric rings sharing one scale. The centre third of the radius is
+// void; the middle band is generation, the outer band is loads. Each band is a
+// stacked bar: a segment's sweep is value/max of a full turn, and max is the
+// larger of the two totals, so whichever side is bigger fills its ring and the
+// other visibly falls short. Segments are separated by a thin panel-coloured
+// stroke; a curtailed fuel is filled with a diagonal stripe instead of a flat
+// colour.
+function regionRingSVG(flows) {
+  const S = 176, c = S / 2, R = 78;
+  const rGenIn = R / 3, rGenOut = 2 * R / 3;
+  const panel = "#0f1b2d";
+  const stripe = (id, color) =>
+    '<pattern id="' + id + '" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">' +
+    '<rect width="6" height="6" fill="' + panel + '"/>' +
+    '<line x1="0" y1="0" x2="0" y2="6" stroke="' + color + '" stroke-width="3"/></pattern>';
+  let svg = '<svg class="rring" width="' + S + '" height="' + S + '" viewBox="0 0 ' + S + ' ' + S + '">';
+  svg += '<defs>' + stripe("ringCurtW", RING_COLOR.wind) + stripe("ringCurtS", RING_COLOR.solar) + '</defs>';
+  // Faint tracks so an empty (or short) band is still legible.
+  svg += '<circle cx="' + c + '" cy="' + c + '" r="' + (rGenIn + rGenOut) / 2 +
+    '" fill="none" stroke="rgba(214,226,240,0.08)" stroke-width="' + (rGenOut - rGenIn) + '"/>';
+  svg += '<circle cx="' + c + '" cy="' + c + '" r="' + (rGenOut + R) / 2 +
+    '" fill="none" stroke="rgba(214,226,240,0.08)" stroke-width="' + (R - rGenOut) + '"/>';
+  const band = (segs, rIn, rOut) => {
+    let a0 = 0, out = "";
+    for (const s of segs) {
+      const a1 = a0 + (flows.max > 0 ? s.value / flows.max * 360 : 0);
+      const fill = s.key === "wind_curt" ? "url(#ringCurtW)"
+        : s.key === "solar_curt" ? "url(#ringCurtS)" : s.color;
+      out += '<path d="' + annularSector(c, c, rIn, rOut, a0, a1) + '" fill="' + fill +
+        '" stroke="' + panel + '" stroke-width="1"/>';
+      a0 = a1;
+    }
+    return out;
+  };
+  svg += band(flows.gen, rGenIn, rGenOut);
+  svg += band(flows.load, rGenOut, R);
+  return svg + '</svg>';
+}
+
+function ringSwatch(s) {
+  const bg = s.key === "wind_curt" || s.key === "solar_curt"
+    ? "repeating-linear-gradient(45deg," + s.color + "," + s.color + " 2px,#0f1b2d 2px,#0f1b2d 5px)"
+    : s.color;
+  return '<span class="rsw" style="background:' + bg + '"></span>';
+}
+
+function regionPopup(code, name) {
+  const f = regionFlows(code);
+  const list = (segs, sign) => segs.length
+    ? segs.map((s) => '<div class="rrow">' + ringSwatch(s) + s.label + ': ' + sign + Math.round(s.value) + ' MW</div>').join("")
+    : '<div class="rrow"><span style="color:#7d8fa5">no live data</span></div>';
+  const total = (v, sign) => v > 0.5 ? sign + Math.round(v) + ' MW' : '&ndash;';
+  return '<div class="pop rpop"><div class="rhead"><b>' + (name || code) + '</b> <k>' + code + '</k></div>' +
+    regionRingSVG(f) +
+    '<div class="rsect"><div class="rtitle"><b>Generation</b> (' + total(f.totalGen, "") + ')</div>' +
+    list(f.gen, "") + '</div>' +
+    '<div class="rsect"><div class="rtitle"><b>Loads</b> (' + total(f.totalLoad, "-") + ')</div>' +
+    list(f.load, "-") + '</div></div>';
 }
 
 /* ---------- lines ---------- */

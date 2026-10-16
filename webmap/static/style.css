@@ -70,6 +70,7 @@ html, body {
 #status .fresh { color: #6cd968; }
 #status .stale { color: #e0a63c; }
 #status .down  { color: #e5635b; }
+#status .hist  { color: #6cb2eb; }
 
 #panel {
   position: absolute;
@@ -192,21 +193,15 @@ html, body {
 
 /* Graphics scale slider (bottom-left, near Leaflet zoom) */
 #gfx-scale {
-  position: absolute;
-  left: 10px;
-  top: 110px;
-  z-index: 1000;
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 6px 8px 2px;
+  margin-top: 4px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
   color: var(--muted);
   display: flex;
   flex-direction: column;
   align-items: stretch;
   gap: 2px;
   min-width: 140px;
-  pointer-events: auto;
 }
 #gfx-scale .gfx-row {
   display: flex;
@@ -223,3 +218,17 @@ html, body {
   width: 100%;
   margin: 0;
 }
+
+#play-24h {
+  margin-top: 6px;
+  padding: 4px 8px;
+  background: #16283f;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font: inherit;
+  cursor: pointer;
+  text-align: center;
+}
+#play-24h:hover { background: #1b2c47; }
+#play-24h.playing { background: #24405f; color: #6cd968; }

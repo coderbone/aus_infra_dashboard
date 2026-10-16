@@ -100,8 +100,14 @@ STATIC_TYPES = {
 }
 
 
-def _query_prometheus(query: str, timeout: float = 10.0):
+def _query_prometheus(query: str, timeout: float = 10.0, at: float | None = None):
+    """Run an instant query, optionally at a historical timestamp.
+
+    `at` is passed straight to Prometheus's `time` parameter (Unix seconds).
+    An absent/None `at` keeps the old behaviour: evaluate at "now"."""
     url = PROMETHEUS_URL.rstrip("/") + "/api/v1/query?query=" + urllib.parse.quote(query)
+    if at is not None:
+        url += "&time=" + urllib.parse.quote(str(at))
     with urllib.request.urlopen(url, timeout=timeout) as resp:
         body = json.loads(resp.read().decode())
     if body.get("status") != "success":
@@ -120,14 +126,16 @@ def _merge(accum, field, spec, labels, value):
         obj[field] = float(value)
 
 
-def build_live():
+def build_live(at: float | None = None):
     out = {"fetched_at": time.time(), "prometheus": "ok", "errors": [],
            "interconnectors": {}, "regions": {}, "batteries": {}, "units": {},
            "reservoirs": {}}
+    if at is not None:
+        out["at"] = at
     for group, fields in LIVE_QUERIES.items():
         for field, spec in fields.items():
             try:
-                for series in _query_prometheus(spec["expr"]):
+                for series in _query_prometheus(spec["expr"], at=at):
                     _merge(out[group], field, spec, series.get("metric", {}), series.get("value", [None, None])[1])
             except Exception as exc:  # noqa: BLE001 - one bad metric must not sink the page
                 out["prometheus"] = "degraded"
@@ -348,8 +356,23 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/data/live":
+            # Optional historical snapshot: /data/live?t=<unix seconds> answers
+            # with the fleet state as of that instant, using Prometheus's native
+            # `time=` parameter. Missing/invalid `t` (or t in the future) keeps
+            # the old "now" behaviour.
+            at = None
+            raw_t = urllib.parse.parse_qs(parsed.query).get("t", [""])[0]
+            if raw_t:
+                try:
+                    t = float(raw_t)
+                    if t > time.time() + 1:  # a little slack for clock skew
+                        raise ValueError("t is in the future")
+                    at = t
+                except ValueError:
+                    self._send_json({"error": "invalid t", "fetched_at": time.time()}, 400)
+                    return
             try:
-                self._send_json(build_live())
+                self._send_json(build_live(at))
             except Exception as exc:  # noqa: BLE001
                 self._send_json({"error": str(exc), "fetched_at": time.time()}, 500)
             return
@@ -373,9 +396,18 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path.startswith("/api/v1/query"):
-            query = urllib.parse.parse_qs(parsed.query).get("query", [""])[0]
+            qs = urllib.parse.parse_qs(parsed.query)
+            query = qs.get("query", [""])[0]
+            at = None
+            raw_t = qs.get("t", [""])[0]
+            if raw_t:
+                try:
+                    at = float(raw_t)
+                except ValueError:
+                    self._send_json({"error": "invalid t"}, 400)
+                    return
             try:
-                self._send_json({"result": _query_prometheus(query)})
+                self._send_json({"result": _query_prometheus(query, at=at)})
             except Exception as exc:  # noqa: BLE001
                 self._send_json({"error": str(exc)}, 502)
             return

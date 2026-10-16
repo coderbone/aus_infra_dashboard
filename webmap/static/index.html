@@ -33,8 +33,12 @@
   <label class="opt chk"><input type="checkbox" id="tog-hydro" checked> hydro</label>
   <label class="opt chk"><input type="checkbox" id="tog-coal" checked> coal</label>
   <label class="opt chk"><input type="checkbox" id="tog-gas" checked> gas</label>
+<div id="gfx-scale">
+  <div class="gfx-row"><span>Scale</span><span id="gfx-val">1.0</span></div>
+  <input id="gfx-slider" type="range" min="0.5" max="10.0" step="0.1" value="1.0">
 </div>
-
+<button id="play-24h">Play 24h</button>
+</div>
 <div id="legend"></div>
 
 <div id="resv" hidden>
@@ -46,9 +50,6 @@
 <script src="/static/lib/leaflet/leaflet.js"></script>
 <script src="/static/app.js"></script>
 
-<div id="gfx-scale">
-  <div class="gfx-row"><span>Scale</span><span id="gfx-val">1.0</span></div>
-  <input id="gfx-slider" type="range" min="0.5" max="10.0" step="0.1" value="1.0">
-</div>
+
 </body>
 </html>

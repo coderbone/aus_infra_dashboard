@@ -6,6 +6,22 @@ const REGION_GEO = "/data/regions.geojson";
 const LINES_GEO = "/data/lines.geojson";
 const LIVE_URL = "/data/live";
 
+// 24h playback: 288 frames at 5-min steps, shown at 24fps (12s total).
+const PLAY_FPS = 24;
+const PLAY_STEP_S = 300;
+const PLAY_TOTAL = Math.round(24 * 3600 / PLAY_STEP_S); // 288
+const PLAY_LOOKAHEAD = 48; // prefetch this many frames ahead of the playhead
+const PLAY_CONCURRENCY = 6;
+
+let playing = false;
+let playIdx = 0;
+let playTimes = [];
+let playBuffer = new Map(); // index -> raw JSON text (parsed on apply, then freed)
+let playInFlight = new Set();
+let playRaf = null;
+let playStart = 0;
+let playAbort = null;
+
 const state = {
   regions: {},
   interconnectors: {},
@@ -14,9 +30,12 @@ const state = {
   hydro: [],
   coal: [],
   gas: [],
+  renewables: [],
   reservoirs: {},
+  units: {},
   fetchedAt: 0,
-  prom: "unknown",
+  historicalAt: null,
+  prom: "ok",
 };
 let metric = "stored";
 let showSchematic = true;
@@ -782,8 +801,21 @@ function batteryPopup(fac) {
 function updateHeader() {
   const timeEl = document.getElementById("st-time");
   const promEl = document.getElementById("st-prom");
-  const age = Date.now() / 1000 - state.fetchedAt;
   if (!state.fetchedAt) { timeEl.textContent = "no data yet"; promEl.textContent = ""; return; }
+  // During 24h playback, show the historical frame's own timestamp with a
+  // distinct style rather than the live age logic (which would always read
+  // "down" since the frame is from the past).
+  if (state.historicalAt) {
+    const d = new Date(state.historicalAt * 1000);
+    const hh = String(d.getHours()).padStart(2, "0");
+    const mm = String(d.getMinutes()).padStart(2, "0");
+    timeEl.textContent = hh + ":" + mm + " (history)";
+    timeEl.className = "hist";
+    promEl.textContent = "playing";
+    promEl.className = "hist";
+    return;
+  }
+  const age = Date.now() / 1000 - state.fetchedAt;
   const d = new Date(state.fetchedAt * 1000);
   const hh = String(d.getHours()).padStart(2, "0");
   const mm = String(d.getMinutes()).padStart(2, "0");
@@ -893,11 +925,16 @@ function wireControls() {
     showGas = ev.target.checked;
     applyThermal("gas", state.gas, showGas, gasLayers);
   });
+  document.getElementById("play-24h").addEventListener("click", () => {
+    if (playing) stopPlayback();
+    else startPlayback();
+  });
 }
 
 /* ---------- poll loop ---------- */
 
 async function poll() {
+  if (playing) return; // don't stomp historical playback with live data
   let data;
   try {
     const resp = await fetch(LIVE_URL, { cache: "no-store" });
@@ -908,6 +945,10 @@ async function poll() {
     document.getElementById("st-time").className = "down";
     return;
   }
+  applySnapshot(data, false);
+}
+
+function applySnapshot(data, isHistorical) {
   state.regions = data.regions || {};
   state.interconnectors = data.interconnectors || {};
   state.batteries = data.batteries || {};
@@ -919,6 +960,7 @@ async function poll() {
   state.gas = data.gas || [];
   state.reservoirs = data.reservoirs || {};
   state.fetchedAt = data.fetched_at;
+  state.historicalAt = isHistorical ? (data.at || null) : null;
   state.prom = data.prometheus || "ok";
   applyRegions();
   applyLines();
@@ -933,6 +975,82 @@ async function poll() {
   restackMarkers();
   updateReservoirs();
   updateHeader();
+}
+
+/* ---------- 24h playback ---------- */
+
+async function prefetchFrames() {
+  if (!playing) return;
+  let launched = 0;
+  for (let i = playIdx; i < Math.min(PLAY_TOTAL, playIdx + PLAY_LOOKAHEAD); i++) {
+    if (playBuffer.has(i) || playInFlight.has(i)) continue;
+    if (playInFlight.size >= PLAY_CONCURRENCY) break;
+    playInFlight.add(i);
+    launched++;
+    const t = playTimes[i];
+    fetch(LIVE_URL + "?t=" + t, { cache: "no-store", signal: playAbort.signal })
+      .then((resp) => resp.text())
+      .then((text) => { if (playing) playBuffer.set(i, text); })
+      .catch(() => { /* frame fetch failed; playback will skip it */ })
+      .finally(() => { playInFlight.delete(i); });
+  }
+  if (launched) setTimeout(prefetchFrames, 25);
+}
+
+function playbackTick() {
+  if (!playing) return;
+  const frameMs = 1000 / PLAY_FPS;
+  const totalMs = PLAY_TOTAL * frameMs;
+  // Hard stop on wall-clock elapsed, independent of whether every frame
+  // actually loaded (a missing tail frame must not hang playback forever).
+  if (Date.now() - playStart >= totalMs) { stopPlayback(); return; }
+  const targetIdx = Math.min(PLAY_TOTAL - 1, Math.floor((Date.now() - playStart) / frameMs));
+  // Apply the newest available frame up to the wall-clock target, freeing each
+  // one after use so the buffer stays bounded.
+  for (let i = playIdx; i <= targetIdx; i++) {
+    const text = playBuffer.get(i);
+    if (text === undefined) continue;
+    playBuffer.delete(i);
+    try {
+      applySnapshot(JSON.parse(text), true);
+    } catch (e) { /* malformed frame; skip */ }
+    playIdx = i + 1;
+  }
+  if (playIdx >= PLAY_TOTAL) { stopPlayback(); return; }
+  prefetchFrames();
+  playRaf = requestAnimationFrame(playbackTick);
+}
+
+function startPlayback() {
+  if (playing) return;
+  playing = true;
+  playIdx = 0;
+  playBuffer.clear();
+  playInFlight.clear();
+  playAbort = new AbortController();
+  const end = Math.floor(Date.now() / 1000 / PLAY_STEP_S) * PLAY_STEP_S;
+  const start = end - 24 * 3600;
+  playTimes = [];
+  for (let i = 0; i < PLAY_TOTAL; i++) playTimes.push(start + i * PLAY_STEP_S);
+  playStart = Date.now();
+  const btn = document.getElementById("play-24h");
+  btn.textContent = "Stop";
+  btn.classList.add("playing");
+  prefetchFrames();
+  playRaf = requestAnimationFrame(playbackTick);
+}
+
+function stopPlayback() {
+  if (!playing) return;
+  playing = false;
+  if (playAbort) playAbort.abort();
+  if (playRaf) cancelAnimationFrame(playRaf);
+  playBuffer.clear();
+  playInFlight.clear();
+  const btn = document.getElementById("play-24h");
+  btn.textContent = "Play 24h";
+  btn.classList.remove("playing");
+  poll(); // restore live view
 }
 
 initGeometry().then(() => {

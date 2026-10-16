@@ -1206,7 +1206,7 @@ The seventh service in the compose file is not an exporter. `webmap` is a
 stdlib-only `ThreadingHTTPServer` (same `python:3.12-alpine` image, mounted the
 same way) serving a **standalone Leaflet page with no tile dependency** — it
 draws region polygons, the interconnector lines, the battery circles, the
-solar/wind and hydro markers and a Snowy reservoirs card onto a
+solar/wind, hydro, coal and gas markers and a Snowy reservoirs card onto a
 plain dark background, so it renders with no internet at all. `./webmap/data`
 is hand-authored schematic `*.geojson` (six regions, the seven
 interconnectors/MNSP links plus the Snowy link, and intra-regional corridors
@@ -1267,6 +1267,24 @@ Wivenhoe, Shoalhaven, Guthega/Snowy 2, Kidston, Snowy 2.0, Walpole); the other
 outline** so the two are distinguishable at a glance. Retired units are dropped,
 so a half-demolished station is not counted at its historic capacity — Tumut 3's
 six retired 250 MW units would otherwise add 1,500 MW to a 2,100 MW facility.
+
+**Coal and gas** are drawn the same way hydro is — one marker per facility, sized
+by registered capacity and filled by output as a fraction of capacity — because a
+thermal plant's units also share a coordinate (Bayswater's four boilers) and
+would stack. Shapes extend the existing language: **coal is a square, gas a
+pentagon** (solar's diamond, wind's triangle and hydro's hexagon are taken), and
+the square is rotated 45° so it reads as a square rather than a second diamond.
+`build_fleet()` splits them into two buckets from the fueltech — coal =
+`coal_black` + `coal_brown`, gas = `gas_ccgt`/`gas_ocgt`/`gas_steam`/`gas_recip`/
+`gas_wcmg` — leaving `distillate` and the bioenergy fuels out, since folding them
+in would misreport the capacity. Retired units are dropped, so the closed
+Hazelwood, Callide A and Energy Brix blocks do not linger at their old ratings.
+Output comes from `aemo_unit_power_mw`, so the WEM coal and gas plants
+(Bluewaters, Collie, Muja, the Kwinana/Pinjar peakers) and the small
+non-scheduled mine-gas and cogeneration units render grey "no live data" — they
+are outside the NEM dispatch set the exporter reads. Unlike hydro these do not
+pulse: thermal plant is baseload, so a marker would throb almost constantly and
+the motion would carry no signal.
 
 A **Snowy reservoirs** card (top right) shows the three published lakes'
 percent-of-gross-storage and 7-day direction, straight from the

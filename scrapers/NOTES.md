@@ -1507,6 +1507,15 @@ dispatch interval. Verified against the live site on 2026-10-08:
   map: a cache written before this feature holds battery capacity but no fossil
   units, so a stop-on-capacity guard would leave the fossil map empty forever
   after the OE exporter rewrites the file in place.
+- **The map's per-facility coal and gas markers are a separate view from that
+  region fossil sum.** They come from the fleet cache's `fueltech_id` joined to
+  `aemo_unit_power_mw`, one marker per facility (a thermal plant's units share a
+  coordinate), split coal (`coal_black` + `coal_brown`) versus gas (every `gas_*`
+  fueltech). The region figure additionally folds in `distillate`; bioenergy and
+  hydro are excluded from both. The two are therefore not meant to sum to each
+  other. WEM units and the small non-scheduled mine-gas/cogeneration units have
+  no `aemo_unit_power_mw` series, so those markers read "no live data" rather
+  than zero.
 - **Interconnector flow/limits piggy-back the DispatchIS download.** The
   `DISPATCH,INTERCONNECTORRES` table shares the payload already fetched for
   region storage, so exposing transmission telemetry costs no second request —

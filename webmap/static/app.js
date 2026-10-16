@@ -12,6 +12,8 @@ const state = {
   batteries: {},
   fleet: [],
   hydro: [],
+  coal: [],
+  gas: [],
   reservoirs: {},
   fetchedAt: 0,
   prom: "unknown",
@@ -24,6 +26,8 @@ let showUnmonitored = true;
 let showSolar = true;
 let showWind = true;
 let showHydro = true;
+let showCoal = true;
+let showGas = true;
 
 const map = L.map("map", { zoomControl: true, attributionControl: false }).setView([-33.2, 145.0], 5);
 
@@ -34,6 +38,8 @@ const batteryArcs = {}; // facility -> commissioning progress arc (donut sector)
 const renLayers = {}; // key -> marker
 const hydroLayers = {}; // facility -> hexagon
 const hydroRings = {}; // facility -> concentric inner hexagon (pumped storage only)
+const coalLayers = {}; // facility -> square
+const gasLayers = {}; // facility -> pentagon
 
 /* ---------- colour helpers ---------- */
 
@@ -623,9 +629,12 @@ function updateLegend() {
     '<div class="row">' + legendGlyph("wind") + '<span>wind</span></div>' +
     '<div class="row">' + hydroGlyph(false) + '<span>hydro</span></div>' +
     '<div class="row">' + hydroGlyph(true) + '<span>pumped hydro</span></div>' +
+    '<div class="row">' + thermalGlyph(THERMAL_SHAPE.coal.sides, THERMAL_SHAPE.coal.offsetDeg) + '<span>coal</span></div>' +
+    '<div class="row">' + thermalGlyph(THERMAL_SHAPE.gas.sides, THERMAL_SHAPE.gas.offsetDeg) + '<span>gas</span></div>' +
     '<div class="cap">commissioning: arc length = % capacity energised, colour = stored now vs peak (red&rarr;green)</div>' +
     '<div class="cap">solar/wind: shape = type, colour = generation (% of capacity)</div>' +
-    '<div class="cap">hydro: colour = output (% of capacity), pulse = &ge;5% (floor 1 MW) generating or pumping</div>';
+    '<div class="cap">hydro: colour = output (% of capacity), pulse = &ge;5% (floor 1 MW) generating or pumping</div>' +
+    '<div class="cap">coal/gas: colour = generation (% of capacity)</div>';
 }
 
 /* ---------- controls ---------- */
@@ -643,6 +652,8 @@ function wireControls() {
   document.getElementById("tog-committed").addEventListener("change", (ev) => {
     showCommitted = ev.target.checked;
     applyHydro();
+    applyThermal("coal", state.coal, showCoal, coalLayers);
+    applyThermal("gas", state.gas, showGas, gasLayers);
     applyBatteries();
     applyRenewables();
   });
@@ -666,6 +677,14 @@ function wireControls() {
     showHydro = ev.target.checked;
     applyHydro();
   });
+  document.getElementById("tog-coal").addEventListener("change", (ev) => {
+    showCoal = ev.target.checked;
+    applyThermal("coal", state.coal, showCoal, coalLayers);
+  });
+  document.getElementById("tog-gas").addEventListener("change", (ev) => {
+    showGas = ev.target.checked;
+    applyThermal("gas", state.gas, showGas, gasLayers);
+  });
 }
 
 /* ---------- poll loop ---------- */
@@ -688,15 +707,19 @@ async function poll() {
   state.fleet = data.fleet || [];
   state.renewables = data.renewables || [];
   state.hydro = data.hydro || [];
+  state.coal = data.coal || [];
+  state.gas = data.gas || [];
   state.reservoirs = data.reservoirs || {};
   state.fetchedAt = data.fetched_at;
   state.prom = data.prometheus || "ok";
   applyRegions();
   applyLines();
-  // Hydro first: its polygons are the broadest shape, and adding it before the
-  // others leaves the co-located solar/wind/battery shapes on top (Kidston has
-  // both a solar farm and pumped hydro on the same coordinate).
+  // Hydro and thermal first: their polygons are the broadest shape, and adding
+  // them before the others leaves the co-located solar/wind/battery shapes on
+  // top (Kidston has both a solar farm and pumped hydro on the same coordinate).
   applyHydro();
+  applyThermal("coal", state.coal, showCoal, coalLayers);
+  applyThermal("gas", state.gas, showGas, gasLayers);
   applyBatteries();
   applyRenewables();
   updateReservoirs();
@@ -822,15 +845,17 @@ const HYDRO_PULSE_MIN_MW = 1;
 
 // Regular n-gon sized in metres, using the same metre->degree scaling as
 // renShape and commissionArc, so a hexagon of radius r covers the same footprint
-// an L.circle(r) would. Vertex 0 sits at 12 o'clock (pointy-top), matching
-// commissionArc's sweep origin.
-function polyPoints(lat, lng, rMeters, sides, scale) {
+// an L.circle(r) would. Vertex 0 sits at 12 o'clock (pointy-top) matching
+// commissionArc's sweep origin, unless offsetDeg rotates it - coal passes 45 so
+// its square stands on an edge instead of becoming a diamond like solar.
+function polyPoints(lat, lng, rMeters, sides, scale, offsetDeg) {
   const r = rMeters * (scale || 1);
+  const off = (offsetDeg || 0) * Math.PI / 180;
   const dLat = 1 / 111320;
   const dLng = 1 / (111320 * Math.max(0.2, Math.cos(lat * Math.PI / 180)));
   const pts = [];
   for (let i = 0; i < sides; i++) {
-    const b = (i * 360 / sides) * Math.PI / 180;
+    const b = off + (i * 360 / sides) * Math.PI / 180;
     pts.push([lat + r * dLat * Math.cos(b), lng + r * dLng * Math.sin(b)]);
   }
   return pts;
@@ -964,6 +989,110 @@ function applyHydro() {
   }
 }
 
+/* ---------- coal / gas ---------- */
+
+// Thermal plants are point sources with several units on one coordinate (four
+// boilers at Bayswater), so they are aggregated per facility like hydro rather
+// than drawn per unit like the (usually single-unit) solar and wind farms.
+// Shape encodes the fuel - coal a square, gas a pentagon - and colour the output
+// as a share of registered capacity, on the same red->yellow->green scale the
+// other sources use. No pulse: unlike hydro these run as baseload, so a marker
+// would be throbbing almost constantly and the motion would carry no signal.
+const THERMAL_SHAPE = { coal: { sides: 4, offsetDeg: 45 }, gas: { sides: 5, offsetDeg: 0 } };
+const FUEL_LABEL = {
+  coal_black: "black coal", coal_brown: "brown coal",
+  gas_ccgt: "CCGT", gas_ocgt: "OCGT", gas_steam: "steam",
+  gas_recip: "recip", gas_wcmg: "wcmg",
+};
+
+function thermalAgg(fac) {
+  let cap = 0, gen = 0, measured = false, age = Infinity;
+  const fuels = {};
+  for (const u of fac.units || []) {
+    cap += u.capacity_mw || 0;
+    fuels[u.fueltech_id] = (fuels[u.fueltech_id] || 0) + 1;
+    const m = state.units && state.units[u.code];
+    if (!m || typeof m.power_mw !== "number") continue;
+    measured = true;
+    gen += Math.max(0, m.power_mw);
+    if (typeof m.age_s === "number" && m.age_s < age) age = m.age_s;
+  }
+  const frac = cap > 0 ? Math.max(0, Math.min(1, gen / cap)) : null;
+  const status = (fac.units || []).map((u) => u.status).filter(Boolean)[0] || "";
+  return { cap, gen, measured, frac, age, status, fuels };
+}
+
+function fuelSummary(fuels) {
+  return Object.keys(fuels).map((k) => (FUEL_LABEL[k] || k) + (fuels[k] > 1 ? " x" + fuels[k] : "")).join(", ");
+}
+
+function thermalTip(kind, fac, agg) {
+  let html = '<b>' + fac.name + '</b> (' + fac.facility + ')<br>' +
+    fac.region + ' &middot; ' + kind + ' &middot; ' + agg.cap.toFixed(0) + ' MW';
+  if (agg.status) html += ' &middot; ' + agg.status;
+  if (!agg.measured) {
+    html += ' &middot; <span style="color:#7d8fa5">no live data</span>';
+    return html;
+  }
+  html += '<br>' + agg.gen.toFixed(0) + ' MW &middot; ' + Math.round(agg.frac * 100) + '% of capacity';
+  if (isFinite(agg.age)) html += ' &middot; ' + agg.age.toFixed(0) + 's old';
+  return html;
+}
+
+function thermalPopup(kind, fac, agg) {
+  let rows = '<tr><th>unit</th><th class="num">cap</th><th class="num">now</th></tr>';
+  for (const u of fac.units || []) {
+    const m = state.units && state.units[u.code];
+    const mw = m && typeof m.power_mw === "number" ? Math.max(0, m.power_mw) : null;
+    rows += '<tr><td>' + u.code + '</td>' +
+      '<td class="num">' + (u.capacity_mw || 0).toFixed(0) + ' MW</td>' +
+      '<td class="num">' + (mw != null ? mw.toFixed(0) + ' MW' : '&ndash;') + '</td></tr>';
+  }
+  rows += '<tr class="sum"><td>facility</td>' +
+    '<td class="num">' + agg.cap.toFixed(0) + ' MW</td>' +
+    '<td class="num">' + (agg.measured ? agg.gen.toFixed(0) + ' MW' : '&ndash;') + '</td></tr>';
+  const fs = fuelSummary(agg.fuels);
+  return '<div class="pop"><b>' + fac.name + '</b> <k>' + fac.region + '</k> &middot; ' + kind +
+    (fs ? ' (' + fs + ')' : '') +
+    '<br>facility ' + fac.facility + '<table>' + rows + '</table></div>';
+}
+
+function applyThermal(kind, facs, show, layers) {
+  for (const fac of facs || []) {
+    const loc = fac.location;
+    if (!show || !loc || !loc.lat || !loc.lng || (!showCommitted && isCommitted(fac))) {
+      const l = layers[fac.facility];
+      if (l) { map.removeLayer(l); delete layers[fac.facility]; }
+      continue;
+    }
+    const agg = thermalAgg(fac);
+    const fill = agg.measured
+      ? ramp(agg.frac, STOPS_GEN)
+      : (STATUS_COLOR[agg.status] || "#54657a");
+    const spec = THERMAL_SHAPE[kind];
+    const pts = polyPoints(loc.lat, loc.lng, radiusFor(agg.cap), spec.sides, 1, spec.offsetDeg);
+    const opts = {
+      color: "#101a2b",
+      weight: 1.5,
+      fillColor: fill,
+      fillOpacity: agg.measured ? 0.85 : 0.5,
+    };
+    let layer = layers[fac.facility];
+    if (!layer) {
+      layer = L.polygon(pts, opts).addTo(map);
+      layers[fac.facility] = layer;
+      layer.bindTooltip("", { direction: "top", className: "" });
+      layer.bindPopup("", { maxWidth: 320, className: "" });
+      layer.on("click", () => layer.setPopupContent(thermalPopup(kind, fac, agg)));
+    } else {
+      layer.setLatLngs(pts);
+      layer.setStyle(opts);
+      layer.setPopupContent(thermalPopup(kind, fac, agg));
+    }
+    layer.setTooltipContent(thermalTip(kind, fac, agg));
+  }
+}
+
 /* ---------- reservoirs ---------- */
 
 // Only the Snowy Hydro lakes are published, and each is a catchment-wide storage
@@ -1035,5 +1164,17 @@ function hydroGlyph(pumped) {
   let svg = '<polygon points="' + hex(6) + '" fill="#8ca3ba" stroke="#101a2b" stroke-width="1.1"/>';
   if (pumped) svg += '<polygon points="' + hex(3.3) + '" fill="none" stroke="#101a2b" stroke-width="1.1"/>';
   return '<span class="glyph"><svg width="14" height="14" viewBox="0 0 14 14">' + svg + '</svg></span>';
+}
+
+// The coal square and gas pentagon, matching the markers' shape and rotation.
+function thermalGlyph(sides, offsetDeg) {
+  const r = 6, off = (offsetDeg || 0) * Math.PI / 180;
+  const pts = [];
+  for (let i = 0; i < sides; i++) {
+    const b = off + i * 2 * Math.PI / sides;
+    pts.push((7 + r * Math.sin(b)).toFixed(2) + ',' + (7 - r * Math.cos(b)).toFixed(2));
+  }
+  return '<span class="glyph"><svg width="14" height="14" viewBox="0 0 14 14">' +
+    '<polygon points="' + pts.join(' ') + '" fill="#8ca3ba" stroke="#101a2b" stroke-width="1.1"/></svg></span>';
 }
 

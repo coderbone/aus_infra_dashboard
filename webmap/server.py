@@ -136,6 +136,8 @@ def build_live():
     out["fleet"] = fl.get("fleet", []) if isinstance(fl, dict) else fl
     out["renewables"] = fl.get("renewables", []) if isinstance(fl, dict) else []
     out["hydro"] = fl.get("hydro", []) if isinstance(fl, dict) else []
+    out["coal"] = fl.get("coal", []) if isinstance(fl, dict) else []
+    out["gas"] = fl.get("gas", []) if isinstance(fl, dict) else []
     return out
 
 
@@ -146,6 +148,31 @@ _fleet_cache = {"mtime": None, "data": None}
 # facility description is free text. Classify a facility as pumped storage
 # from any of three independent signals; otherwise draw it as classic hydro.
 _PUMPED_DESC_RE = re.compile(r"pumped|pump[- ]?storage", re.I)
+
+# Thermal generation, split into the two categories the map draws. Coal lumps
+# black and brown together (the popup still breaks the grade down); gas is every
+# gas-fired fueltech. `distillate` and the bioenergy fuels are deliberately not
+# here: they are neither, and folding them in would misreport the capacity.
+_COAL_FUELS = ("coal_black", "coal_brown")
+_GAS_FUELS = ("gas_ccgt", "gas_ocgt", "gas_steam", "gas_recip", "gas_wcmg")
+
+
+def _thermal_unit(unit, ft):
+    """A drawable coal/gas unit, or None when it should be skipped. Retired
+    units still carry a registered capacity but produce nothing, so they are
+    excluded - the same rule the hydro bucket uses (e.g. the closed Hazelwood
+    and Callide A blocks must not read as 1 GW of idle coal)."""
+    if (unit.get("status_id") or "") == "retired":
+        return None
+    cap = unit.get("capacity_registered") or unit.get("capacity_maximum")
+    if isinstance(cap, (int, float)) and not isinstance(cap, bool) and cap > 0:
+        return {
+            "code": unit.get("code") or "",
+            "capacity_mw": float(cap),
+            "fueltech_id": ft,
+            "status": unit.get("status_id") or "",
+        }
+    return None
 
 
 def build_fleet():
@@ -165,12 +192,16 @@ def build_fleet():
     fleet = []
     renewables = []
     hydro = []
+    coal = []
+    gas = []
     for facility in raw:
         if not isinstance(facility, dict):
             continue
         units_bat = []
         units_ren = []
         units_hyd = []
+        units_coal = []
+        units_gas = []
         pumped_hint = False
         for unit in facility.get("units") or []:
             if not isinstance(unit, dict):
@@ -214,6 +245,14 @@ def build_fleet():
                             "fueltech_id": ft,
                             "status": unit.get("status_id") or "",
                         })
+            elif ft in _COAL_FUELS:
+                u = _thermal_unit(unit, ft)
+                if u:
+                    units_coal.append(u)
+            elif ft in _GAS_FUELS:
+                u = _thermal_unit(unit, ft)
+                if u:
+                    units_gas.append(u)
         if units_bat:
             fleet.append({
                 "facility": facility.get("code") or "",
@@ -244,8 +283,22 @@ def build_fleet():
                     "kind": "hydro",
                     "pumped": bool(pumped_hint) or bool(_PUMPED_DESC_RE.search(str(facility.get("description") or ""))),
                 })
+        # Coal and gas are point sources like hydro, so they need a coordinate to
+        # be drawn; a plant missing one is dropped rather than pinned to (0, 0).
+        for bucket, units, kind in ((coal, units_coal, "coal"), (gas, units_gas, "gas")):
+            loc = facility.get("location")
+            if units and isinstance(loc, dict) and loc.get("lat") and loc.get("lng"):
+                bucket.append({
+                    "facility": facility.get("code") or "",
+                    "name": facility.get("facility_name") or facility.get("name") or "",
+                    "region": facility.get("network_region") or "",
+                    "location": loc,
+                    "units": units,
+                    "kind": kind,
+                })
     _fleet_cache["mtime"] = mtime
-    _fleet_cache["data"] = {"fleet": fleet, "renewables": renewables, "hydro": hydro}
+    _fleet_cache["data"] = {"fleet": fleet, "renewables": renewables, "hydro": hydro,
+                            "coal": coal, "gas": gas}
     return _fleet_cache["data"]
 
 

@@ -544,6 +544,12 @@ function unitLiveStatus(fac) {
 // markers to a constant pixel size regardless of zoom.
 const MARKER_ZOOM_REF = 6;    // zoom at which the metre scale is left untouched
 const MARKER_ZOOM_DAMP = 0.6; // how hard the zoom growth is damped (see above)
+const GFX_SCALE_MIN = 0.5;
+const GFX_SCALE_MAX = 10.0;
+const GFX_SCALE_STEP = 0.1;
+const GFX_SCALE_DEF = 1.0;
+let gfxScale = GFX_SCALE_DEF;
+
 
 function viewScale() {
   // Tolerant of a missing map.getZoom so the geometry helpers stay usable (and

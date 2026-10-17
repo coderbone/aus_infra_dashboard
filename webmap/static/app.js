@@ -197,6 +197,9 @@ function regionTip(code, r) {
   const bits = ['<b>' + code + '</b>'];
   if (typeof r.stored_mwh === "number") bits.push("stored " + r.stored_mwh.toFixed(0) + " MWh");
   if (typeof r.fossil_mw === "number") bits.push("fossil " + r.fossil_mw.toFixed(0) + " MW");
+  if (typeof r.rooftop_mw === "number") bits.push("rooftop " + r.rooftop_mw.toFixed(0) + " MW");
+  if (typeof r.import_mw === "number") bits.push("import " + r.import_mw.toFixed(0) + " MW");
+  if (typeof r.export_mw === "number") bits.push("export " + r.export_mw.toFixed(0) + " MW");
   if (r.curtail) {
     for (const [fuel, mw] of Object.entries(r.curtail)) if (typeof mw === "number") bits.push("curtail " + fuel + " " + mw.toFixed(0) + " MW");
   }
@@ -212,6 +215,8 @@ function regionTip(code, r) {
 const RING_COLOR = {
   coal: "#94a3b8", gas: "#fb923c", hydro: "#38bdf8", wind: "#34d399",
   solar: "#fbbf24", battery: "#c084fc", pumps: "#2dd4bf",
+  rooftop: "#f59e0b",
+  imports: "#f472b6", exports: "#a3e635",
 };
 
 // Everything the region popup needs, aggregated from data already on the page:
@@ -252,6 +257,13 @@ function regionFlows(code) {
   add(gen, "hydro", "Hydro", RING_COLOR.hydro, genSum(state.hydro, (u) => u.fueltech_id === "hydro"));
   add(gen, "wind", "Wind", RING_COLOR.wind, genSum(state.renewables, (u) => u.fueltech_id === "wind" || u.fueltech_id === "wind_farm"));
   add(gen, "solar", "Solar", RING_COLOR.solar, genSum(state.renewables, (u) => u.fueltech_id === "solar" || u.fueltech_id === "solar_utility"));
+  const rooftopMw = (state.regions[code] || {}).rooftop_mw;
+  add(gen, "rooftop", "Rooftop solar", RING_COLOR.rooftop, (typeof rooftopMw === "number" && isFinite(rooftopMw) && rooftopMw >= 0) ? rooftopMw : null);
+  // Imports from other regions count as supply, so they sit in the
+  // generation band; exports are demand and sit in the load band. The
+  // AEMO exporter derives both per region from the interconnector flows.
+  const region = state.regions[code] || {};
+  add(gen, "imports", "Imports", RING_COLOR.imports, region.import_mw);
 
   // Batteries are bidirectional: discharging is generation, charging is load.
   // unitPower picks the freshest of the two power sources, exactly as the
@@ -282,6 +294,7 @@ function regionFlows(code) {
     }
   }
   add(load, "pumps", "Pumps", RING_COLOR.pumps, pumpAny ? pumpLoad : null);
+  add(load, "exports", "Exports", RING_COLOR.exports, region.export_mw);
 
   // Per-region curtailment, added to the generation band as unrealised output.
   const cur = (state.regions[code] || {}).curtail || {};

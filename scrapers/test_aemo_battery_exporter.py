@@ -1253,6 +1253,29 @@ class ParseInterconnectorTest(unittest.TestCase):
                 make_zip(IS_CSV, [interconnector_header()])
             )
 
+    def test_region_interchange_attributes_flow_to_both_ends(self):
+        # NSW1-QLD1 flows away from NSW (-926.72) so NSW imports and QLD
+        # exports; VIC1-NSW1 flows towards NSW (+690.80) so VIC exports and NSW
+        # imports; T-V-MNSP1 flows from TAS (+33.1) so TAS exports and VIC
+        # imports. Each region's gross figures are the sums across its links.
+        ic = self.parsed()["interconnectors"]
+        ie = exporter.region_interchange(ic)
+        self.assertAlmostEqual(ie["NSW1"]["import"], 926.72489 + 690.80116, places=4)
+        self.assertAlmostEqual(ie["NSW1"]["export"], 0.0, places=4)
+        self.assertAlmostEqual(ie["QLD1"]["export"], 926.72489, places=4)
+        self.assertAlmostEqual(ie["QLD1"]["import"], 0.0, places=4)
+        self.assertAlmostEqual(ie["VIC1"]["import"], 33.1, places=4)
+        self.assertAlmostEqual(ie["VIC1"]["export"], 690.80116, places=4)
+        self.assertAlmostEqual(ie["TAS1"]["export"], 33.1, places=4)
+        self.assertAlmostEqual(ie["TAS1"]["import"], 0.0, places=4)
+
+    def test_region_interchange_skips_unmapped_and_missing_flows(self):
+        ic = {
+            "UNKNOWN-LINK": {"mwflow": 500.0},   # not in INTERCONNECTOR_REGIONS
+            "NSW1-QLD1": {"mwflow": None},        # no settled flow
+        }
+        self.assertEqual(exporter.region_interchange(ic), {})
+
 
 # --------------------------------------------------------------------------- #
 # render_intraday
@@ -1307,7 +1330,13 @@ class RenderIntradayTest(unittest.TestCase):
             if l.startswith('aemo_battery_region_stored_mwh{region="NSW1"} ')
         )
         self.assertAlmostEqual(float(nsw.rsplit(" ", 1)[1]), 5084.59164, places=4)
-        self.assertNotIn('region="TAS1"', text)
+        self.assertEqual(
+            [
+                l for l in lines_named(text, "aemo_battery_region_stored_mwh")
+                if 'region="TAS1"' in l
+            ],
+            [],
+        )
 
     def test_success_gauges_report_the_split(self):
         text = self.text()
@@ -1458,6 +1487,28 @@ class RenderIntradayTest(unittest.TestCase):
         self.assertNotIn("aemo_interconnector_flow_mw", text)
         self.assertIn('aemo_interconnector_report_info{file="%s"} 1' % IS_ZIP, text)
         self.assertIn("aemo_interconnector_count 0", text)
+        self.assertNotIn("aemo_battery_region_import_mw", text)
+        self.assertNotIn("aemo_battery_region_export_mw", text)
+
+    def test_region_import_export_render_derived_from_the_flows(self):
+        text = self.text()
+        nsw_imp = next(
+            l for l in lines_named(text, "aemo_battery_region_import_mw")
+            if 'region="NSW1"' in l
+        )
+        self.assertAlmostEqual(
+            float(nsw_imp.rsplit(" ", 1)[1]), 926.72489 + 690.80116, places=4
+        )
+        qld_exp = next(
+            l for l in lines_named(text, "aemo_battery_region_export_mw")
+            if 'region="QLD1"' in l
+        )
+        self.assertAlmostEqual(float(qld_exp.rsplit(" ", 1)[1]), 926.72489, places=4)
+        tas_exp = next(
+            l for l in lines_named(text, "aemo_battery_region_export_mw")
+            if 'region="TAS1"' in l
+        )
+        self.assertAlmostEqual(float(tas_exp.rsplit(" ", 1)[1]), 33.1, places=4)
 
     def test_a_failed_dispatchis_read_omits_interconnectors(self):
         text = exporter.render_intraday(self.scada, True, self.isr, False, 1.5, self.now)

@@ -45,6 +45,9 @@ LIVE_QUERIES = {
     "regions": {
         "stored_mwh": {"expr": "aemo_battery_region_stored_mwh", "key": "region"},
         "fossil_mw": {"expr": "aemo_battery_region_fossil_generation_mw", "key": "region"},
+        "rooftop_mw": {"expr": "aemo_battery_region_rooftop_solar_mw", "key": "region"},
+        "import_mw": {"expr": "aemo_battery_region_import_mw", "key": "region"},
+        "export_mw": {"expr": "aemo_battery_region_export_mw", "key": "region"},
         "curtail": {"expr": "aemo_battery_region_curtailment_mw", "key": "region", "extra": "fuel"},
     },
     "batteries": {

@@ -155,6 +155,12 @@ per region at the newest interval:
     aemo_interconnector_age_seconds{interconnector}  its age at export time
     aemo_interconnector_report_info{file}        the DispatchIS file processed
     aemo_interconnector_count                   interconnectors with a reading
+    aemo_battery_region_import_mw{region}       gross MW into the region, summed
+                                               over its interconnectors
+                                               (derived from MWFLOW)
+    aemo_battery_region_export_mw{region}       gross MW out of the region,
+                                               summed over its interconnectors
+                                               (derived from MWFLOW)
 
 The two derived region series both come from a DUID-level measurement paired
 with a map, because AEMO publishes neither directly at region granularity:
@@ -175,6 +181,14 @@ never re-derived or normalized. A parse failure of that one table leaves the
 interconnector series absent while the region storage survives - the series is
 gated on its own table, and `aemo_interconnector_count` makes the absence
 visible.
+
+The same table also yields the per-region gross import/export series: AEMO
+publishes no gross regional figure (REGIONSUM carries only NETINTERCHANGE), so
+each link's MWFLOW is attributed to both its ends via INTERCONNECTOR_REGIONS - a
+positive flow is an export for its FROM region and an import for its TO region,
+and vice versa. Interconnector losses are not modelled. A link whose id is not
+in the map contributes to neither end; when no link reports a flow, neither
+series is emitted.
 
 and the intraday bookkeeping:
 
@@ -279,6 +293,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 DEFAULT_DATA_URL = "https://nemweb.com.au/Reports/Current/Next_Day_Dispatch/"
 SCADA_DATA_URL = "https://nemweb.com.au/Reports/Current/Dispatch_SCADA/"
 DISPATCHIS_DATA_URL = "https://nemweb.com.au/Reports/Current/DispatchIS_Reports/"
+ROOFTOP_PV_DATA_URL = "https://nemweb.com.au/Reports/CURRENT/ROOFTOP_PV/ACTUAL/"
 
 # NEMWEB is a free, anonymous, keyless archive, so unlike the OE exporter there
 # is no rate budget to conserve - the poll cadence only needs to keep up with a
@@ -424,6 +439,24 @@ INTERCONNECTOR_NOMINAL_MW = {
     "T-V-MNSP1": (594.0, 478.0),    # Basslink
     "N-Q-MNSP1": (107.0, 210.0),    # Terranora / Directlink
     "NSW1-SA1": (150.0, 150.0),     # Project EnergyConnect (stage 1)
+}
+
+# Which regions each energy interconnector joins, as (FROM, TO) in the same
+# direction AEMO signs MWFLOW (positive flow leaves FROM and enters TO). AEMO
+# publishes no gross import/export per region - REGIONSUM carries only
+# NETINTERCHANGE - so the region totals are derived from these links. The ids
+# mix full region codes (NSW1-QLD1, VIC1-NSW1, V-SA, NSW1-SA1) with the
+# historical MNSP abbreviations (N=NSW1, Q=QLD1, V=VIC1, S=SA1, T=TAS1), so the
+# ends are spelled out rather than parsed. A link absent here is left out of the
+# region totals rather than mis-attributed; see region_interchange().
+INTERCONNECTOR_REGIONS = {
+    "NSW1-QLD1": ("NSW1", "QLD1"),   # QNI
+    "N-Q-MNSP1": ("NSW1", "QLD1"),   # Terranora / Directlink
+    "VIC1-NSW1": ("VIC1", "NSW1"),   # VNI
+    "V-SA": ("VIC1", "SA1"),         # Heywood
+    "V-S-MNSP1": ("VIC1", "SA1"),    # Murraylink
+    "T-V-MNSP1": ("TAS1", "VIC1"),   # Basslink
+    "NSW1-SA1": ("NSW1", "SA1"),     # Project EnergyConnect (stage 1)
 }
 
 # An error body from these listing pages is not meaningful, but the cap keeps a
@@ -602,6 +635,45 @@ def scada_file_timestamp(name: str) -> float | None:
     except ValueError:
         return None
     return naive.replace(tzinfo=timezone(timedelta(seconds=AEST_UTC_OFFSET_SECONDS))).timestamp()
+
+
+# Rooftop PV actual measurement files, one per 5-minute interval:
+# PUBLIC_ROOFTOP_PV_ACTUAL_MEASUREMENT_<YYYYMMDDHHMM>_<seq>.zip. Unlike the
+# Dispatch_SCADA/DispatchIS pair these carry only region totals - AEMO's
+# satellite-based estimate of distributed (rooftop) PV output, per NEM region -
+# so the newest file is all the map needs. Same naming rules as the SCADA files:
+# lexicographic max is chronological and picks up corrections.
+ROOFTOP_PV_FILE_RE = re.compile(
+    r"PUBLIC_ROOFTOP_PV_ACTUAL_MEASUREMENT_\d{14}_\d+\.zip"
+)
+ROOFTOP_PV_FILE_NAME_RE = re.compile(
+    r"PUBLIC_ROOFTOP_PV_ACTUAL_MEASUREMENT_(\d{14})_\d+\.zip"
+)
+
+
+def newest_rooftop_pv_file(html: str) -> str:
+    return _newest(
+        html, ROOFTOP_PV_FILE_RE, "PUBLIC_ROOFTOP_PV_ACTUAL_MEASUREMENT_*.zip"
+    )
+
+
+def rooftop_pv_file_timestamp(name: str) -> float | None:
+    """`PUBLIC_ROOFTOP_PV_ACTUAL_MEASUREMENT_<YYYYMMDDHHMM>_<seq>.zip` -> Unix.
+
+    Same convention as scada_file_timestamp: AEMO names the file for the
+    settlement interval (UTC+10), so the timestamp is recoverable without
+    fetching it; a malformed stamp returns None.
+    """
+    match = ROOFTOP_PV_FILE_NAME_RE.match(name)
+    if not match:
+        return None
+    try:
+        naive = datetime.strptime(match.group(1), "%Y%m%d%H%M%S")
+    except ValueError:
+        return None
+    return naive.replace(
+        tzinfo=timezone(timedelta(seconds=AEST_UTC_OFFSET_SECONDS))
+    ).timestamp()
 
 
 def scada_files_in_range(html: str, start_ts: float, end_ts: float) -> list[str]:
@@ -850,6 +922,77 @@ def parse_dispatch_scada(data: bytes) -> dict:
             "no UNIT_SCADA rows in %s (handled %d)" % (filename, handled_rows)
         )
     return {"file": filename, "newest_interval": newest, "units": units}
+
+
+def parse_rooftop_pv(data: bytes) -> dict:
+    """Reduce one ROOFTOP_PV_ACTUAL_MEASUREMENT CSV into per-region MW.
+
+    Returns {"file": str, "newest_interval": float, "regions": {region: {"ts":
+    float, "mw": float}}}. The file is a single 5-minute interval snapshot of
+    AEMO's satellite-based distributed-PV estimate, one POWER row per NEM region
+    (NSW1, QLD1, SA1, TAS1, VIC1), so each region appears once; a re-sent row
+    keeps its later stamp. Columns are indexed by the header names, so a column
+    reorder upstream cannot silently read the wrong number.
+    """
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(data))
+    except zipfile.BadZipFile as exc:
+        raise ScrapeError("zip corrupted or not a zip: %s" % exc) from exc
+    members = [
+        name
+        for name in archive.namelist()
+        if name.rpartition(".")[-1].lower() == "csv"
+    ]
+    if not members:
+        raise ScrapeError("zip contained no .csv member (%s)" % archive.namelist())
+    filename = members[0].rsplit(".", 1)[0]
+
+    regions: dict[str, dict] = {}
+    newest: float | None = None
+    indices: dict[str, int] | None = None
+    handled_rows = 0
+    with archive.open(members[0]) as member:
+        for row in csv_row_reader(member):
+            if not row:
+                continue
+            if row[0] == "I":
+                if len(row) >= 3 and row[1] == "ROOFTOP" and row[2] == "ACTUAL":
+                    try:
+                        indices = {
+                            "INTERVAL_DATETIME": row.index("INTERVAL_DATETIME"),
+                            "REGIONID": row.index("REGIONID"),
+                            "POWER": row.index("POWER"),
+                        }
+                    except ValueError:
+                        indices = None
+                continue
+            if row[0] != "D" or indices is None:
+                continue
+            if len(row) < 3 or row[1] != "ROOFTOP" or row[2] != "ACTUAL":
+                continue
+            if len(row) <= max(indices.values()):
+                continue
+            stamp = parse_aest(row[indices["INTERVAL_DATETIME"]])
+            region = row[indices["REGIONID"]]
+            if stamp is None or not region:
+                continue
+            handled_rows += 1
+            try:
+                value = float(row[indices["POWER"]])
+            except ValueError:
+                log.warning("region %s: non-numeric rooftop PV at %s", region, stamp)
+                continue
+            entry = regions.get(region)
+            if entry is None or stamp >= entry["ts"]:
+                regions[region] = {"ts": stamp, "mw": value}
+            if newest is None or stamp > newest:
+                newest = stamp
+
+    if not regions:
+        raise ScrapeError(
+            "no ROOFTOP PV rows in %s (handled %d)" % (filename, handled_rows)
+        )
+    return {"file": filename, "newest_interval": newest, "regions": regions}
 
 
 def _region_sum_indices(header_row: list[str]) -> dict[str, int] | None:
@@ -1133,6 +1276,43 @@ def parse_dispatchis_interconnectors(data: bytes) -> dict:
     }
 
 
+def region_interchange(interconnectors: dict) -> dict:
+    """Gross imports and exports per region, MW, derived from the per-link flows.
+
+    AEMO publishes no gross import/export at region granularity: DispatchIS
+    REGIONSUM carries only NETINTERCHANGE, a single net figure. The gross flows
+    are attributed across each interconnector's two ends instead. With AEMO's
+    sign convention (positive MWFLOW leaves FROM and enters TO) a positive flow
+    is an export for FROM and an import for TO, and a negative flow is the
+    reverse. Interconnector losses are not modelled, so a region's import is the
+    flow value AEMO signs on the link - the same number the map draws on the
+    line. Returns {region: {"import": float, "export": float}}, with a region
+    present only when at least one of its links reported a flow. A link absent
+    from INTERCONNECTOR_REGIONS, or whose MWFLOW is missing, contributes to
+    neither end.
+    """
+    out: dict[str, dict] = {}
+    for ic, entry in interconnectors.items():
+        ends = INTERCONNECTOR_REGIONS.get(ic)
+        if ends is None:
+            continue
+        flow = entry.get("mwflow")
+        if not isinstance(flow, (int, float)) or isinstance(flow, bool):
+            continue
+        if flow == 0:
+            continue
+        frm, to = ends
+        a = out.setdefault(frm, {"import": 0.0, "export": 0.0})
+        b = out.setdefault(to, {"import": 0.0, "export": 0.0})
+        if flow > 0:
+            a["export"] += flow
+            b["import"] += flow
+        else:
+            a["import"] += -flow
+            b["export"] += -flow
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Prometheus exposition
 # --------------------------------------------------------------------------- #
@@ -1260,16 +1440,18 @@ def render(
 
 
 def render_intraday(
-    scada: dict,
-    scada_ok: bool,
-    region_storage: dict,
-    region_ok: bool,
-    duration: float,
-    now: float,
-    infer: dict | None = None,
-    infer_ok: bool = False,
-    unit_meta: dict | None = None,
-) -> str:
+        scada: dict,
+        scada_ok: bool,
+        region_storage: dict,
+        region_ok: bool,
+        duration: float,
+        now: float,
+        infer: dict | None = None,
+        infer_ok: bool = False,
+        unit_meta: dict | None = None,
+        rooftop: dict | None = None,
+        rooftop_ok: bool = False,
+    ) -> str:
     """Exposition for the intraday cycle's last readings.
 
     Each side is independent: a failed SCADA read omits the per-unit power and
@@ -1547,6 +1729,67 @@ def render_intraday(
             "missing or unparsable.",
             "# TYPE aemo_interconnector_count gauge",
             "aemo_interconnector_count %d" % len(interconnectors),
+        ]
+
+    interchange = region_interchange(interconnectors)
+    if interchange and region_ok:
+        lines += [
+            "# HELP aemo_battery_region_import_mw Gross MW flow into the region "
+            "at the newest interval, summed over its interconnectors. AEMO "
+            "publishes no gross regional import/export (REGIONSUM carries only "
+            "NETINTERCHANGE), so this is derived from the per-link MWFLOW: a "
+            "positive flow on a link leaves its FROM region and enters its TO "
+            "region. Interconnector losses are not modelled, so a region's "
+            "import is the flow value AEMO signs on the link.",
+            "# TYPE aemo_battery_region_import_mw gauge",
+            "# HELP aemo_battery_region_export_mw Gross MW flow out of the region "
+            "at the newest interval, summed over its interconnectors. See "
+            "aemo_battery_region_import_mw for how it is derived.",
+            "# TYPE aemo_battery_region_export_mw gauge",
+        ]
+        for region in sorted(interchange):
+            r = interchange[region]
+            lines += [
+                'aemo_battery_region_import_mw{region="%s"} %s'
+                % (escape_label(region), fmt(r["import"])),
+                'aemo_battery_region_export_mw{region="%s"} %s'
+                % (escape_label(region), fmt(r["export"])),
+            ]
+
+    rp = (rooftop or {}).get("regions") or {}
+    if rp and rooftop_ok:
+        lines += [
+            "# HELP aemo_battery_region_rooftop_solar_mw AEMO satellite-based "
+            "estimate of distributed (rooftop) PV generation, MW, per region, "
+            "at the newest 5-minute interval.",
+            "# TYPE aemo_battery_region_rooftop_solar_mw gauge",
+        ]
+        for region in sorted(rp):
+            r = rp[region]
+            if isinstance(r.get("mw"), (int, float)) and not isinstance(
+                r.get("mw"), bool
+            ):
+                lines.append(
+                    'aemo_battery_region_rooftop_solar_mw{region="%s"} %s'
+                    % (escape_label(region), fmt(r["mw"]))
+                )
+        lines += [
+            "# HELP aemo_battery_region_rooftop_solar_timestamp_seconds "
+            "Newest interval behind the rooftop PV readings.",
+            "# TYPE aemo_battery_region_rooftop_solar_timestamp_seconds gauge",
+        ]
+        for region in sorted(rp):
+            r = rp[region]
+            lines.append(
+                'aemo_battery_region_rooftop_solar_timestamp_seconds{region="%s"} %s'
+                % (escape_label(region), fmt(r.get("ts")))
+            )
+        lines += [
+            "# HELP aemo_battery_region_rooftop_solar_report_info Processed "
+            "ROOFTOP_PV file.",
+            "# TYPE aemo_battery_region_rooftop_solar_report_info gauge",
+            'aemo_battery_region_rooftop_solar_report_info{file="%s"} 1'
+            % escape_label(rooftop.get("file", "")),
         ]
 
     infer_units = (infer or {}).get("units") or {}
@@ -1923,9 +2166,11 @@ class IntradayPoller:
         infer_backfill_max_hours: float = MAX_INFER_BACKFILL_HOURS,
         infer_state_file: str | None = None,
         fleet_cache_file: str | None = None,
+        rooftop_url: str | None = None,
     ) -> None:
         self.scada_url = scada_url.rstrip("/") + "/"
         self.dispatchis_url = dispatchis_url.rstrip("/") + "/"
+        self.rooftop_url = (rooftop_url or ROOFTOP_PV_DATA_URL).rstrip("/") + "/"
         self.timeout = timeout
         self.poll_interval = poll_interval
         self.retries = retries
@@ -1972,8 +2217,10 @@ class IntradayPoller:
         self._lock = threading.Lock()
         self._scada_state: dict | None = None
         self._is_state: dict | None = None
+        self._rooftop_state: dict | None = None
         self._scada_health = (False, "not polled yet")
         self._is_health = (False, "not polled yet")
+        self._rooftop_health = (False, "not polled yet")
         self._last_poll: float | None = None
         self._last_duration = 0.0
         self._stop = threading.Event()
@@ -1996,8 +2243,10 @@ class IntradayPoller:
         # fossil region map is available.
         self._maybe_load_fleet_metadata()
         scada_ok = region_ok = False
+        rooftop_ok = False
         scada_state: dict = {}
         is_state: dict = {}
+        rooftop_state: dict = {}
         try:
             listing = http_get(
                 self.scada_url, self.timeout, self.retries, self.retry_budget
@@ -2016,6 +2265,15 @@ class IntradayPoller:
             region_ok = True
         except (ScrapeError, ValueError, KeyError, TypeError, OSError) as exc:
             log.error("DispatchIS poll failed: %s", exc)
+        try:
+            listing = http_get(
+                self.rooftop_url, self.timeout, self.retries, self.retry_budget
+            )
+            newest = newest_rooftop_pv_file(listing.decode("utf-8", "replace"))
+            rooftop_state = self._resolve_rooftop(newest)
+            rooftop_ok = True
+        except (ScrapeError, ValueError, KeyError, TypeError, OSError) as exc:
+            log.error("ROOFTOP_PV poll failed: %s", exc)
 
         if scada_ok:
             units = scada_state.get("units") or {}
@@ -2051,10 +2309,14 @@ class IntradayPoller:
         with self._lock:
             self._scada_state = scada_state
             self._is_state = is_state
+            self._rooftop_state = rooftop_state
             self._last_poll = finished
             self._last_duration = duration
             self._scada_health = (scada_ok, "" if scada_ok else "Dispatch_SCADA poll failed")
             self._is_health = (region_ok, "" if region_ok else "DispatchIS poll failed")
+            self._rooftop_health = (
+                rooftop_ok, "" if rooftop_ok else "ROOFTOP_PV poll failed"
+            )
         # The inferred side is only "up" when it is actually serving units: an
         # anchor that exists but whose gap could not be reconstructed serves
         # nothing, and reporting success there is how a fleet-wide stale anchor
@@ -2067,7 +2329,7 @@ class IntradayPoller:
         return (
             render_intraday(
                 scada_state, scada_ok, is_state, region_ok, duration, finished,
-                infer, infer_ok, self._unit_meta,
+                infer, infer_ok, self._unit_meta, rooftop_state, rooftop_ok,
             ),
             scada_ok and region_ok,
         )
@@ -2111,6 +2373,19 @@ class IntradayPoller:
                 "absent: %s",
                 exc,
             )
+        report["file"] = newest
+        report["reused"] = False
+        return report
+
+    def _resolve_rooftop(self, newest: str) -> dict:
+        held = self._rooftop_state
+        if held is not None and held.get("file") == newest:
+            report = dict(held)
+            report["reused"] = True
+            return report
+        url = urllib.parse.urljoin(self.rooftop_url, newest)
+        payload = http_get(url, self.timeout, self.retries, self.retry_budget)
+        report = parse_rooftop_pv(payload)
         report["file"] = newest
         report["reused"] = False
         return report
@@ -2585,8 +2860,10 @@ class IntradayPoller:
         with self._lock:
             scada_state = self._scada_state
             is_state = self._is_state
+            rooftop_state = self._rooftop_state
             scada_health = self._scada_health
             is_health = self._is_health
+            rooftop_health = self._rooftop_health
             duration = self._last_duration
         body = render_intraday(
             scada_state or {}, scada_health[0],
@@ -2594,6 +2871,7 @@ class IntradayPoller:
             duration, now,
             self._infer_view(now), scada_health[0] and self._anchor_file is not None,
             self._unit_meta,
+            rooftop_state or {}, rooftop_health[0],
         )
         return body, scada_health[0] and is_health[0]
 
@@ -2601,9 +2879,16 @@ class IntradayPoller:
         with self._lock:
             sa, sb = self._scada_health
             ia, ib = self._is_health
-        return sa and ia, "" if (sa and ia) else "%s; %s" % (
-            "" if sa else sb, "" if ia else ib,
-        )
+            ra, rb = self._rooftop_health
+        ok = sa and ia and ra
+        parts = []
+        if not sa:
+            parts.append(sb)
+        if not ia:
+            parts.append(ib)
+        if not ra:
+            parts.append(rb)
+        return ok, "; ".join(parts) if parts else ""
 
     # -- poll loop ---------------------------------------------------------- #
 
@@ -2706,6 +2991,12 @@ def main(argv: list[str] | None = None) -> int:
         default=DISPATCHIS_DATA_URL,
         help="DispatchIS_Reports archive directory (default %s)."
         % DISPATCHIS_DATA_URL,
+    )
+    parser.add_argument(
+        "--rooftop-pv-url",
+        default=ROOFTOP_PV_DATA_URL,
+        help="ROOFTOP_PV ACTUAL archive directory (default %s)."
+        % ROOFTOP_PV_DATA_URL,
     )
     parser.add_argument(
         "--intraday-poll-interval",

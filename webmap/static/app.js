@@ -693,13 +693,14 @@ function applyBatteries() {
       removeBattery(fac.facility);
       continue;
     }
+    const live = unitLiveStatus(fac);
+    const fsoc = facilitySoc(fac);
+    const soc = fsoc ? fsoc.soc : (live && typeof live.m.soc_ratio === "number" ? live.m.soc_ratio : null);
+    const monitored = !!live || !!fsoc;
     const total = facilityTotal(fac);
-    const soc = s ? s.soc : (live && typeof live.m.soc_ratio === "number" ? live.m.soc_ratio : null);
     const fp = facilityPower(fac);
     const commissioning = isCommissioning(fac);
     const commission = commissioning ? facilityCommission(fac) : null;
-    // Commissioning facilities carry the progress arc instead of the power
-    // ring, so the two indicators do not collide on the same circle edge.
     const ring = !commissioning && fp && Math.abs(fp.mw) > 5 ? true : false;
     const ringWeight = fp ? Math.min(6, 2 + Math.abs(fp.mw) / 20) : 0;
     const ringColor = fp && fp.mw < 0 ? "#22c55e" : (fp && fp.mw > 0 ? "#ef4444" : "#101a2b");
@@ -713,8 +714,8 @@ function applyBatteries() {
       className: "",
     } : {
       radius: radiusFor(total),
-      weight: ring ? ringWeight : (s ? 1.5 : (monitored ? 1.5 : 1)),
-      color: ring ? ringColor : (s ? "#101a2b" : (monitored ? "#101a2b" : "#3a4c63")),
+      weight: ring ? ringWeight : (fsoc ? 1.5 : (monitored ? 1.5 : 1)),
+      color: ring ? ringColor : (fsoc ? "#101a2b" : (monitored ? "#101a2b" : "#3a4c63")),
       fillColor: soc != null
         ? ramp(soc, STOPS_SOC)
         : (STATUS_COLOR[fac.units[0].status] || "#54657a"),

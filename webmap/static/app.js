@@ -39,14 +39,18 @@ const state = {
 };
 let metric = "stored";
 let showSchematic = true;
-let showCommitted = true;
-let showMonitored = true;
-let showUnmonitored = true;
+let showBatteries = true;
 let showSolar = true;
 let showWind = true;
 let showHydro = true;
 let showCoal = true;
 let showGas = true;
+let showStatus = {
+  operating: true,
+  operational: true,
+  commissioning: true,
+  committed: true
+};
 
 const map = L.map("map", { zoomControl: true, attributionControl: false }).setView([-33.2, 145.0], 5);
 
@@ -509,6 +513,24 @@ function isCommissioning(fac) {
   return (fac.units || []).some((u) => u.status === "commissioning");
 }
 
+function facilityStatusVisible(fac) {
+  if (!fac || !fac.units) return false;
+  const units = fac.units || [];
+  // If any unit is in a selected status, show. Also handle facilities that are all committed.
+  for (const u of units) {
+    const st = (u.status || "").toLowerCase();
+    if (st === "operating" && showStatus.operating) return true;
+    if (st === "operational" && showStatus.operational) return true;
+    if (st === "commissioning" && showStatus.commissioning) return true;
+    if (st === "committed" && showStatus.committed) return true;
+  }
+  // If no unit matched known statuses, check by facility-level flags
+  if (isCommitted(fac) && showStatus.committed) return true;
+  if (isCommissioning(fac) && showStatus.commissioning) return true;
+  return false;
+}
+
+
 // Two numbers drive a commissioning facility's marker:
 //   frac  peak stored energy over the commissioning window / registered storage
 //         capacity - how much of the battery has been energised. There is no
@@ -667,15 +689,10 @@ function applyBatteries() {
   for (const fac of state.fleet) {
     const loc = fac.location;
     let layer = batteryLayers[fac.facility];
-    if (!loc || !loc.lat || !loc.lng || (!showCommitted && isCommitted(fac))) {
+    if (!loc || !loc.lat || !loc.lng || !showBatteries || !facilityStatusVisible(fac)) {
       removeBattery(fac.facility);
       continue;
     }
-    const live = unitLiveStatus(fac);
-    const s = facilitySoc(fac);
-    const monitored = !!live || !!s;
-    if (monitored && !showMonitored) { removeBattery(fac.facility); continue; }
-    if (!monitored && !showUnmonitored) { removeBattery(fac.facility); continue; }
     const total = facilityTotal(fac);
     const soc = s ? s.soc : (live && typeof live.m.soc_ratio === "number" ? live.m.soc_ratio : null);
     const fp = facilityPower(fac);
@@ -902,21 +919,41 @@ function wireControls() {
     showSchematic = ev.target.checked;
     applyLines();
   });
-  document.getElementById("tog-committed").addEventListener("change", (ev) => {
-    showCommitted = ev.target.checked;
+  document.getElementById("tog-batteries").addEventListener("change", (ev) => {
+    showBatteries = ev.target.checked;
+    applyBatteries();
+  });
+  document.getElementById("tog-status-operating").addEventListener("change", (ev) => {
+    showStatus.operating = ev.target.checked;
+    applyBatteries();
     applyHydro();
     applyThermal("coal", state.coal, showCoal, coalLayers);
     applyThermal("gas", state.gas, showGas, gasLayers);
-    applyBatteries();
     applyRenewables();
   });
-  document.getElementById("tog-monitored").addEventListener("change", (ev) => {
-    showMonitored = ev.target.checked;
+  document.getElementById("tog-status-operational").addEventListener("change", (ev) => {
+    showStatus.operational = ev.target.checked;
     applyBatteries();
+    applyHydro();
+    applyThermal("coal", state.coal, showCoal, coalLayers);
+    applyThermal("gas", state.gas, showGas, gasLayers);
+    applyRenewables();
   });
-  document.getElementById("tog-unmonitored").addEventListener("change", (ev) => {
-    showUnmonitored = ev.target.checked;
+  document.getElementById("tog-status-commissioning").addEventListener("change", (ev) => {
+    showStatus.commissioning = ev.target.checked;
     applyBatteries();
+    applyHydro();
+    applyThermal("coal", state.coal, showCoal, coalLayers);
+    applyThermal("gas", state.gas, showGas, gasLayers);
+    applyRenewables();
+  });
+  document.getElementById("tog-status-committed").addEventListener("change", (ev) => {
+    showStatus.committed = ev.target.checked;
+    applyBatteries();
+    applyHydro();
+    applyThermal("coal", state.coal, showCoal, coalLayers);
+    applyThermal("gas", state.gas, showGas, gasLayers);
+    applyRenewables();
   });
   document.getElementById("tog-solar").addEventListener("change", (ev) => {
     showSolar = ev.target.checked;
@@ -1125,7 +1162,10 @@ function applyRenewables() {
     const loc = fac.location;
     if (!loc || !loc.lat || !loc.lng) continue;
     for (const u of fac.units || []) {
-      if (!showCommitted && u.status === "committed") continue;
+      const ust = (u.status || "").toLowerCase();
+      if (ust === "committed" && !showStatus.committed) continue;
+      if (ust === "commissioning" && !showStatus.commissioning) continue;
+      if ((ust === "operating" || ust === "operational") && !(showStatus.operating || showStatus.operational)) continue;
       const ft = u.fueltech_id || (u.code && u.code.includes("WF") ? "wind" : "solar");
       const isWind = (ft === "wind" || ft === "wind_farm");
       const isSolar = (ft === "solar" || ft === "solar_utility");
@@ -1275,7 +1315,7 @@ function applyHydro() {
   for (const fac of state.hydro) {
     const loc = fac.location;
     const agg = hydroAgg(fac);
-    if (!showHydro || !loc || !loc.lat || !loc.lng || (!showCommitted && isCommitted(fac))) {
+    if (!showHydro || !loc || !loc.lat || !loc.lng || !facilityStatusVisible(fac)) {
       removeHydro(fac.facility);
       continue;
     }
@@ -1407,7 +1447,7 @@ function thermalPopup(kind, fac, agg) {
 function applyThermal(kind, facs, show, layers) {
   for (const fac of facs || []) {
     const loc = fac.location;
-    if (!show || !loc || !loc.lat || !loc.lng || (!showCommitted && isCommitted(fac))) {
+    if (!show || !loc || !loc.lat || !loc.lng || !facilityStatusVisible(fac)) {
       const l = layers[fac.facility];
       if (l) { map.removeLayer(l); delete layers[fac.facility]; }
       continue;

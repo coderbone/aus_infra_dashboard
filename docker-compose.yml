@@ -410,7 +410,20 @@ services:
       # region-stored-MWh panels.
       - --intraday-poll-interval=300
       - --infer-state-file=/cache/intraday-state.json
-      - --infer-charge-efficiency=1.0
+      # Share of grid-facing charging energy that reaches the cells; the rest
+      # is conversion loss and never comes back out. Charging only - discharge
+      # is already metered at the terminals. At 1.0 (the exporter default) the
+      # inferred fleet sum sat permanently above AEMO's own reported regional
+      # storage, because every watt-hour of loss was being counted as stored.
+      # Fitted 2026-10-19 over the eight complete days since the feed went live:
+      # at 18:00 AEST, sum(aemo_battery_inferred_stored_mwh) ran 1-21% (median
+      # ~11%) above sum(aemo_battery_region_stored_mwh), and the gap scaled
+      # with the day's charging energy. Solving gap = (1 - e) x charged per day
+      # gives 0.83-0.99, median 0.90, pooled 0.908 - so 0.91, within a rounding
+      # of the OE exporter's deployed 0.9 (same fleet, same conversion losses).
+      # At 1.0 that phantom charge also pushed up to 12 units/day onto the
+      # capacity ceiling and made the next morning's re-anchor a ~1.5 GWh drop.
+      - --infer-charge-efficiency=0.91
       # Read-only from the OE exporter's fleet cache. Supplies each unit's
       # registered storage capacity (so inference clamps at 100% as well as at
       # the zero floor) and its fueltech + region (so Dispatch_SCADA MW can be
@@ -446,6 +459,24 @@ services:
       retries: 3
       start_period: 15s
 
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: node-exporter
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.rootfs=/host/rootfs'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host/rootfs:ro,rslave
+    ports:
+      - "9100:9100"
+    networks: [monitoring]
+    restart: unless-stopped
+    pid: host
+
   prometheus:
     image: prom/prometheus
     container_name: prometheus
@@ -457,7 +488,7 @@ services:
       # reservoir levels), so two-week retention would erase every reading long
       # before a yearly trend is visible. The write rate is tiny (a handful of
       # series, ≤30 KB/h), so the cost is negligible.
-      - --storage.tsdb.retention.time=2y
+      - --storage.tsdb.retention.time=7d
       - --web.enable-lifecycle
       - --web.listen-address=0.0.0.0:9090
     volumes:

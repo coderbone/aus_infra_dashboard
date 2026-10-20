@@ -58,3 +58,11 @@ scrape_configs:
     metrics_path: /metrics
     static_configs:
       - targets: ['aemobattery-exporter:9112']
+
+  - job_name: node
+    scrape_interval: 15s
+    static_configs:
+      - targets: ['node-exporter:9100']
+      # Add other hosts here as needed - e.g. 'otherhost:9100'
+      # Use file_sd_configs for dynamic discovery if scaling
+

@@ -1672,3 +1672,61 @@ total by definition), and the API credit/request/poll-duration scalars.
   for the variable silently loses a region (TAS1 from OE, WEM from AEMO), and
   the panels that then show nothing for it look like missing data rather than a
   variable that never offered the option.
+
+## Calibrating the AEMO inference charge efficiency — 2026-10-19
+
+The AEMO exporter deployed `--infer-charge-efficiency=1.0` — no loss term at
+all — when the intraday feed went live (2026-10-09). Ten days of samples are
+enough to fit it, and the evidence is the same two series the dashboard's
+`Inferred vs reported storage` panel already plots.
+
+**Method.** At 18:00 AEST each day, `sum(aemo_battery_inferred_stored_mwh)`
+(anchor + integrated SCADA at the deployed efficiency) sat above
+`sum(aemo_battery_region_stored_mwh)` (AEMO's own regional
+`BDU_ENERGY_STORAGE`) by 1–21% of reported, median ~11%. The gap scaled with
+the day's charging energy, which is what a missing loss term looks like rather
+than a constant feed offset. With deployed efficiency `e_deployed` the gap is
+`(e_deployed − e_true) × charged`, so with `e_deployed = 1` each day solves
+directly; `charged` is the charging-only integral of the SCADA series over the
+same window, 00:00→18:00 AEST:
+
+```
+charged = avg_over_time((sum(clamp_min(-aemo_battery_power_mw, 0)))[18h:5m]) × 18 h
+e_true  = 1 − gap / charged
+```
+
+(`avg × hours` is MW·h = MWh; multiply by 3600 and you have a number three
+orders of magnitude too large, which is the first cut of this query.)
+
+| Day (18:00 AEST) | gap, MWh | charged, MWh | implied e |
+| --- | ---: | ---: | ---: |
+| 2026-10-10 | 3421 | 19984 | 0.83 |
+| 2026-10-11 | 1050 | 18823 | 0.94 |
+| 2026-10-12 | 169 | 17550 | 0.99 |
+| 2026-10-13 | 1597 | 14701 | 0.89 |
+| 2026-10-14 | 1061 | 13596 | 0.92 |
+| 2026-10-15 | 1769 | 16760 | 0.89 |
+| 2026-10-16 | 1584 | 15576 | 0.90 |
+| 2026-10-17 | 2002 | 19942 | 0.90 |
+
+Pooled (Σ gap / Σ charged) **0.908**, median **0.90**, mean 0.91; the spread is
+real day-to-day variation plus the noise of comparing two different feeds.
+2026-10-09 is excluded: the feed's first partial day, whose 6pm ratio was 46%.
+Deployed **0.91** — the pooled fit, and within a rounding of the OE exporter's
+0.9, which is the right neighbourhood for the same fleet and the same
+conversion losses (NEMPulse quotes ~0.85 round-trip). Both exporters keep the
+code default at 1.0; only docker-compose.yml carries a fitted coefficient.
+
+**What it fixes.** At 1.0 the phantom charge was the day's entire loss term:
+the next morning's re-anchor dropped the fleet by ~1.5 GWh, and up to 12 units
+a day sat pinned at the capacity ceiling — on 2026-10-17 16:00 every clamped
+unit was at the top, none at the floor. At 0.91 both shrink by the loss term.
+
+**Caveats, both deliberate.** The per-unit anchor is the daily
+`ENERGY_STORAGE` while the reference is the region `BDU_ENERGY_STORAGE` —
+different feeds, so a constant feed-level offset loads onto the estimate; the
+near-zero gap on 2026-10-12 says that offset is small next to the charging
+signal. And the discharge side is assumed exact (metered at the terminals), so
+all loss is charged to the charging leg — which is also the convention, so the
+number means "efficiency under this convention", not a hardware round-trip
+figure.

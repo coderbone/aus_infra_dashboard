@@ -311,9 +311,10 @@ DEFAULT_INTRADAY_POLL_INTERVAL = 300.0
 # it: start each unit at the daily report's per-unit ENERGY_STORAGE and integrate
 # the 5-minute Dispatch_SCADA output. `charge_efficiency` is the share of
 # charging energy that is actually stored (discharging is deducted in full),
-# the exact convention of the OE exporter's --infer-charge-efficiency; the
-# default 1.0 matches the coefficient OE is *deployed* with, so the two inferred
-# feeds stay directly comparable.
+# the exact convention of the OE exporter's --infer-charge-efficiency. The
+# default 1.0 assumes nothing about the hardware; the deployed value is fitted
+# against AEMO's own reported regional storage and set in docker-compose.yml
+# (0.91 since 2026-10-19; see NOTES.md for the fit).
 DEFAULT_INFER_CHARGE_EFFICIENCY = 1.0
 
 # A unit that stops appearing in Dispatch_SCADA is unscheduled (idle), so a short
@@ -3019,9 +3020,10 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=DEFAULT_INFER_CHARGE_EFFICIENCY,
         help="share of charging energy counted as stored when integrating SCADA "
-        "into the inferred stored MWh (default %g, matching the coefficient the "
-        "OE exporter is deployed with; NEMPulse applies ~0.85 round-trip, here "
-        "on the charging leg)." % DEFAULT_INFER_CHARGE_EFFICIENCY,
+        "into the inferred stored MWh (default %g, which assumes nothing; "
+        "deployment sets the value fitted against AEMO's reported regional "
+        "storage - see docker-compose.yml and NOTES.md. NEMPulse applies ~0.85 "
+        "round-trip, here on the charging leg)." % DEFAULT_INFER_CHARGE_EFFICIENCY,
     )
     parser.add_argument(
         "--infer-clamp",

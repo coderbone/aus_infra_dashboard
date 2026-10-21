@@ -12,52 +12,38 @@ charts them in Grafana:
 - **AEMO-reported battery energy storage**, the per-DUID values every NEM
   battery dispatches against, straight from the `Next_Day_Dispatch` archive.
 
-> The AEMO exporter is the *second* battery feed, purposely: OpenElectricity
-> reports what batteries were measured to have done (`storage_battery`, with
-> inferred SOC in between); AEMO reports what they were dispatched to hold and
-> what they entered the day with, on a single daily timestamp. They cover the
-> same units and answer different questions, so `aemo_battery_*` and
-> `oe_battery_*` belong side by side on the same board rather than either
-> replacing the other.
+> The AEMO exporter is the *primary* battery feed and the one the dashboard's
+> live SOC and power panels read. AEMO reports what units were dispatched to
+> (5-minute SCADA power) and the `ENERGY_STORAGE` they entered the day with;
+> OpenElectricity supplies fleet registration metadata, capacity, and the
+> poll-health/scope metrics. The OE reading families were retired on 2026-10-20
+> rather than kept as a second, slower source for the same quantity.
 
 > The Snowy series are **water levels, not construction progress.** Snowy Hydro
 > 2.0 publishes no machine-readable project status of any kind; see
 > `scrapers/NOTES.md` for the audit. Tantangara drawdown is the closest live
 > signal that exists, because the 2.0 intake works are at the upper storage.
 
-> The battery **SOC is derived, not published.** OpenElectricity exposes stored
-> energy in MWh and registered capacity in MWh, and no percentage, so
-> `oe_battery_soc_ratio` is `energy / capacity` computed in the exporter. It is
-> also scoped to the largest batteries that have *ever reported*: seven of the
-> ten highest-capacity units in the country are unbuilt and publish nothing, so
-> ranking over all of them would produce an empty dashboard.
+> The battery **SOC is derived, not published.** Neither upstream exposes a
+> percentage. AEMO publishes a daily `ENERGY_STORAGE` anchor and 5-minute
+> dispatch power, so `aemo_battery_energy_stored_mwh` is the reported anchor and
+> `aemo_battery_inferred_stored_mwh` is the live estimate integrated from power
+> since it. OpenElectricity publishes stored energy and power but no SOC either;
+> its reading families were retired on 2026-10-20 once the AEMO estimator
+> replaced them.
 >
-> **Energy and power are not on the same clock.** The energy feed publishes only
-> overnight (~18:00–04:00 Sydney); charge/discharge power updates through the
-> day. Each is exported with its own timestamp and age, so a daytime SOC reading
-> is honestly labelled as hours old rather than looking current, and
-> `oe_battery_power_mw` keeps showing what the fleet is doing in between.
+> **The live estimate is labelled synthetic.** `aemo_battery_inferred_*` is
+> dead-reckoned from 5-minute power and never overwrites the reported anchor;
+> `aemo_battery_inferred_anchor_age_seconds` says how far the anchor is, so a
+> quiet feed is visible rather than silently frozen. The dashboard shows the
+> reported and inferred lines together, and the two meet at each daily anchor.
 >
-> **Inferred SOC fills the hours right after an overnight reading, and is
-> labelled as synthetic.** With `--enable-inferred` the exporter dead-reckons
-> stored energy by integrating each battery's power since its last measured
-> reading, and publishes it as a separate family
-> (`oe_battery_soc_inferred_ratio` and friends). Measured values are never
-> overwritten. It costs no extra API requests — the power series comes back in
-> the response already being read.
->
-> The honest limit: the upstream leaves an ~18h gap between energy readings, and
-> integration only holds up for about six of them (2–3h after a reading it is
-> within ~2% of capacity; by 10h half the fleet is pinned against its capacity
-> bound). So inference covers roughly 05:00–10:00 and then publishes nothing
-> rather than a confident wrong number. `oe_battery_inferred_saturated` flags
-> when an estimate was pinned at a bound. See `scrapers/README.md`.
->
-> The integration discounts charging by `--infer-charge-efficiency` (0.9 in
-> `docker-compose.yml`), the share of grid-facing power that reaches the cells.
-> Discharge is not discounted — it is metered at the terminals already. That
-> takes the mean error across the full daytime gap from 11.3% to 7.4% of
-> capacity and leaves the one-hour case untouched.
+> **Scope is the largest batteries that have ever reported**: seven of the ten
+> highest-capacity units in the country are unbuilt and publish nothing, so
+> ranking over all of them would produce an empty dashboard. The OE exporter
+> still rotates that polling set, but it now contributes fleet metadata,
+> capacity and poll-health only; the AEMO exporter covers the whole NEM
+> dispatch fleet by `duid`.
 
 - `docker-compose.yml` — the seven services (`tbm-exporter`,
   `reservoir-exporter`, `battery-exporter`, `aemobattery-exporter`,
@@ -196,15 +182,15 @@ history, 2000/day, 5 keys) is also free but wants an accredited institution's
 email domain.
 
 The real budget is not the 500 credits, it is the rate buckets: **8 requests per
-5 minutes, 32 per hour, 366 per day**. `battery-exporter` polls hourly over the
-largest 12 batteries: 12 data requests plus one credit check per cycle is
-13 × 24 = 312 a day, and the once-daily fleet metadata refresh adds one more for
-**313** — inside every bucket, and the reason the exporter polls on its own
-schedule instead of on the Prometheus scrape. Each data request returns *both*
-stored energy and charge/discharge power, so the second metric is free. Scraping
-it every 5 minutes would be 288 scrapes a day that each cost the API nothing,
-which is fine; polling the API every 5 minutes would be 2880 requests a day,
-which is 8x over. See `NOTES.md` §9.
+5 minutes, 32 per hour, 366 per day**. `battery-exporter` is **metadata-only**:
+it makes one `GET /facilities/` request plus one free credit check per cycle,
+refreshed daily, so it costs **two requests a day** — far inside every bucket.
+The reason it polls on its own schedule rather than on the Prometheus scrape is
+that the fleet metadata changes a few times a year, not per scrape. Scraping it
+every 5 minutes is 288 scrapes a day that each cost the API nothing, which is
+fine. Live state of charge, energy and power come from the AEMO exporter
+(`aemobattery-exporter`), which reads NEMWEB directly and costs no API credits.
+See `scrapers/README.md` and `NOTES.md` §9.
 
 The API also **rejects the default `Python-urllib` User-Agent with a bare HTTP
 403** and no body, so the exporter sets an explicit one. If you ever see a 403
@@ -239,12 +225,12 @@ credit balance:
 curl -s --get --data-urlencode \
   'query=time() - oe_last_poll_timestamp_seconds' localhost:9090/api/v1/query
 curl -s --get --data-urlencode 'query=oe_api_credits_remaining' localhost:9090/api/v1/query
-curl -s --get --data-urlencode 'query=count(oe_battery_soc_ratio)' localhost:9090/api/v1/query
+curl -s --get --data-urlencode 'query=count(oe_battery_fleet_capacity_storage_mwh)' localhost:9090/api/v1/query
+curl -s --get --data-urlencode 'query=count(aemo_battery_power_mw)' localhost:9090/api/v1/query
 ```
 
-The last one is the count of batteries that actually produced a reading; it is
-7 of 10 in this stack, and the three that do not are the Collie WEM units, which
-have published nothing in the 30 days checked. That is upstream, not a fault.
+The first count is the OE fleet metadata (every battery unit); the second is the
+AEMO fleet, which covers every NEM unit by `duid`.
 
 Alert on `wht_tbm_scrape_success == 0`, on
 `time() - wht_tbm_last_report_timestamp_seconds`, on

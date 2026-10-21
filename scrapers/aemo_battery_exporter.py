@@ -311,7 +311,8 @@ DEFAULT_INTRADAY_POLL_INTERVAL = 300.0
 # it: start each unit at the daily report's per-unit ENERGY_STORAGE and integrate
 # the 5-minute Dispatch_SCADA output. `charge_efficiency` is the share of
 # charging energy that is actually stored (discharging is deducted in full),
-# the exact convention of the OE exporter's --infer-charge-efficiency. The
+# the exact convention the retired OE exporter used for its
+# --infer-charge-efficiency. The
 # default 1.0 assumes nothing about the hardware; the deployed value is fitted
 # against AEMO's own reported regional storage and set in docker-compose.yml
 # (0.91 since 2026-10-19; see NOTES.md for the fit).
@@ -347,8 +348,7 @@ MAX_INFER_BACKFILL_HOURS = 24.0
 DEFAULT_INFER_BACKFILL = True
 
 # Stored energy cannot be negative, so the SCADA-integrated estimate is floored
-# at zero by default, the same envelope the OE exporter clamps to (its
-# --infer-clamp). The top end needs the unit's registered storage capacity -
+# at zero by default. The top end needs the unit's registered storage capacity -
 # OpenElectricity data - so it only clamps when --fleet-cache-file supplies it;
 # without one this exporter can only floor. --no-infer-clamp serves the raw
 # drift instead. Either way `aemo_battery_inferred_clamped` reports a raw

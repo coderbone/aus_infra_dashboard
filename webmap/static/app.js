@@ -225,7 +225,7 @@ const RING_COLOR = {
 
 // Everything the region popup needs, aggregated from data already on the page:
 // the per-DUID live MW in state.units (all generators and loads), the freshest
-// battery power (unitPower, OpenNEM or AEMO) and the per-fuel curtailment the
+// battery power (unitPower: AEMO 5-min SCADA) and the per-fuel curtailment the
 // AEMO exporter publishes per region. Generation and load are kept apart; within
 // each, a fuel total can net several units. A category with no live series is
 // left out rather than drawn as zero.
@@ -618,18 +618,16 @@ function radiusFor(mwh) {
 }
 
 function unitPower(code) {
+  // AEMO's 5-min Dispatch_SCADA MW is the only per-unit power source now: the
+  // OE exporter retired its `power` family on 2026-10-20 once AEMO coverage
+  // proved a superset. Positive is discharging, negative charging.
   const m = state.batteries[code];
-  if (!m) return null;
-  const oe = (typeof m.power_mw === "number")
-    ? { mw: m.power_mw, src: "oe", age: typeof m.age_s === "number" ? m.age_s : Infinity }
-    : null;
-  const aemo = (typeof m.aemo_power_mw === "number")
-    ? { mw: m.aemo_power_mw, src: "aemo", age: typeof m.aemo_power_age_s === "number" ? m.aemo_power_age_s : Infinity }
-    : null;
-  if (!oe && !aemo) return null;
-  if (!aemo) return oe;
-  if (!oe) return aemo;
-  return oe.age <= aemo.age ? oe : aemo;
+  if (!m || typeof m.aemo_power_mw !== "number") return null;
+  return {
+    mw: m.aemo_power_mw,
+    src: "aemo",
+    age: typeof m.aemo_power_age_s === "number" ? m.aemo_power_age_s : Infinity,
+  };
 }
 function facilityPower(fac) {
   let sumMw = 0;
@@ -650,32 +648,28 @@ function rateLabel(mw) {
 }
 
 function unitSoc(code, capacityMwh) {
+  // AEMO's live inferred SOC (daily anchor + integrated 5-min SCADA) is the
+  // only per-unit SOC now; the OE exporter retired its measured ratio on
+  // 2026-10-20. Inference is flagged so the UI can label it as an estimate.
   const m = state.batteries[code];
-  if (!m) return null;
-  const measured = typeof m.soc_ratio === "number"
-    ? { soc: m.soc_ratio, src: "measured", age: typeof m.age_s === "number" ? m.age_s : Infinity }
-    : null;
-  const inferred = (typeof m.inf_stored_mwh === "number" && capacityMwh > 0)
-    ? { soc: m.inf_stored_mwh / capacityMwh, src: "inferred", age: typeof m.inf_age_s === "number" ? m.inf_age_s : Infinity }
-    : null;
-  if (!measured && !inferred) return null;
-  if (!inferred) return measured;
-  if (!measured) return inferred;
-  return measured.age <= inferred.age ? measured : inferred;
+  if (!m || typeof m.inf_stored_mwh !== "number" || !(capacityMwh > 0)) return null;
+  return {
+    soc: m.inf_stored_mwh / capacityMwh,
+    src: "inferred",
+    age: typeof m.inf_age_s === "number" ? m.inf_age_s : Infinity,
+  };
 }
 
 function facilitySoc(fac) {
-  let wsum = 0, w = 0, src = null;
+  let wsum = 0, w = 0;
   for (const u of fac.units) {
     const s = unitSoc(u.code, u.capacity_mwh);
     if (!s) continue;
     wsum += s.soc * u.capacity_mwh;
     w += u.capacity_mwh;
-    if (s.src === "measured") src = "measured";
-    else if (src !== "measured") src = "inferred";
   }
   if (!w) return null;
-  return { soc: wsum / w, src };
+  return { soc: wsum / w, src: "inferred" };
 }
 
 function removeBattery(facility) {
@@ -695,7 +689,7 @@ function applyBatteries() {
     }
     const live = unitLiveStatus(fac);
     const fsoc = facilitySoc(fac);
-    const soc = fsoc ? fsoc.soc : (live && typeof live.m.soc_ratio === "number" ? live.m.soc_ratio : null);
+    const soc = fsoc ? fsoc.soc : null;
     const monitored = !!live || !!fsoc;
     const total = facilityTotal(fac);
     const fp = facilityPower(fac);
@@ -795,8 +789,8 @@ function batteryTip(fac, live, soc, total, commission) {
   if (!live) html += ' &middot; <span style="color:#7d8fa5">unmonitored</span>';
   else {
     if (soc != null) html += '<br>SoC ' + (soc * 100).toFixed(0) + '%';
-    if (typeof live.m.power_mw === "number") html += ' &middot; ' + live.m.power_mw.toFixed(0) + ' MW';
-    if (typeof live.m.age_s === "number") html += ' &middot; ' + live.m.age_s.toFixed(0) + 's old';
+    if (typeof live.m.aemo_power_mw === "number") html += ' &middot; ' + live.m.aemo_power_mw.toFixed(0) + ' MW';
+    if (typeof live.m.aemo_power_age_s === "number") html += ' &middot; ' + live.m.aemo_power_age_s.toFixed(0) + 's old';
   }
   return html;
 }

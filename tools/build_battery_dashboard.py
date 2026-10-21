@@ -35,13 +35,80 @@ INSTANT = "last_over_time(%s[2h])"
 REGION = 'region=~"$region"'
 SEL = 'name=~"$battery",%s' % REGION
 
-# Mirrors `--max-infer-hours` in docker-compose.yml, drawn as the threshold
-# line on the anchor-age panel. Past this the exporter stops publishing an
-# inferred SOC altogether, so it is the line that explains a missing dashed line.
-# Kept as a constant here rather than a metric because it is deployment
-# configuration, not an observation - if the two ever disagree, this is the one
-# to change.
-MAX_INFER_HOURS = 192.0
+# AEMO per-unit metrics carry only `duid`; the OE capacity gauge carries the
+# display labels keyed by the same code under `unit`. `label_replace` copies
+# the code into `duid` so the join keys match, and the right-hand side is
+# always the SEL-filtered capacity gauge. Panels that should cover every
+# battery use the `FLEET_*` form below instead. Verified against the live
+# datasource 2026-10-20.
+CAP_JOIN_DUID = (
+    'label_replace(oe_battery_capacity_storage_mwh{%s}, "duid", "$1", "unit", "(.*)")'
+    % SEL
+)
+# Value-preserving form: capacity / capacity is 1 with the same labels, so
+# multiplying imports them without touching the value. (There is no metric
+# with value 1 carrying the display labels - `oe_battery_fleet_info` is 1 but
+# has no `name` label.)
+CAP_JOIN_ONE = "(%s / %s)" % (CAP_JOIN_DUID, CAP_JOIN_DUID)
+
+# Whole-fleet counterpart of the pair above. Same five labels and the same
+# `unit`/`duid` join, but sourced from `oe_battery_fleet_capacity_storage_mwh`
+# so the join reaches every unit in the fleet metadata. Used
+# by the panels that are meant to show every battery AEMO publishes.
+FLEET_CAP_JOIN_DUID = (
+    'label_replace(oe_battery_fleet_capacity_storage_mwh{%s}, '
+    '"duid", "$1", "unit", "(.*)")' % SEL
+)
+FLEET_CAP_JOIN_ONE = "(%s / %s)" % (FLEET_CAP_JOIN_DUID, FLEET_CAP_JOIN_DUID)
+
+
+def soc_pct(expr):
+    """100 * expr / registered capacity, with the display labels attached.
+
+    Division, so the join is the natural shape: AEMO publishes MWh, the
+    capacity gauge publishes the MWh those bytes are a fraction of. The
+    denominator is the whole-fleet capacity gauge, so state of charge is
+    available for every unit AEMO publishes, not just the OE-monitored twelve.
+    """
+    return (
+        "100 * %s / on(duid) "
+        "group_left(name, region, facility, status, unit) %s"
+        % (expr, FLEET_CAP_JOIN_DUID)
+    )
+
+
+def unit_scope_fleet(expr):
+    """Like `unit_labels` but importing only `unit`, the table's join key.
+
+    The table wraps every value column in `max by (unit)`, which drops the
+    display labels anyway (the first column carries them for the whole row),
+    so importing five labels here would only be thrown away. Fleet-scoped,
+    like `soc_pct`.
+    """
+    return "%s * on(duid) group_left(unit) %s" % (expr, FLEET_CAP_JOIN_ONE)
+
+
+def unit_labels(expr):
+    """`expr` (duid-keyed) with the display labels attached, value untouched.
+
+    For series that are not a fraction of capacity - power, stored MWh,
+    ages, timestamps - where the join still has to happen but must not
+    scale the number.
+    """
+    return "%s * on(duid) group_left(name, region, facility, status) %s" % (
+        expr,
+        CAP_JOIN_ONE,
+    )
+
+
+def unit_labels_fleet(expr):
+    """Whole-fleet `unit_labels`: same labels, but joined through the fleet
+    capacity gauge, so every unit AEMO publishes is included rather than just
+    the twelve the OE exporter polls."""
+    return "%s * on(duid) group_left(name, region, facility, status) %s" % (
+        expr,
+        FLEET_CAP_JOIN_ONE,
+    )
 
 
 def target(expr, refid="A", instant=True, legend="{{name}}", fmt=None):
@@ -336,7 +403,7 @@ def slug(header):
     return out or "column"
 
 
-def table(title, grid, columns, description, sort_by="Rank", badges=()):
+def table(title, grid, columns, description, sort_by="Rank", sort_desc=False, badges=()):
     """One Prometheus frame per column, joined on the unit code.
 
     `columns` is a list of `(expr, header, unit, decimals)` in display order.
@@ -432,7 +499,7 @@ def table(title, grid, columns, description, sort_by="Rank", badges=()):
                 "show": False,
             },
             "showHeader": True,
-            "sortBy": [{"desc": False, "displayName": sort_by}],
+            "sortBy": [{"desc": sort_desc, "displayName": sort_by}],
         },
         "targets": [
             target(expr, refid=refid, instant=True, legend="", fmt="table")
@@ -551,77 +618,56 @@ def badge(column, options, mode="color-background-solid"):
 ABOUT = """\
 ### NEM battery state of charge
 
-**OpenElectricity publishes no state-of-charge metric.** Every percentage here is \
-derived in the exporter as `energy stored / registered capacity` \
-(`oe_battery_soc_ratio` is 0-1; the panels multiply by 100). Capacity comes from \
-the facility metadata, energy from the `storage_battery` metric, so a capacity \
-correction upstream moves the reading. See `scrapers/oe_battery_exporter.py` for \
-the derivation and `scrapers/NOTES.md` for the upstream quirks.
+**State of charge, power and stored energy come from AEMO; OpenElectricity \
+supplies the fleet's identity.** AEMO's daily `Next_Day_Dispatch` report gives \
+each unit's registered `ENERGY_STORAGE` anchor once a day (~04:11 AEST), and \
+the 5-minute `Dispatch_SCADA` feed gives measured charge/discharge MW. The \
+exporter anchors on the daily report and integrates the 5-minute MW between \
+anchors (charging discounted by a fitted ~0.91 conversion efficiency), which is \
+what makes a *live* per-unit SOC possible at all - AEMO publishes no live \
+per-unit SOC of its own. OE never published SOC either (its ratio was derived \
+the same way from its own stored-energy feed); what OE has that AEMO does not \
+is the clean registered-capacity and facility metadata, so the OE exporter now \
+exports just that - capacity, names, status and network - plus its API-budget \
+metrics, and every number that moves is AEMO's.
 
-**Energy and power are two different feeds, and this board keeps them apart.** \
-State of charge comes from `storage_battery` (MWh) and charge/discharge power \
-from `power` (MW); both arrive in the same response to the same request, so \
-showing power costs nothing. They do *not* publish on the same schedule: \
-`storage_battery` carries values only overnight, while `power` updates all day. \
-So the SOC panels are stale by design for a few hours after dawn and the power \
-panel is not, and each carries its own age metric rather than sharing one. \
-`Read` in the table is about the energy reading alone - a battery can be \
-publishing power and still have no SOC to show.
+**The board covers the whole AEMO fleet.** Every panel pairs the AEMO numbers \
+with OE's capacity metadata across all dispatch units - every unit with an \
+anchor and a SCADA stream, most of a hundred-odd units - because the SOC, power \
+and stored-energy numbers are AEMO's and AEMO already publishes them all; the \
+bars, the detail table and the live SCADA panels carry a DUID or facility legend \
+and honour the Region control, not `$battery`. The join underpins it all: AEMO \
+metrics are keyed by DUID, the OE capacity gauge by `unit`, and the codes match \
+(`ERB01` = `ERB01`), so dividing one by the other yields % of registered \
+capacity for any unit both sides know.
 
-**Scope is the NEM and WEM battery fleet.** The `NEM` facilities endpoint also \
-returns WEM units, so the top 12 by capacity includes Collie 2 and Synergy in \
-the west. Each facility is queried on its own `network_id`, because asking for a \
-WEM unit on the NEM dataset returns 404 rather than empty data.
+**The live SOC is an inference and this board says so.** The live SOC panels \
+are the integrated estimate; AEMO's own daily report is not plotted. The \
+estimate re-anchors each morning when the next daily report lands, and the \
+drift between anchors *is* the integration error. A bar pinned at 0% or 100% \
+is the estimate hitting its capacity bound (or the zero floor), not a battery \
+that is empty or full. \
+`aemo_battery_infer_success == 0` or a missing series means the exporter has \
+no fresh anchor or the SCADA gap exceeded its 6h bridge limit, not that the \
+battery went dark.
 
-**Idle batteries are rotated out, not monitored in vain.** A slot held by a \
-battery that has published nothing - neither energy nor power - for 36h goes to \
-the next-largest candidate, at no extra API cost, so the scope stays full. The \
-three Collie WEM units return only nulls, so `skipped as idle` settles at 3 and \
-the board fills up with the next-largest publishing batteries. `Batteries with a \
-reading` counts energy readings, so it can sit below `Batteries in scope` \
-through the afternoon without anything being wrong; watch the power panel to see \
-that those batteries are alive.
+**Sample age is the honest companion.** Both age lines - SOC's integration \
+and power's measurement - track the same 5-minute SCADA feed and should sit \
+near zero; either climbing past ~15 minutes means the intraday feed stalled, \
+and past 30 the panels above are showing the last good state, not the current \
+one. The daily report that re-anchors the live inference arrives each morning \
+around 04:11 AEST; nothing on the board plots the anchor age itself.
 
-**The energy feed is sparse on purpose.** As of 2026-10-01 the upstream only \
-carries values for roughly 18:00-04:00 Sydney time, so a daytime SOC reading is \
-hours old by design. The `Sample age` panel is the one to read before the SOC \
-panels: a reading older than a day means the feed went quiet, not that the \
-battery emptied. The SOC series is **omitted** rather than zeroed when a battery \
-cannot be read, so a missing bar means "no reading", never "flat and empty".
+**WEM is out of scope for AEMO.** NEMWEB publishes the NEM only, so the \
+occasional WEM battery (Collie, Synergy) on the board will simply have no \
+AEMO series - no bar, no line, absent rather than zero. OE still tracks them \
+in its capacity and info metrics.
 
-**One panel on this board is synthetic, and says so.** `State of charge: \
-measured vs inferred` plots the measured line solid and a dead-reckoned one \
-dashed: the exporter anchors on each battery's last measured energy and \
-integrates its power from there. It exists because the sparse feed above leaves \
-the board flat from dawn until the next night, but it is **not an upstream \
-reading** and it does not last all day - it is published only for the first few \
-hours after a measured reading, then stops rather than drift further. Every \
-other SOC panel on this board is measured. Judge the method on that one panel \
-before trusting it anywhere.
-
-**This is the largest N batteries that have ever reported**, not the largest N \
-batteries in Australia. Of the ten highest-capacity units in the fleet metadata, \
-seven are `committed` and have never dispatched - Richmond Valley (2200 MWh), \
-Tomago (2000), Baranduda (1886) - and they publish nothing at all. Ranking over \
-units with data is the only ranking that produces a chart.
-
-**The two live AEMO panels answer "what is happening right now".** They read \
-AEMO's 5-minute `Dispatch_SCADA` and `DispatchIS_Reports` archives: per-unit \
-*measured* MW and the region-level reported stored MWh (`BDU_ENERGY_STORAGE`). \
-AEMO publishes no per-unit live SOC - per-DUID storage only exists in the daily \
-snapshot - so the live charge/discharge panel is measured output, and the \
-region panel is the only AEMO storage figure that is both live and measured \
-across the whole fleet. This is the mechanism behind any NEMPulse-style "live" \
-battery view; a NEMPulse per-unit SOC is the daily anchor plus an integration \
-of these same 5-minute numbers at ~85% round-trip efficiency (an inference, \
-like the OE exporter's). Both live panels carry their feed's age and `/success` \
-metric so a stalled interval is visible rather than silent.
-
-Polled hourly and scoped to 12 batteries: 13 API requests per cycle (14 on the \
-once-daily cycle that also refreshes the fleet metadata), 313 a day, inside the \
-free plan's 366 requests/day bucket. Both upstream metrics come back in that one \
-request per battery. The 5m Prometheus scrape does not cost the API anything - \
-the exporter answers it from the last completed cycle.\
+**OpenElectricity is metadata-only and nearly free.** Its exporter makes one \
+`GET /facilities/` request per refresh (daily by default) plus a free `/me` \
+credit read - two requests a day against the free plan's 366/day bucket. It \
+publishes the fleet's registration data (capacity, names, status) and API \
+budget metrics; every number that moves is AEMO's.\
 """
 
 panels = []
@@ -643,22 +689,19 @@ panels.append(
 
 panels.append(
     stat(
-        "Batteries with a reading",
-        {"h": 4, "w": 4, "x": 0, "y": 9},
-        "oe_batteries_monitored",
-        "How many of the in-scope batteries returned a usable **state-of-charge** "
-        "sample in the last poll. It counts energy readings only, so it dips "
-        "through the afternoon when the storage_battery feed is silent and "
-        "recovers overnight - that is the feed, not a fault, and the charge and "
-        "discharge panel is where those batteries are still visible. A battery "
-        "that has published neither energy nor power for 36h is rotated out of "
-        "scope and its slot goes to the next-largest candidate, so a *permanent* "
-        "shortfall here is a scope problem, not a reading one.",
+        "Batteries with a live SOC",
+        {"h": 4, "w": 6, "x": 0, "y": 9},
+        "aemo_battery_inferred_units",
+        "How many batteries AEMO is currently serving a live inferred SOC for "
+        "- the units with both a daily anchor and a fresh-enough SCADA stream. "
+        "This is **AEMO feed health**: a drop means the daily report is stale "
+        "or the intraday feed has a gap wider than the exporter's 6h bridge "
+        "limit, not that batteries have gone dark. Every AEMO unit is included.",
         unit="short",
         steps=[
             {"color": "red", "value": 0},
             {"color": "orange", "value": 1},
-            {"color": "green", "value": 2},
+            {"color": "green", "value": 50},
         ],
         text_mode="value",
     )
@@ -666,42 +709,15 @@ panels.append(
 
 panels.append(
     stat(
-        "Batteries in scope",
-        {"h": 4, "w": 4, "x": 4, "y": 9},
-        "oe_batteries_in_scope",
-        "Batteries being polled: the top N by capacity, set by the exporter's "
-        "`--top` flag (12 in this stack).",
-        unit="short",
-        text_mode="value",
-    )
-)
-
-panels.append(
-    stat(
         "Fleet capacity, GWh",
-        {"h": 4, "w": 4, "x": 8, "y": 9},
+        {"h": 4, "w": 6, "x": 6, "y": 9},
         "oe_battery_fleet_capacity_mwh / 1000",
         "Registered storage capacity of every battery unit in the OpenElectricity "
-        "fleet that has ever reported - 74 units. The whole fleet, not just the "
-        "monitored twelve. The metric is MWh, so the query divides by 1000: in GWh "
-        "the number reads at a glance, where in MWh it was a six-digit value with "
-        "a 'k' buried in it.",
-        unit="short",
-        decimals=1,
-        text_mode="value",
-    )
-)
-
-panels.append(
-    stat(
-        "Monitored capacity, GWh",
-        {"h": 4, "w": 4, "x": 12, "y": 9},
-        "oe_battery_monitored_capacity_mwh / 1000",
-        "Registered capacity of the batteries that produced an energy reading. The "
-        "gap against the in-scope twelve is capacity that is in scope but has no "
-        "SOC to show - which through the afternoon is most of them, since the "
-        "energy feed is silent from 04:00. Check the power panel before reading "
-        "anything into that gap. Divided by 1000 for GWh, same as the fleet panel.",
+        "fleet. OpenElectricity is the fleet's identity source - names, "
+        "facilities and registered capacity - so this is the whole registered "
+        "NEM fleet, not the AEMO-reported subset. The metric is MWh, so the "
+        "query divides by 1000: in GWh the number reads at a glance, where in "
+        "MWh it was a six-digit value with a 'k' buried in it.",
         unit="short",
         decimals=1,
         text_mode="value",
@@ -711,19 +727,22 @@ panels.append(
 panels.append(
     stat(
         "Age of oldest reading",
-        {"h": 4, "w": 4, "x": 16, "y": 9},
-        "max(oe_battery_sample_age_seconds{%s})" % REGION,
-        "The oldest **energy** reading currently on the board. Non-zero by design - "
-        "the storage_battery feed only publishes overnight - but a jump into the "
-        "tens of hours means that feed went quiet, and every SOC panel is about to "
-        "start lying by omission. The power panel has its own age and will keep "
-        "moving through those hours; only this one resets each morning.",
+        {"h": 4, "w": 6, "x": 12, "y": 9},
+        "max(aemo_battery_inferred_age_seconds and on(duid) oe_battery_fleet_info{%s})"
+        % REGION,
+        "The oldest sample behind any SOC number on this board, across the "
+        "selected regions. Both the SOC integration and the power measurement "
+        "ride the same 5-minute `Dispatch_SCADA` feed, so this should sit near "
+        "zero; orange past 15 minutes (three intervals) and red past 30 means "
+        "the intraday feed stalled and every panel above is showing the last "
+        "good state rather than the current one. Scoped through the OE fleet "
+        "map so a dispatch unit OE has never heard of cannot set the dial.",
         unit="s",
         decimals=0,
         steps=[
             {"color": "green", "value": 0},
-            {"color": "orange", "value": 129600},
-            {"color": "red", "value": 172800},
+            {"color": "orange", "value": 900},
+            {"color": "red", "value": 1800},
         ],
         text_mode="value",
     )
@@ -731,18 +750,20 @@ panels.append(
 
 panels.append(
     stat(
-        "Since last poll",
-        {"h": 4, "w": 4, "x": 20, "y": 9},
-        "time() - oe_last_poll_timestamp_seconds",
-        "How long ago the exporter finished a poll. Green under 90m, red past 3h: "
-        "the poll is hourly, so this is the panel that says the loop has stopped, "
-        "even while every battery keeps showing its last reading.",
+        "Since last AEMO poll",
+        {"h": 4, "w": 6, "x": 18, "y": 9},
+        "time() - aemo_battery_intraday_last_poll_timestamp_seconds",
+        "How long ago the AEMO exporter finished its intraday poll - the 5-minute "
+        "SCADA cycle that feeds every SOC number on this board. Green under 20m, "
+        "red past 45m: the cycle runs every 5 minutes, so this is the panel that "
+        "says the loop has stopped, even while every battery keeps showing its "
+        "last reading.",
         unit="s",
         decimals=0,
         steps=[
             {"color": "green", "value": 0},
-            {"color": "orange", "value": 5400},
-            {"color": "red", "value": 10800},
+            {"color": "orange", "value": 1200},
+            {"color": "red", "value": 2700},
         ],
         text_mode="value",
     )
@@ -752,43 +773,35 @@ panels.append(
     bargauge(
         "State of charge, largest batteries first",
         {"h": 12, "w": 9, "x": 0, "y": 13},
-        # Inferred first, measured second, and the order is the whole point.
-        # `oe_battery_soc_ratio` is never *absent*: the API keeps returning the
-        # overnight reading all day, so the series stays exported at its stale
-        # value, and `measured or inferred` would therefore match on every
-        # battery and quietly keep the frozen number. Inference is published only
-        # while the measured reading is older than `--infer-fresh-hours`, so
-        # preferring it hands over to the live estimate for exactly the daytime
-        # hours the measured value is unusable, and falls back to the measured
-        # reading whenever no estimate exists - fresh overnight readings, a
-        # battery past `--max-infer-hours`, or inference off - so the bar is
-        # never blank just because the live number is missing.
-        "100 * (%s or %s)"
-        % (
-            INSTANT % ("oe_battery_soc_inferred_ratio{%s}" % SEL),
-            INSTANT % ("oe_battery_soc_ratio{%s}" % SEL),
-        ),
-        "State of charge for each monitored battery, as a percentage. Each bar is "
-        "**inferred wherever an estimate exists** and measured otherwise - the two "
-        "families are never published for the same battery at the same time, so a "
-        "bar is unambiguously one or the other rather than a blend. The inferred "
-        "bars are dead-reckoned by the exporter from the last overnight reading "
-        "plus integrated charge/discharge power, and they drift as they age; "
-        "`State of charge: measured vs inferred` below has the error figures, and "
-        "treat a bar that is pinned flat at 0% or 100% as the estimate hitting its "
-        "capacity bound rather than as a battery that is actually empty or full. "
-        "The measured bars are the upstream values, and are what you get overnight "
-        "and any time no estimate is available.\n\n"
+        # AEMO's live inferred SOC, joined to the whole-fleet capacity gauge
+        # for both the % denominator and the display labels. `last_over_time`
+        # on the AEMO side only: it holds each bar through a brief scrape gap,
+        # same trade the OE-fed version made - a permanent hole still shows.
+        "100 * last_over_time(aemo_battery_inferred_stored_mwh[2h]) / on(duid) "
+        "group_left(name, region, facility, status, unit) %s" % FLEET_CAP_JOIN_DUID,
+        "State of charge for every battery AEMO publishes a series for, as a "
+        "percentage. Each bar is AEMO's live inferred SOC: the daily "
+        "`Next_Day_Dispatch` `ENERGY_STORAGE` anchor integrated forward with "
+        "5-minute `Dispatch_SCADA` MW (charging discounted by the fitted ~0.91 "
+        "conversion efficiency). AEMO publishes no live per-unit SOC of its "
+        "own, so this is an estimate and it drifts between anchors - a bar "
+        "pinned flat at 0% or 100% is the estimate hitting its capacity bound "
+        "or zero floor, not a battery that is empty or full. It re-anchors "
+        "every morning when the next daily report lands; "
+        "`State of charge: live inferred (SCADA)` below plots the same "
+        "estimate.\n\n"
         "The ramp is interpolated across the bar, so it runs dark red at empty, "
         "through orange and yellow across the middle, and is green from about "
         "three-quarters full. A nearly-full battery is unambiguously green and an "
         "empty one unambiguously red, with the in-between states readable at a "
         "glance instead of having to check the number.\n\n"
-        "Batteries that could not be read have **no bar at all** rather than a "
-        "zero-length one - the exporter omits the series instead, because an empty "
-        "bar here would read as a flat battery, which is a completely different "
-        "claim. The battery list comes from the capacity gauge, so an unread "
-        "battery still shows up as a blank row.",
+        "Batteries with no AEMO series have **no bar at all** rather than a "
+        "zero-length one - a WEM unit (NEMWEB covers the NEM only) or a unit "
+        "whose SCADA gap passed the exporter's 6h bridge limit simply omits "
+        "the series, because an empty bar here would read as a flat battery, "
+        "which is a completely different claim. Capacity comes from the "
+        "whole-fleet OE metadata, so every AEMO NEM "
+        "unit is eligible for a bar.",
         steps=[
             {"color": "dark-red", "value": 0},
             {"color": "orange", "value": 25},
@@ -807,66 +820,65 @@ panels.append(
         {"h": 12, "w": 15, "x": 9, "y": 13},
         [
             (
-                "oe_battery_capacity_storage_mwh{%s}" % SEL,
+                # Whole-fleet capacity, but only for units AEMO actually
+                # publishes an inferred SOC for. The fleet metadata also
+                # carries committed/never-built units (and WEM units), and
+                # those would otherwise be rows of blanks.
+                "oe_battery_fleet_capacity_storage_mwh{%s} and on(unit) "
+                'label_replace(aemo_battery_inferred_stored_mwh, "unit", "$1", '
+                '"duid", "(.*)")' % SEL,
                 "Capacity, MWh",
                 "short",
                 0,
             ),
-            ("max by (unit) (100 * oe_battery_soc_ratio{%s})" % SEL, "SOC, %", "percent", 1),
             (
-                "max by (unit) (oe_battery_energy_stored_mwh{%s})" % SEL,
+                "max by (unit) (%s)" % soc_pct("aemo_battery_inferred_stored_mwh"),
+                "SOC, %",
+                "percent",
+                1,
+            ),
+            (
+                "max by (unit) (%s)"
+                % unit_scope_fleet("aemo_battery_inferred_stored_mwh"),
                 "Stored, MWh",
                 "short",
                 1,
             ),
             (
                 # `dateTimeAsIso` is milliseconds, and
-                # `oe_battery_last_sample_timestamp_seconds` is seconds - without
+                # `aemo_battery_inferred_timestamp_seconds` is seconds - without
                 # the x1000 this column rendered as a 1970 date, which is worse
                 # than showing nothing because it looks like a real timestamp.
-                "1000 * max by (unit) (oe_battery_last_sample_timestamp_seconds{%s})" % SEL,
+                "1000 * max by (unit) (%s)"
+                % unit_scope_fleet("aemo_battery_inferred_timestamp_seconds"),
                 "Sampled at",
                 "dateTimeAsIso",
                 0,
             ),
             (
-                "max by (unit) (oe_battery_sample_age_seconds{%s})" % SEL,
+                "max by (unit) (%s)"
+                % unit_scope_fleet("aemo_battery_inferred_age_seconds"),
                 "Sample age",
                 "s",
                 0,
             ),
-            ("max by (unit) (oe_battery_capacity_rank{%s})" % SEL, "Rank", "short", 0),
-            (
-                # Was "Read", which read as a past-tense verb and invited the
-                # question "read by whom?". It is the exporter's scrape_success:
-                # 1 when the last poll returned a usable reading.
-                "max by (unit) (oe_battery_scrape_success{%s})" % SEL,
-                "Read OK",
-                "short",
-                0,
-            ),
         ],
-        "One row per monitored battery, joined on the unit code, sorted by capacity "
-        "rank. A blank SOC means the exporter could not read that battery in the "
-        "last poll - the row stays, because capacity is a property of the fleet "
-        "rather than of the reading. `Sample age` is the honest version of the "
-        "reading next to it: compare it against the overnight publication window "
-        "before reading anything into a flat SOC. A battery that has gone quiet "
-        "for 36h leaves the table entirely - watch `skipped as idle` in the scope "
-        "panel below, and `oe_battery_idle_seconds` for the per-unit reason.",
+        "One row per battery AEMO publishes an inferred SOC for, joined on the "
+        "unit code and sorted by registered capacity, largest first. Capacity "
+        "and the identity/status labels come from the whole-fleet OE metadata; "
+        "SOC, stored, sampled-at and age are AEMO's live inferred values, "
+        "joined through the same capacity gauge the first column prints. Units "
+        "with no AEMO series are omitted rather than shown as blank rows - a "
+        "WEM battery (NEMWEB is NEM-only), a never-built committed unit, or a "
+        "unit whose SCADA gap passed the exporter's bridge limit. `Sample age` "
+        "should sit near zero (the feed is 5-minute); if it climbs, the SOC "
+        "column is a snapshot of the last good state.",
+        sort_by="Capacity, MWh",
+        sort_desc=True,
         badges=[
-            # scrape_success: whether the last poll returned a usable reading.
-            # This is the column that says whether the numbers beside it mean
-            # anything, so it gets the strongest fill. A blank SOC with a
-            # green cell here cannot happen - a unit that could not be read is
-            # 0 - and a filled cell here is what makes that visible at a glance
-            # rather than by reading four columns to the left.
-            ("Read OK", {"1": ("Yes", "green"), "0": ("No", "red")}),
             # commissioning is not a fault, it is a unit that exists and is
             # registered but is not yet producing, so it is amber rather than
-            # red. Both states come from the fleet metadata, not from a reading,
-            # which is why this column can be populated for a row whose SOC is
-            # blank.
+            # red. Both states come from the fleet metadata, not from a reading.
             ("Status", {"operating": ("Operating", "green"), "commissioning": ("Commissioning", "yellow")}),
         ],
     )
@@ -874,141 +886,32 @@ panels.append(
 
 panels.append(
     timeseries(
-        "State of charge over time",
-        {"h": 11, "w": 24, "x": 0, "y": 25},
-        [target("100 * oe_battery_soc_ratio{%s}" % SEL, instant=False, legend="{{name}} ({{facility}})")],
-        "State of charge as a percentage. `stepAfter` because this is a step "
-        "function: the exporter holds each reading until the next hourly poll, so "
-        "a sloped line would invent levels that were never published. The daytime "
-        "flat stretches are the sparse feed, not a fault - the charge and "
-        "discharge panel below keeps moving through the same hours - and Prometheus "
-        "only holds what this job has scraped since it started, so there is no "
-        "history further back than the exporter's first successful poll. Gaps are "
-        "not bridged: if the exporter stops answering, the line stops.",
-        unit="percent",
-        axis="% full",
-        decimals=1,
-        span_nulls=False,
-        min_=0,
-        max_=100,
-    )
-)
-
-panels.append(
-    timeseries(
-        "State of charge: measured vs inferred",
-        {"h": 11, "w": 24, "x": 0, "y": 36},
-        [
-            target("100 * oe_battery_soc_ratio{%s}" % SEL, refid="A", instant=False,
-                   legend="{{name}} ({{facility}}) measured"),
-            target("100 * oe_battery_soc_inferred_ratio{%s}" % SEL, refid="B",
-                   instant=False, legend="{{name}} ({{facility}}) inferred"),
-        ],
-        "**Not an upstream reading.** The dashed lines are dead-reckoned by the "
-        "exporter: it anchors on each battery's last *measured* energy and "
-        "integrates its charge/discharge power from there, discounted by the "
-        "configured charging efficiency. The solid lines are the real thing.\n\n"
-        "The two families never overlap - while a measured reading is younger "
-        "than `--infer-fresh-hours` no inferred value is published at all - so "
-        "the handover is a clean handoff rather than two lines competing for the "
-        "same battery.\n\n"
-        "**Accuracy decays with age, and the panel shows the whole window on "
-        "purpose.** Each overnight reading restarts the estimate, so the dashed "
-        "line is most trustworthy just after it appears and drifts from there. "
-        "Measured against the live feed over four days at 5-minute resolution: "
-        "~0.4% of capacity after 1 hour, ~1.5% at 6, ~1.8% at 8, ~5% at 14 - the "
-        "full overnight gap. So the line runs all day rather than stopping while "
-        "the battery is still moving, trading a few percent of drift late in the "
-        "window for continuous coverage. The cap is still there as a backstop: a "
-        "dashed line that stops is `--max-infer-hours` working, not a fault. A "
-        "line pinned flat at 0% or 100% is not a full or empty battery either - "
-        "that is the estimate hitting its capacity bound.\n\n"
-        "**Between polls the line is partly extrapolated.** The newest power "
-        "sample is carried forward and scaled by real elapsed time, so the "
-        "value tracks the clock instead of stepping once an hour; each new "
-        "sample re-anchors it. `oe_battery_inferred_hold_hours` reports how much "
-        "of the value is carried rather than integrated - minutes in normal "
-        "operation, and it rising toward the cap means the power feed has "
-        "stopped arriving rather than that the battery has.\n\n"
-        "`oe_battery_inferred_saturated` and `oe_battery_inferred_age_seconds` quantify "
-        "both of those, and this panel is the one to judge the method on; the SOC "
-        "panel above remains the measured view.",
-        unit="percent",
-        axis="% full",
-        decimals=1,
-        span_nulls=False,
-        min_=0,
-        max_=100,
-        overrides=[
-            # Dashed so the synthetic family can never be mistaken for the
-            # measured one at a glance, whatever colours the palette picks.
-            override({"id": "byRegexp", "options": ".*inferred"},
-                     [("custom.lineStyle", {"fill": "dash"}),
-                      ("custom.lineWidth", 1)]),
-        ],
-    )
-)
-
-panels.append(
-    timeseries(
-        "Charge and discharge power",
-        {"h": 10, "w": 24, "x": 0, "y": 47},
-        [target("oe_battery_power_mw{%s}" % SEL, instant=False,
-                legend="{{name}} ({{facility}})")],
-        "Charge and discharge power per battery in MW, from the upstream `power` "
-        "metric. **Positive is discharging to the network, negative is charging** "
-        "- so the parts of the chart above the line are batteries exporting and "
-        "the parts below are batteries absorbing, and the zero line is the "
-        "boundary between them. The axis is centred on zero so the two sides can "
-        "be compared directly. Nothing upstream documents that sign; it is read "
-        "off the data, where a charging battery goes negative, and it is stated "
-        "here so nobody has to infer it from the shape of the chart.\n\n"
-        "This costs no extra API requests: `power` and `storage_battery` come "
-        "back in the same response, one request per battery, so the request "
-        "budget below is unchanged by this panel.\n\n"
-        "Unlike the SOC panels above, this one is expected to be current through "
-        "the afternoon - the energy series stops at 04:00 and this one does not. "
-        "A battery flat at zero here is genuinely idle, and a battery missing "
-        "from this panel published no power at all, which is a different thing "
-        "again: absent, not zero. `Sample age` below measures the energy "
-        "reading's age and `oe_battery_power_sample_age_seconds` measures this "
-        "one; they are separate metrics because the two series age separately - "
-        "both are plotted on that panel.",
-        unit="mwatth",
-        axis="MW",
-        decimals=0,
-        span_nulls=False,
-        center_zero=True,
-    )
-)
-
-panels.append(
-    timeseries(
         "Energy stored, GWh",
-        {"h": 9, "w": 12, "x": 0, "y": 57},
-        [target("oe_battery_energy_inferred_mwh{%s} / 1000" % SEL, instant=False,
-                legend="{{name}} ({{facility}})")],
+        {"h": 9, "w": 12, "x": 0, "y": 25},
+        [
+            target(
+                unit_labels_fleet("(aemo_battery_inferred_stored_mwh / 1000)"),
+                instant=False,
+                legend="{{facility}}",
+            )
+        ],
         "**Not an upstream reading.** Stored energy divided by 1000 so the axis "
-        "reads in GWh, but the energy is dead-reckoned by the exporter from each "
-        "battery's last *measured* energy plus integrated charge/discharge power "
-        "rather than read from the feed - `State of charge: measured vs inferred` "
-        "has the error figures and the method. The value is clamped to the "
-        "battery's registered capacity, so a segment sitting flat at its capacity "
-        "is the estimate hitting that bound, not a battery that is genuinely full. "
-        "`oe_battery_inferred_saturated` flags exactly that case.\n\n"
-        "Stacked, because the question this panel answers is how much the monitored "
+        "reads in GWh, but the energy is AEMO's live inference: the daily "
+        "`Next_Day_Dispatch` anchor integrated forward with 5-minute "
+        "`Dispatch_SCADA` MW (charging discounted by the fitted ~0.91 "
+        "conversion efficiency). The value is clamped "
+        "to the battery's registered capacity, so a segment sitting flat at "
+        "its capacity is the estimate hitting that bound, not a battery that "
+        "is genuinely full.\n\n"
+        "Stacked, because the question this panel answers is how much the "
         "fleet is holding in total, and the segments show which battery is "
-        "responsible. Two decimals rather than one: the segments span 0.04 to 0.77 "
-        "GWh, and at one decimal four of the seven would read 0.0.\n\n"
-        "**This series runs alongside the measured one rather than standing in for "
-        "it**, since inference always integrates when an anchor and power exist and "
-        "no longer yields to a fresh measurement (the always-integrate decision, "
-        "2026-10-06). So a gap here means inference was unavailable - no anchor, or "
-        "a power series with a hole wider than `--infer-max-gap-hours` - and the "
-        "bars simply stop, which is a gap in this data source rather than a fleet "
-        "holding no charge. Compare against the measured series in `State of charge: "
-        "measured vs inferred`; `oe_battery_energy_stored_mwh` is the measured "
-        "counterpart and remains the authority on what was actually published.",
+        "responsible. Every AEMO unit is included - the whole fleet. "
+        "Two decimals rather than one: the segments "
+        "span hundredths of a GWh, and at one decimal many would read 0.0.\n\n"
+        "A gap here means the inference was unavailable - no fresh anchor, or "
+        "a SCADA gap wider than the exporter's 6h bridge limit - so the bars "
+        "simply stop, which is a feed problem rather than a fleet holding no "
+        "charge.",
         axis="GWh",
         decimals=2,
         span_nulls=False,
@@ -1020,21 +923,32 @@ panels.append(
 panels.append(
     timeseries(
         "Sample age",
-        {"h": 9, "w": 12, "x": 12, "y": 57},
+        {"h": 9, "w": 12, "x": 12, "y": 25},
         [
-            target("oe_battery_sample_age_seconds{%s}" % SEL, refid="A", instant=False,
-                   legend="{{name}} (energy)"),
-            target("oe_battery_power_sample_age_seconds{%s}" % SEL, refid="B", instant=False,
-                   legend="{{name}} (power)"),
+            target(
+                unit_labels("aemo_battery_inferred_age_seconds"),
+                refid="A",
+                instant=False,
+                legend="{{name}} (SOC)",
+            ),
+            target(
+                unit_labels("aemo_battery_power_age_seconds"),
+                refid="B",
+                instant=False,
+                legend="{{name}} (power)",
+            ),
         ],
-        "How old the reading behind each value is, for both feeds on one axis - "
-        "the honest companion to the panels above. The **energy** line's sawtooth "
-        "is the overnight publication window resetting each day, and an energy "
-        "line that climbs without resetting is a feed that has stopped, however "
-        "healthy the SOC curve looks. The **power** line stays near zero "
-        "through the same hours, which is the visible proof that the battery is "
-        "awake and dispatching while its SOC goes stale. Two series is the point: "
-        "either one alone would be misleading here.",
+        "How old the sample behind each value is, for both AEMO series on one "
+        "axis - the honest companion to the panels above. Both ride the same "
+        "5-minute `Dispatch_SCADA` feed, so both should sit near zero and "
+        "reset every interval; either climbing past ~15 minutes means the "
+        "intraday feed stalled and the panels above are showing the last good "
+        "state rather than the current one. The **SOC** line integrates the "
+        "power (its timestamp is the interval the estimate covers); the "
+        "**power** line is the measurement itself. They track each other "
+        "closely in normal operation, and a split between them - power fresh, "
+        "SOC ageing - means the integration stopped even though measurements "
+        "keep arriving (no anchor, or a gap past the bridge limit).",
         axis="age",
         decimals=0,
         span_nulls=False,
@@ -1043,46 +957,12 @@ panels.append(
 
 panels.append(
     timeseries(
-        "Inference anchor age",
-        {"h": 9, "w": 24, "x": 0, "y": 66},
-        [
-            target("max by (unit) (oe_battery_anchor_age_hours{%s})" % SEL, refid="A",
-                   instant=False, legend="{{name}}"),
-            target("vector(%s)" % MAX_INFER_HOURS, refid="B", instant=False,
-                   legend="--max-infer-hours"),
-        ],
-        "How far back the measured reading that inferred SOC integrates away from "
-        "is, in hours. The **sawtooth** is the normal overnight publication "
-        "window resetting each day - same shape as the energy line in `Sample "
-        "age`, and for the same reason.\n\n"
-        "The line that matters is one that **climbs without resetting**. That is "
-        "upstream `storage_battery` not publishing, and it is why the dashed line "
-        "in `measured vs inferred` goes missing: `--max-infer-hours` is a hard "
-        "cut-off, not a degradation, so past the threshold the exporter stops "
-        "publishing an estimate entirely rather than publishing a worse one. The "
-        "grey **%s** line is that threshold. Before this panel existed, a missing "
-        "dashed line was indistinguishable from a battery having no data at all.\n\n"
-        "Read it as the evidence it is: the anchor is identical across units when "
-        "the whole feed stalled, and staggered when individual batteries are "
-        "genuinely late. Current deployment value is %s hours; it is set above the "
-        "worst gap seen so a missed publication yields a visibly-degrading estimate "
-        "instead of no estimate."
-        % (MAX_INFER_HOURS, MAX_INFER_HOURS),
-        axis="hours",
-        decimals=1,
-        span_nulls=False,
-        min_=0,
-    )
-)
-
-panels.append(
-    timeseries(
         "API credits remaining",
-        {"h": 8, "w": 8, "x": 0, "y": 75},
+        {"h": 8, "w": 8, "x": 0, "y": 34},
         [target("oe_api_credits_remaining", instant=False, legend="credits left")],
         "Daily OpenElectricity credit balance, read from the free /me endpoint each "
-        "cycle. The free plan allows 500 a day; this stack's hourly twelve-battery "
-        "cycle uses a handful.",
+        "cycle. The free plan allows 500 a day; this stack is metadata-only and "
+        "uses a couple.",
         axis="credits",
         decimals=0,
         span_nulls=False,
@@ -1093,7 +973,7 @@ panels.append(
 panels.append(
     timeseries(
         "API requests against the daily bucket",
-        {"h": 8, "w": 8, "x": 8, "y": 75},
+        {"h": 8, "w": 8, "x": 8, "y": 34},
         [
             target(
                 "sum(increase(oe_api_requests_total{job=\"openelectricity_battery\"}[1d]))",
@@ -1105,15 +985,11 @@ panels.append(
         ],
         "Requests issued in the trailing 24h against the API's own 366/day bucket "
         "- the real limit, and it binds long before the 500 daily credits run out. "
-        "The two are compared as *daily* quantities on purpose: the poll happens "
-        "once an hour as a single burst of 13 requests, so an hourly rate would "
-        "draw a spike in one 5m bucket and zero everywhere else, and a ceiling "
-        "line derived the same way would sit at 0 for 23 hours out of 24. "
-        "Steady state here is ~313, just under the ceiling. That figure includes "
-        "the charge/discharge panel: both upstream metrics come back in the same "
-        "response, so adding power did not move it. Failed requests count too - "
-        "the exporter increments the counter when a request is issued, not when "
-        "it succeeds - and a restart resets it, which `increase` accounts for.",
+        "Metadata-only polling is one `/facilities/` request plus a free `/me` read "
+        "per cycle, so steady state is a small handful a day against the ceiling. "
+        "Failed requests count too - the exporter increments the counter when a "
+        "request is issued, not when it succeeds - and a restart resets it, which "
+        "`increase` accounts for.",
         axis="requests",
         decimals=0,
         span_nulls=False,
@@ -1127,50 +1003,6 @@ panels.append(
     )
 )
 
-panels.append(
-    timeseries(
-        "Poll cycle duration",
-        {"h": 8, "w": 8, "x": 16, "y": 75},
-        [target("oe_poll_cycle_duration_seconds", instant=False, legend="cycle")],
-        "Wall time of the last poll: thirteen sequential API calls plus the credit "
-        "read. A duration near or above the 3600s poll interval means cycles are "
-        "starting to overlap the next one.",
-        axis="s",
-        decimals=1,
-        span_nulls=False,
-        step="linear",
-    )
-)
-
-panels.append(
-    timeseries(
-        "Batteries enumerated, in scope, monitored",
-        {"h": 8, "w": 24, "x": 0, "y": 83},
-        [
-            target("oe_batteries_enumerated", refid="A", instant=False, legend="with data upstream"),
-            target("oe_batteries_in_scope", refid="B", instant=False, legend="in scope (--top)"),
-            target("oe_batteries_monitored", refid="C", instant=False, legend="reading this poll"),
-            target("oe_batteries_demoted", refid="F", instant=False, legend="skipped as idle"),
-            target("oe_battery_series_without_capacity", refid="D", instant=False, legend="series without capacity"),
-            target("oe_battery_series_too_stale", refid="E", instant=False, legend="dropped as stale"),
-        ],
-        "Scope accounting, all as step functions because they only change on a "
-        "poll. `enumerated` is the fleet that has ever reported (74 of 119 "
-        "capacity-bearing units), `in scope` is the top 12, `monitored` is what "
-        "actually read. `skipped as idle` counts candidates dropped for going "
-        "quiet for 36h - their slots go to the next-largest battery, so the scope "
-        "stays full at no extra API cost, and 3 is the expected steady state "
-        "here (the Collie WEM units). `series without capacity` is expected to be "
-        "in the tens: each battery facility also returns a G1 and an L1 series for "
-        "each of the two metrics it publishes, and those four are counted and then "
-        "dropped because the metadata has no capacity for them. `dropped as stale` "
-        "is the one that should stay at 0.",
-        axis="units",
-        decimals=0,
-        span_nulls=False,
-    )
-)
-
 # --- AEMO Next_Day_Dispatch panels ---------------------------------------- #
 #
 # AEMO publishes stored energy in MWh and no capacity, while the OE exporter's
@@ -1178,13 +1010,13 @@ panels.append(
 # AEMO state of charge is derived where the two overlap: divide AEMO's reported
 # `ENERGY_STORAGE` by the OE capacity of the same DUID. The `on(duid)` join
 # works because both sides are keyed by the same identifier; only units both
-# sides know survive, which is the twelve in OE scope, and that is the honest
-# limit of the derivation rather than a filter hiding units.
+# sides know survive. The whole-fleet capacity gauge is the denominator, so
+# that is every AEMO NEM unit with OE metadata (68 today).
 
 panels.append(
     timeseries(
         "Charge/discharge rate: live SCADA (5-min)",
-        {"h": 11, "w": 24, "x": 0, "y": 91},
+        {"h": 11, "w": 24, "x": 0, "y": 42},
         [
             target(
                 "aemo_battery_power_mw and on(duid) oe_battery_fleet_info{%s}"
@@ -1203,9 +1035,8 @@ panels.append(
         "This is the \"live\" view: AEMO publishes no public per-DUID live SOC, "
         "so the charge/discharge is this measured MW, and the \"SoC\" a NEMPulse "
         "shows is the daily reported anchor plus an integration of these 5-minute "
-        "numbers (an inference, like the OE exporter's). Compare against the "
-        "meter-verified OE `Charge and discharge power` panel; this one is "
-        "measured at the same cadence but straight from the dispatch archive. A "
+        "numbers (an inference, like the live SOC panels this board plots). "
+        "This panel is the whole fleet by DUID. A "
         "flat line here is a unit actually idle; a *gap* plus a growing "
         "`aemo_battery_power_age_seconds`, or `aemo_battery_scada_success == 0`, "
         "is a missing feed.\n\n"
@@ -1226,7 +1057,7 @@ panels.append(
 panels.append(
     timeseries(
         "Charge/discharge rate by region: live SCADA (5-min)",
-        {"h": 11, "w": 24, "x": 0, "y": 102},
+        {"h": 11, "w": 24, "x": 0, "y": 53},
         [
             target(
                 "sum by (region) (aemo_battery_power_mw_region{%s})" % REGION,
@@ -1257,11 +1088,11 @@ panels.append(
 panels.append(
     timeseries(
         "State of charge: live inferred (SCADA)",
-        {"h": 10, "w": 24, "x": 0, "y": 113},
+        {"h": 10, "w": 24, "x": 0, "y": 64},
         [
             target(
                 "100 * aemo_battery_inferred_stored_mwh / on(duid) "
-                "label_replace(max by (unit) (oe_battery_capacity_storage_mwh), "
+                "label_replace(max by (unit) (oe_battery_fleet_capacity_storage_mwh), "
                 "\"duid\", \"$1\", \"unit\", \"(.*)\") "
                 "and on(duid) oe_battery_fleet_info{%s}" % REGION,
                 instant=False,
@@ -1275,9 +1106,9 @@ panels.append(
         "`MW×dt` when discharging). Only units present in the daily anchor and "
         "within `MAX_INFER_GAP_HOURS` of their last SCADA reading are shown "
         "(`aemo_battery_infer_success == 1` when the feed is live). "
-        "Join to capacity is by DUID (only OE-scope units have capacity in the "
-        "fleet). This is a complement to the region-reported aggregate, not a "
-        "replacement.",
+        "Join to capacity is by DUID against the **whole-fleet** capacity gauge, "
+        "so this is every unit AEMO knows. This is a complement to the "
+        "region-reported aggregate, not a replacement.",
         unit="percent",
         axis="SoC (%)",
         decimals=1,
@@ -1290,7 +1121,7 @@ panels.append(
 panels.append(
     timeseries(
         "Inferred vs reported storage (NEM total)",
-        {"h": 9, "w": 24, "x": 0, "y": 123},
+        {"h": 9, "w": 24, "x": 0, "y": 74},
         [
             target("sum(aemo_battery_inferred_stored_mwh)", refid="A", instant=False, legend="inferred total (MWh)"),
             target("sum(aemo_battery_region_stored_mwh)", refid="B", instant=False, legend="reported region total (MWh)"),
@@ -1316,7 +1147,7 @@ panels.append(
 panels.append(
     timeseries(
         "Stored energy by region: live (BDU)",
-        {"h": 9, "w": 24, "x": 0, "y": 132},
+        {"h": 9, "w": 24, "x": 0, "y": 83},
         [
             target(
                 "aemo_battery_region_stored_mwh{%s}" % REGION,
@@ -1352,7 +1183,7 @@ panels.append(
 panels.append(
     gauge(
         "Stored energy by region: live (BDU) gauges",
-        {"h": 9, "w": 24, "x": 0, "y": 141},
+        {"h": 9, "w": 24, "x": 0, "y": 92},
         [
             target(
                 "aemo_battery_region_stored_mwh{%s}" % REGION,
@@ -1374,7 +1205,7 @@ panels.append(
 panels.append(
     timeseries(
         "Fossil-load runtime by region: stored MWh / fossil MW (fanciful)",
-        {"h": 9, "w": 24, "x": 0, "y": 150},
+        {"h": 9, "w": 24, "x": 0, "y": 101},
         [
             target(
                 fossil_runtime(),
@@ -1409,7 +1240,7 @@ panels.append(
 panels.append(
     gauge(
         "Most active batteries (charging): stored energy vs capacity",
-        {"h": 9, "w": 24, "x": 0, "y": 159},
+        {"h": 9, "w": 24, "x": 0, "y": 110},
         [
             target(
                 "100 * aemo_battery_inferred_stored_mwh / on(duid) "
@@ -1433,8 +1264,8 @@ panels.append(
         "follows AEMO: `aemo_battery_power_mw < 0` is charging/absorbing, so "
         "the selection is `topk(12, -power)`. "
         "`oe_battery_fleet_capacity_storage_mwh` is the whole-fleet capacity "
-        "gauge, so any dispatch unit in the SCADA panel qualifies - not just "
-        "the 12 OE-monitored ones. The dim, `(1h)` ring below each is where "
+        "gauge, so any dispatch unit in the SCADA panel qualifies. "
+        "The dim, `(1h)` ring below each is where "
         "the unit's stored energy would sit one hour ahead at the current "
         "dispatch rate, clamped to 0..100% of capacity (`stored - power`), "
         "marked by the Point endpoint on a fixed 0-100 % scale. The **Region** "
@@ -1454,7 +1285,7 @@ panels.append(
 panels.append(
     gauge(
         "Most active batteries (discharging): stored energy vs capacity",
-        {"h": 9, "w": 24, "x": 0, "y": 168},
+        {"h": 9, "w": 24, "x": 0, "y": 119},
         [
             target(
                 "100 * aemo_battery_inferred_stored_mwh / on(duid) "
@@ -1481,8 +1312,8 @@ panels.append(
         "stored. Sign follows AEMO: `aemo_battery_power_mw > 0` is "
         "discharging, so the selection is `topk(12, power)`. "
         "`oe_battery_fleet_capacity_storage_mwh` is the whole-fleet capacity "
-        "gauge, so any dispatch unit in the SCADA panel qualifies - not just "
-        "the 12 OE-monitored ones. The dim, `(1h)` ring bottom row is where "
+        "gauge, so any dispatch unit in the SCADA panel qualifies. "
+        "The dim, `(1h)` ring bottom row is where "
         "each unit's stored energy would sit one hour ahead at the current "
         "dispatch rate, clamped to 0..100% of its capacity (`stored - power`), "
         "marked by the Point endpoint on a fixed 0-100 % scale. The **Region** "
@@ -1526,13 +1357,16 @@ dashboard = {
         ]
     },
     "description": (
-        "State of charge for the largest N battery storage units in the NEM and WEM "
-        "fleet that publish data, from OpenElectricity. SOC is derived, not "
-        "published: stored energy divided by registered capacity. The NEM facilities "
-        "list also returns WEM units, so one of the units in scope may be WEM and is "
-        "queried against its own network. Hourly poll, free-plan request budget. "
-        "The lower half adds the same batteries as reported by AEMO Next_Day_Dispatch "
-        "(dispatched values, full storage fleet), joined to capacity by DUID."
+        "State of charge, power and stored energy for the NEM battery fleet, "
+        "driven by AEMO: the daily Next_Day_Dispatch "
+        "ENERGY_STORAGE anchor integrated with 5-minute Dispatch_SCADA MW for "
+        "the live per-unit inference, plus AEMO's own measured MW and "
+        "region-level reported storage. OpenElectricity supplies the fleet's "
+        "registered capacity, names and status (metadata only) plus its own "
+        "API-budget metrics - its "
+        "per-unit SOC/power families were retired when AEMO coverage proved a "
+        "superset. The board is the whole AEMO fleet as NEMWEB reports "
+        "it (every unit AEMO publishes, NEM only, no WEM)."
     ),
     "editable": True,
     "fiscalYearStartMonth": 0,
@@ -1550,7 +1384,8 @@ dashboard = {
                 "allowCustomValue": True,
                 "current": {"selected": True, "text": ["All"], "value": ["$__all"]},
                 "datasource": ds_(),
-                "definition": "label_values(oe_battery_capacity_storage_mwh, name)",
+                "definition": 'label_values(oe_battery_fleet_capacity_storage_mwh{'
+                              'status=~"operating|commissioning"}, name)',
                 "hide": 0,
                 "includeAll": True,
                 "label": "Battery",
@@ -1558,12 +1393,17 @@ dashboard = {
                 "name": "battery",
                 "options": [],
                 "query": {
-                    "query": "label_values(oe_battery_capacity_storage_mwh, name)",
+                    "query": 'label_values(oe_battery_fleet_capacity_storage_mwh{'
+                             'status=~"operating|commissioning"}, name)',
                     "refId": "PrometheusVariableQueryEditor-VariableQuery",
                 },
-                # 2 = on time range change. The battery list is stable, but the
-                # value has to refresh once a poll has landed, and this is the
-                # cheapest hook for that.
+                # 2 = on time range change. The fleet list changes only when a
+                # unit is commissioned, but the value has to refresh once a poll
+                # has landed, and this is the cheapest hook for that. Kept to
+                # operating/commissioning rather than every capacity row so
+                # committed (never-built) units do not clutter the picker; the
+                # panels themselves still join to AEMO, so a selected battery
+                # with no dispatch series simply has no data.
                 "refresh": 2,
                 "regex": "",
                 "regexApplyTo": "value",

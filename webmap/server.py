@@ -51,11 +51,10 @@ LIVE_QUERIES = {
         "curtail": {"expr": "aemo_battery_region_curtailment_mw", "key": "region", "extra": "fuel"},
     },
     "batteries": {
-        "soc_ratio": {"expr": "oe_battery_soc_ratio", "key": "unit"},
-        "power_mw": {"expr": "oe_battery_power_mw", "key": "unit"},
-        "stored_mwh": {"expr": "oe_battery_energy_stored_mwh", "key": "unit"},
+        # OE keeps exporting only fleet metadata; the per-unit SOC/power/stored
+        # families it used to export were retired 2026-10-20 once AEMO coverage
+        # (below) was verified a superset, so capacity is the only OE series here.
         "capacity_mwh": {"expr": "oe_battery_capacity_storage_mwh", "key": "unit"},
-        "age_s": {"expr": "oe_battery_sample_age_seconds", "key": "unit"},
         # whole-fleet live coverage from the AEMO exporter's per-duid estimates
         "inf_stored_mwh": {"expr": "aemo_battery_inferred_stored_mwh", "key": "duid"},
         "inf_age_s": {"expr": "aemo_battery_inferred_age_seconds", "key": "duid"},

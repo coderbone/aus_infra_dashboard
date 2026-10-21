@@ -333,528 +333,132 @@ endpoint to fail quietly:
 - **`--change-days 14` renaming the metric**, so a reconfigured window cannot
   keep writing under the `7d` name.
 
-## NEM battery state of charge exporter
+## NEM battery registration metadata exporter
 
-`oe_battery_exporter.py` publishes state of charge for the largest N NEM battery
-storage units from **OpenElectricity** (formerly OpenNEM), the successor to
-opennem.com.au.
+`oe_battery_exporter.py` publishes **registration metadata** for the NEM/WEM
+battery fleet from **OpenElectricity** (formerly OpenNEM), the successor to
+opennem.com.au. It is metadata-only by design: it makes a single `GET
+/facilities/` request per refresh and exports the fleet's registered capacity,
+unit identity and status, plus its own API-budget health. Nothing it publishes
+moves minute to minute.
 
 > **The API publishes no state of charge.** There is no SOC metric, no
 > percentage, and no full-charge flag anywhere in the OpenElectricity data model.
-> What it does publish is stored energy (`storage_battery`, MWh) and charge/
-> discharge power (`power`, MW), together with registered capacity
-> (`capacity_storage`, MWh) in the facility metadata. There is no SOC metric or
-> full-charge flag. Every percentage in the dashboard is therefore **derived**
-> as `energy / capacity` in the exporter, and inherits both of their error
-> sources: a capacity correction upstream moves the reading. Do not describe
-> `oe_battery_soc_ratio` as an upstream figure.
+> Every percentage on the dashboard comes from the **AEMO** exporter
+> (`aemo_battery_*`), which combines a daily reported `ENERGY_STORAGE` anchor with
+> live 5-minute power. This exporter also used to fetch `storage_battery` and
+> `power` per facility and derive its own `oe_battery_soc_ratio` the same way; the
+> per-facility fetch and **every metric derived from it — SOC, stored energy,
+> power, the inferred/SOC estimate, efficiency calibration, liveness and the
+> request-window machinery — were retired on 2026-10-20**. See
+> [Metrics](#metrics) for what remains.
 
 ### How it gets the numbers
 
-Two endpoints, one request per battery per cycle:
+One endpoint for the data, one for the budget:
 
 1. `GET /facilities/` — the fleet metadata for the **whole** NEM (batteries and
    everything else), each unit's `fueltech_id`, `network_region`,
-   `capacity_storage`, `status_id` and `data_last_seen`. Read once per
-   `--fleet-refresh-interval` (24h) and cached to disk as a fallback. Despite
-   being unfiltered this is one request (~1.3 MB, ~631 facilities / 1142 units,
-   no pagination) — the battery rows feed this exporter, and the non-battery
-   rows are what let the AEMO exporter sum fossil generation per region.
-2. `GET /data/facilities/{NEM|WEM}?metrics=storage_battery&metrics=power&facility_code=…`
-   — the data, **per facility**, with a `date_start`/`date_end` window and
-   `interval=1h`. The response holds one block per metric and one series per
-   *unit* code (`storage_battery_ERB01`, `power_ERB01`), which is the only way
-   to attribute a number to a battery.
+   `capacity_storage`, `capacity_registered`, `status_id` and `data_last_seen`.
+   Read once per `--fleet-refresh-interval` (24h) and cached to disk as a
+   fallback. Despite being unfiltered this is one request (~1.3 MB, ~631
+   facilities / 1142 units, no pagination) — the battery rows feed this
+   exporter, and the file is *also* read by the AEMO exporter to attribute its
+   measured SCADA MW, which needs the fueltech and region of every unit. So the
+   request is deliberately **not** filtered by `?fueltech_id=battery`: doing so
+   would strip the non-battery rows AEMO needs.
+2. `GET /me` — the free daily credit balance, read once per cycle to keep the
+   budget visible. A failure here costs a gauge, not the scrape.
 
-Both metrics are asked for in that **one** request, by repeating the `metrics`
-parameter. That is deliberate: the budget is counted in requests per day, and a
-second call per battery would double it to fetch a number that is free to
-collect alongside. Adding charge/discharge power cost the daily budget nothing,
-which the `API requests against the daily bucket` panel confirms.
+That is **two requests a day** against the free Community plan's 366/day bucket,
+which is why the poll interval can be relaxed and why Prometheus can scrape the
+exporter as often as it likes at zero additional credit cost.
 
-The per-facility form is not optional. The same endpoint without
-`facility_code` returns one flat array of timestamps with no unit attribution at
-all, and summing it is meaningless.
+### Why the poll loop is not the scrape handler
 
-### The two feeds, and why they are not one metric
+The free Community plan allows 500 credits/day but rate-limits by bucket:
+**8 requests / 5 min, 32 / 1 h, 366 / 1 day**. Metadata-only polling costs one
+request per cycle, so scrape-driven polling would still be arithmetically fine —
+but there is no reason to re-read a year-static fleet every scrape. So the
+exporter **polls on its own schedule** and serves the last completed cycle to
+Prometheus; the scrape interval is independent and free.
 
-| Upstream metric | Exported as | Unit | Publishes |
-| --- | --- | --- | --- |
-| `storage_battery` | `oe_battery_soc_ratio`, `oe_battery_energy_stored_mwh` | MWh | overnight only, ~18:00–04:00 |
-| `power` | `oe_battery_power_mw` | MW | through the day |
+Consequence worth knowing: a stopped poll loop leaves the capacity gauges showing
+the last good metadata forever. That is what `oe_last_poll_timestamp_seconds`
+and `oe_last_fleet_refresh_timestamp_seconds` are for.
 
-They behave differently and are kept apart end to end. On 2026-10-01 at 11:53
-the newest Eraring energy reading was 7 hours older than its newest power
-reading, and that is the normal state of this feed rather than an anomaly. So:
+### The upstream quirks that shaped it
 
-- Each gets **its own timestamp and age** (`oe_battery_*_sample_age_seconds`).
-  One shared timestamp would make a 7-hour-old SOC claim to be current, which is
-  the failure this exporter exists to avoid.
-- `oe_battery_scrape_success` stays tied to the **energy** reading, so
-  `Batteries with a reading` means what it says. A battery can publish power and
-  still read 0 here; that combination is real and is not a fault.
-- **Liveness takes whichever is newer.** A battery that is visibly dispatching on
-  the power panel is not idle, so a power-only battery keeps its slot. Judging
-  liveness on energy alone would rotate working batteries off the board every
-  morning.
-
-On the sign: nothing upstream documents it. It is read off the data — negative
-while charging, positive while discharging, consistent with a bidirectional
-dispatch_type — and stated in the metric's `# HELP` and the panel description
-rather than left to be inferred from the chart. The unit is not inferred
-either: each response block declares it (`MW`), and the exporter warns if that
-ever stops being true.
-
-### The five upstream quirks that shaped it
-
-These are the whole reason the file is the shape it is; `../scrapers/NOTES.md`
-has the full audit.
-
-1. **Six series per facility, two with capacity.** Each battery facility returns
-   `<CODE>1`, `<CODE>G1` and `<CODE>L1` for *each* of the two metrics it
-   publishes. Only `<CODE>1` has a `capacity_storage` in the metadata, so only
-   it can yield a SOC. Summing the three triples the apparent fleet size. The
-   other four are counted in `oe_battery_series_without_capacity` (~37 for the
-   deployed top 12) and dropped.
-2. **The largest batteries in the country are unbuilt.** Of the ten
+1. **The largest batteries in the country are unbuilt.** Of the ten
    highest-capacity units, seven are `committed` and have never dispatched —
    Richmond Valley (2200 MWh, the largest in Australia), Tomago (2000),
-   Baranduda (1886), Wooreen, Elaine, Western Downs 3, Supernode 3. They publish
-   nothing. The top-N is therefore taken over units with a `data_last_seen`,
-   which cuts the fleet from 119 capacity-bearing units to 74 and makes the
-   ranking produce a chart. `--require-data` (default on) is this filter;
-   `--include-undispatched` turns it off if you would rather see the empty rows.
+   Baranduda (1886), Wooreen, Elaine, Western Downs 3, Supernode 3. They have no
+   `data_last_seen`. The numeric capacity series skip them (`require_data`,
+   default on); `oe_battery_fleet_info` and
+   `oe_battery_fleet_capacity_storage_mwh` cover *all* of them, because
+   describing the units the live feed never mentions is the whole point of the
+   info metric. `--include-undispatched` widens the numeric series to match.
    `commissioning` is *kept* — Eraring 2 and Collie 2 are both commissioning and
    both publish real data.
-3. **`data_last_seen` is not proof of a series.** It says the *facility* has
-   dispatched, not that the battery's `storage_battery` series has a value. The
-   three Collie WEM units in the original top 10 are all `data_last_seen` current
-   and return 1151 points that are all null — on both metrics. Liveness has to be
-   learned by polling, so the exporter tracks it — see the rotation below.
-4. **The energy feed is sparse on purpose; the power feed is not.** As of
-   2026-10-01 `storage_battery` values exist only for roughly 18:00–04:00 Sydney
-   time and are null for the rest of the day, while `power` updates all day. So a
-   daytime scrape legitimately finds no new energy even though the battery is
-   dispatching. The exporter exports the newest *non-null* sample of each within
-   the lookback window together with its own real timestamp and age, and drops a
-   series only once that sample is older than `--max-sample-age` (36h,
-   comfortably past the feed's own daily gap). A daytime SOC reading is hours old
-   *by design*, and `oe_battery_sample_age_seconds` is how you tell that from a
-   dead feed — read it next to `oe_battery_power_sample_age_seconds`, which will
-   be hours younger.
-5. **Facilities can 404 or be in the other network.** `COLLIE_BESS2` 404s, and
-   ten of the battery facilities are WEM — querying one under `NEM` returns
-   `404 No data available`, which is indistinguishable from a genuinely empty
-   battery. The network is carried per row from `network_id` for exactly this
-   reason. Both cases are counted, not raised as failures.
+2. **`capacity_storage` is a *unit* field, not a facility field.** Reading it
+   off the facility yields no denominator at all. A unit with no positive
+   `capacity_storage` yields no numeric row; a battery data facility returns
+   `<CODE>1`, `<CODE>G1` and `<CODE>L1`, and only `<CODE>1` carries the
+   capacity.
+3. **Facilities come and go, and span two networks.** Ten of the battery
+   facilities are WEM and `COLLIE_BESS2` 404s when queried as NEM. The network is
+   carried per row from `network_id` rather than assumed; in this metadata-only
+   exporter that is only a label distinction, but the AEMO exporter reads the
+   same file and relies on it.
 
 Plus one that is not about the data: **the API rejects the default
 `Python-urllib` User-Agent with a bare HTTP 403** and no body. `USER_AGENT` is
 explicit and must not be dropped. Verified 2026-09-30: `Python-urllib/3.12` →
 403, `curl/8.5.0` → 200, `python-requests/2.31` → 200.
 
-### Why the poll loop is not the scrape handler
-
-The free Community plan allows 500 credits/day but rate-limits by bucket:
-**8 requests / 5 min, 32 / 1 h, 366 / 1 day**. One request per battery per cycle
-means scrape-driven polling is arithmetically impossible: at 288 scrapes/day and
-even N=5, that is 1440 requests/day — 4x over the daily bucket.
-
-So the exporter **polls on its own schedule** and serves the last completed
-cycle to Prometheus. Prometheus can scrape as often as it likes — 5m here — at
-zero cost to the API, and the API is only touched `--poll-interval` times per
-cycle. Both upstream metrics ride in each data request, so the deployed
-defaults (N=12, hourly) are 13 requests/cycle (14 on the daily fleet-metadata
-refresh), 313/day, ~1 request per 4.6 min: inside every bucket with room to
-spare.
-
-Consequence worth knowing: a stopped poll loop is invisible in the SOC panels,
-which happily show the last reading forever. That is what
-`oe_last_poll_timestamp_seconds` and the `Since last poll` panel are for.
-
 ### Metrics
 
-Per-battery, all carrying the same five labels —
+Per-unit, all carrying the same five labels —
 `{facility, unit, name, region, status}` — so one Grafana variable selects the
-same batteries everywhere and the table can join on `unit`:
+same units everywhere and the table can join on `unit`:
 
 | Metric | Type | Meaning |
 | --- | --- | --- |
-| `oe_battery_soc_ratio` | gauge | SOC as 0–1, `energy / capacity` |
-| `oe_battery_energy_stored_mwh` | gauge | Stored energy as published |
-| `oe_battery_capacity_storage_mwh` | gauge | Registered capacity from metadata |
-| `oe_battery_last_sample_timestamp_seconds` | gauge | When that value was observed |
-| `oe_battery_sample_age_seconds` | gauge | Its age at export time |
-| `oe_battery_scrape_success` | gauge | 1 if read, 0 if not |
-| `oe_battery_capacity_rank` | gauge | 1 = largest in the monitored set |
-| `oe_battery_idle_seconds` | gauge | Age of the newest reading seen for this unit |
-| `oe_battery_power_mw` | gauge | Charge (negative) / discharge (positive) power |
-| `oe_battery_power_sample_timestamp_seconds` | gauge | When that power value was observed |
-| `oe_battery_power_sample_age_seconds` | gauge | Its age at export time |
+| `oe_battery_capacity_storage_mwh` | gauge | Registered storage capacity from metadata, for units with data (or all, with `--include-undispatched`) |
+| `oe_battery_fleet_capacity_storage_mwh` | gauge | Registered storage capacity in MWh for **every** unit in the fleet metadata — the numeric operand the info gauge's capacity label cannot be, so any unit's % of capacity can be computed (`energy / on(unit) this series`) |
 
 A labelled **info** gauge accompanies the whole fleet, value 1 with the data in
 the labels, and covers *every* battery unit in the metadata — committed and
-never-built units included, not just the polling set:
+never-built units included:
 
 | Metric | Type | Meaning |
 | --- | --- | --- |
 | `oe_battery_fleet_info{duid, facility, facility_name, region, network, status, capacity_storage_mwh, capacity_registered_mw, data_last_seen}` | gauge | Registration metadata for one unit. `duid` is the join key: AEMO per-unit dispatch series carry `duid`, so `aemo_battery_power_mw * on(duid) group_left(region) oe_battery_fleet_info` enriches them with region/network/status with no lookup table. Capacity figures ride as label strings for display and filtering; `data_last_seen` is empty for units that have never published. Absent entirely until the fleet metadata is first read. |
-| `oe_battery_fleet_capacity_storage_mwh{facility, unit, name, region, status}` | gauge | Storage capacity in MWh for every unit in the fleet metadata, not just the `--top` polled ones — the numeric operand the info gauge's capacity label cannot be, so any unit's % of capacity can be computed (`energy / on(unit) this series`). |
-
-With `--enable-inferred`, a separate synthetic family is exported for units with
-no *fresh* measured reading. It is deliberately kept out of the table above so
-it can never be mistaken for an upstream number:
-
-| Metric | Type | Meaning |
-| --- | --- | --- |
-| `oe_battery_soc_inferred_ratio` | gauge | SOC 0–1, dead-reckoned from power |
-| `oe_battery_energy_inferred_mwh` | gauge | MWh behind that SOC, clamped to capacity |
-| `oe_battery_inferred_timestamp_seconds` | gauge | Newest power point integrated |
-| `oe_battery_inferred_age_seconds` | gauge | Its age at export time |
-| `oe_battery_inferred_saturated` | gauge | 1 = the raw integral left `[0, capacity]` |
-| `oe_battery_inferred_hold_hours` | gauge | hours the newest power rate has been carried forward to export time — the extrapolated share of the value above |
-| `oe_battery_anchor_age_hours` | gauge | age of the measured reading inferred SOC integrates away from — the quantity `--max-infer-hours` bounds |
-| `oe_battery_anchor_timestamp_seconds` | gauge | Unix time of that same anchor; never moves backwards, so a stalled feed reads as a frozen timestamp |
-
-Measured always wins: while the measured reading is younger than
-`--infer-fresh-hours` (default 2, deployed at 1) no inferred value is exported
-at all, so the two families never both claim the same cycle.
-
-**How accurate is it?** Measured against the live feed on 2026-10-01, integrating
-from one measured reading to the next:
-
-All figures below are with the deployed `--infer-charge-efficiency=0.9`.
-
-| Window | n | Median error | Mean error |
-| --- | --- | --- | --- |
-| 1 hour (within an overnight block) | 140 | 0.25% of capacity | 0.81% |
-| ~14 hours (the daytime gap) | 7 | 10.4% of capacity | 7.4% |
-
-Error accumulates fastest in the first hours after the anchor, where most of the
-movement is:
-
-| Hours since anchor | Mean drift from anchor | Units saturated |
-| --- | --- | --- |
-| 1h | 0.9% | 0/7 |
-| 2h | 1.9% | 0/7 |
-| 3h | 2.1% | 0/7 |
-| 4h | 1.1% | 0/7 |
-| 5h | 3.7% | 1/7 |
-| 6h | 10.3% | 1/7 |
-| 8h | 31.8% | 1/7 |
-| 10h | 43.0% | 3/7 |
-
-This is the whole story of the feature. Because `storage_battery` leaves an
-overnight gap, **integration cannot cover that gap for free**: by 10h the
-estimate has run into the capacity bound on half the fleet, and clamping it to
-100% would be a confident lie. Raising the cap buys coverage and costs accuracy
-— it will not refuse to answer, only answer badly.
-
-The deployment therefore runs `--max-infer-hours=48` with
-`--infer-fresh-hours=1`. The 48 is **not** a claim that a 48h integral is
-accurate; it is set above the worst anchor age actually observed so the estimate
-stays visible during an upstream publication failure. The fit error above is
-~5% of capacity by 14h and compounds well past that by 32h, so during an outage
-the dashed line should be read as *"batteries moved this way since 04:00"*, not
-as a state-of-charge reading.
-
-Once `storage_battery` publishes again the anchor refreshes and 48 becomes
-slack — the normal case is unaffected by the setting, so it can be dropped back
-to 24 at leisure. What must not happen is the reverse: setting it below the
-real anchor age does not degrade the estimate, it deletes it. That is exactly
-what happened at 15h on 2026-10-03, and
-[`oe_battery_anchor_age_hours`](#oe_battery_anchor_age_hours) now exists to make
-that failure mode visible rather than silent.
-
-### `--infer-charge-efficiency`
-
-Grid-facing charging energy and stored energy are not the same number: some is
-lost converting between AC and DC and never comes back. The coefficient is the
-share that reaches the cells, applied to **charging only** — the discharge side
-is already metered at the terminals, so there is nothing further to discount it
-by. That makes it a round-trip figure: at `0.9`, 100 MWh into the grid
-connection puts ~90 MWh in the cells and ~90 MWh comes back out.
-
-A segment that crosses zero is split at the crossing, because charging and
-discharging have to be weighted differently and averaging across the switch
-point would apply the wrong factor to part of the interval.
-
-Without it the integration is biased in one direction only — it consistently
-**over**-predicts stored energy — which is the signature of an ignored loss
-term. The default is `1.0`, i.e. no loss term at all, so the exporter assumes
-nothing about hardware it was not told about; the deployment sets `0.9`
-explicitly in `docker-compose.yml`.
-
-| `--infer-charge-efficiency` | 1h median | 14h median | 14h mean |
-| --- | --- | --- | --- |
-| `1.0` (no loss term) | 0.3% | 14.3% | 11.3% |
-| `0.9` (deployed) | 0.3% | 10.4% | **7.4%** |
-
-It roughly halves the error over the long gap and leaves the one-hour case
-untouched, which is what a genuine physical loss term should do. That is the
-test a coefficient *fitted* to these seven samples failed: see `NOTES.md` for
-why that version was rejected.
-
-One coefficient for the whole fleet remains a simplification, and the obvious
-next step — **a per-unit coefficient** — was tried and does not work. Fitted in
-closed form per unit over five days and validated leave-one-day-out, the values
-came out physically impossible (two units above 1.0, meaning they would store
-more energy than they drew; two negative), and held-out validation improved the
-fleet by 3% while being *worse* than a flat 0.9 on three units of seven. That is
-the signature of a model whose residual is not a loss term; `NOTES.md` records
-what the residual turns out to be. The lever that would actually move this error
-is finding out what `power` measures, not another coefficient.
-
-### `--infer-max-hold-hours`
-
-How long the newest observed power rate is carried forward to export time,
-scaled by the real elapsed time — a five-minute-old rate contributes 1/12th of
-its hourly energy, an hour-old one a full hour. Default `6`, set to `0` to
-disable.
-
-It exists because of an asymmetry that is easy to miss: `power` arrives on a
-fixed grid and Prometheus scrapes fall *between* those grid points. Integrating
-only the samples therefore produces a value that is exactly right but changes
-only when a new sample lands — hourly here. On a chart that is a staircase, and
-a staircase is indistinguishable from a battery that stopped moving. The hold
-turns it back into a line, and each real sample re-anchors it, so the error
-introduced is bounded by the time to the next sample rather than by the hold.
-
-Three bounds keep it an estimate rather than invention. `--max-infer-hours`
-still kills the whole estimate at the anchor; `--infer-max-hold-hours` caps how
-far a single unconfirmed rate is carried, so a poll that stops arriving
-degrades into a frozen line with a growing age instead of an indefinite
-extrapolation; and the capacity clamp still applies, so a held battery stops at
-full and reports `oe_battery_inferred_saturated` rather than walking off the
-panel. `oe_battery_inferred_hold_hours` publishes the held duration, because a
-value that is partly extrapolated should not look like one that was measured.
-
-### `oe_battery_anchor_age_hours`
-
-Publishes the age of the measured `storage_battery` reading that inferred SOC
-integrates away from, for every unit, whether or not an estimate exists.
-
-It exists because `--max-infer-hours` is a hard cut-off rather than a
-degradation: once the anchor is older than the setting, inference stops and
-`oe_battery_soc_inferred_ratio` is simply *absent*. An absent series and a
-battery with no data look identical on a dashboard, which is precisely when the
-cause matters most. The anchor pair turns that silence into a number:
-
-- `oe_battery_anchor_age_hours` — hours, so it reads directly against
-  `--max-infer-hours`. Above the setting, no estimate is published; that is the
-  whole rule.
-- `oe_battery_anchor_timestamp_seconds` — the underlying instant. It only ever
-  moves forward, so a stalled upstream feed is a flat line rather than a gap,
-  which is the form that survives being pasted into a support ticket.
-
-Both are emitted even when the poll that produced them returned nothing, and a
-unit whose anchor is unknown is omitted rather than zeroed — a zero would read as
-"published just now", inverting the metric's purpose.
-
-Observed on 2026-10-03: `storage_battery` stopped publishing and the anchor
-reached 31.8h, which at `--max-infer-hours=15` suppressed every inferred line
-with no other symptom. The setting was raised to 48 to prefer a visibly-degrading
-estimate over none; see the `--max-infer-hours` discussion below for what that
-costs.
-
-### `--power-history-file` and `--power-history-days`
-### `--power-history-file` and `--power-history-days`
-
-A local, self-hosted copy of the per-unit power series, held in memory and in a
-plain JSON file (`power-history.json` beside `--fleet-cache-file` by default).
-
-What it buys is **resilience, not accuracy**. Inferred SOC integrates the power
-series between two measured energy readings, and until now that series came only
-from the current cycle's API response — which quietly couples the estimator both
-to how deep a lookback the exporter asked for and to whether the API was
-reachable. A scrape that failed mid-window silently shortened the integration,
-and the result was indistinguishable from a battery that had simply stopped.
-Merging the cache with each fresh response turns that into lost freshness
-rather than lost history.
-
-It is deliberately **not** used to hold the inference anchor. `_last_measured_*`
-still re-derives from the API on every start, because a persisted anchor would
-let a restart serve a stale SOC as if it were current — the one failure mode the
-exporter refuses everywhere else. Power is a bounded, self-correcting physical
-signal; an energy anchor is a claim about the present, and a file on disk cannot
-tell whether it is still true.
-
-Bounded twice over: by `--power-history-days` (14 by default), and by keeping
-one value per (unit, timestamp), so re-polling the same lookback replaces rather
-than duplicates. At `--api-interval=5m` that is ~288 points per unit per day, so
-14 days of a 12-unit fleet is roughly 1 MB — still trivial, but no longer
-something to read with `cat`; `--power-history-days` is the knob if it ever
-matters.
-
-Storing it does **not** let you poll faster: the upstream power series is
-already fully resolved at `--api-interval`, so re-fetching returns
-byte-identical data for another request. `--api-interval=5m` is the knob that
-*does* change resolution, and it is free, being a query parameter on the same
-one request — over four days it roughly halves mean error at every horizon
-(1.47% vs 2.12% at 6h) because the hourly value is only the arithmetic mean of
-the twelve 5m samples under it. All verified, with numbers, in the sampling
-section of `NOTES.md`.
-
-`oe_battery_inferred_saturated` exists because a clamped value is otherwise
-indistinguishable from a real one: in the live run Waratah read exactly `1.0`
-because the integral ran ~97 MWh past its 1680 MWh capacity. A `1` there means
-the integration and the anchor disagree by at least a full battery.
-
-Flags: `--enable-inferred`, `--max-infer-hours` (default 24),
-`--infer-fresh-hours` (default 2), `--infer-max-gap-hours` (default 2),
-`--infer-max-hold-hours` (default 6), `--no-infer-clamp`. Inference costs no extra API requests: the full power series
-comes back in the response already being read for `oe_battery_power_mw`.
-
-Gaps are not bridged. `--infer-max-gap-hours` bounds how far apart two power
-samples may be and still be integrated across, so one missing hourly point is
-tolerated but a real outage ends the integration instead of inventing energy
-across it.
 
 Unlabelled fleet and poll gauges:
 
 | Metric | Type | Meaning |
 | --- | --- | --- |
-| `oe_batteries_enumerated` | gauge | Fleet units with capacity *and* upstream data |
-| `oe_batteries_in_scope` | gauge | Units selected after `--top` and idle drops |
-| `oe_batteries_demoted` | gauge | Candidates skipped for going idle |
-| `oe_batteries_monitored` | gauge | Units that produced a usable reading |
-| `oe_battery_fleet_capacity_mwh` | gauge | Capacity of the whole enumerated fleet |
-| `oe_battery_monitored_capacity_mwh` | gauge | Capacity of the monitored subset |
-| `oe_battery_series_without_capacity` | gauge | Series dropped, quirk 1 (~37, expected) |
-| `oe_battery_series_too_stale` | gauge | Samples dropped for age (should be 0) |
-| `oe_batteries_inferred` | gauge | Units carrying a synthetic SOC this cycle |
-| `oe_poll_cycle_duration_seconds` | gauge | Wall time of the last cycle |
+| `oe_battery_fleet_capacity_mwh` | gauge | Capacity of the whole enumerated fleet (units with data) |
 | `oe_last_poll_timestamp_seconds` | gauge | When the last cycle finished |
 | `oe_last_fleet_refresh_timestamp_seconds` | gauge | When the metadata was last read |
 | `oe_api_credits_remaining` | gauge | Daily balance, from the free `/me` |
 | `oe_api_requests_total` | counter | Requests **issued**, failures included |
 
-A battery that could not be read keeps its capacity, rank and `scrape_success 0`
-— those are facts about the fleet — but its SOC, energy, timestamp and age series
-are **omitted rather than zeroed**. On a battery, a zero is not "no reading", it
-is "flat and empty", which is a different and much more alarming claim. Power
-follows the same rule, so a gap in the power panel means *nothing was published
-for that unit*, while a real `0` there is upstream genuinely reporting zero —
-worth distinguishing, because commissioning units sit at zero all day.
-
-### The rotation: idle slots refill, at no extra request
-
-A strict top-N is only as good as its membership. Three of the original ten
-units were Collie WEM batteries that return all-null energy series, so a third
-of the request budget bought nothing, while larger publishing batteries further
-down the fleet were never asked. The exporter therefore keeps the scope full:
-
-- Each poll notes the newest usable reading per unit, keyed on the **sample's own
-  timestamp**, not the poll time, and over *both* metrics. A unit that has not
-  published since 04:00 is correctly measured as idle from 04:00; a unit
-  dispatching on power alone is not idle, which is why the clock takes the newer
-  of the two.
-- A unit whose reading is older than `--drop-idle-hours` (default 36, matching
-  the sample-age limit) is dropped from scope and the next-largest candidate
-  takes its slot. `oe_batteries_demoted` counts batteries skipped, not slots
-  lost; `oe_battery_idle_seconds` is exported for demoted units too, so "why did
-  that battery stop appearing" is answerable from the metrics alone.
-- **Cost is unchanged**: one request per in-scope battery per cycle, exactly as
-  before. The rotation only changes *which* batteries those are.
-
-The 36-hour default is deliberate and is the whole design. The feed publishes
-overnight (~18:00–04:00), so a poll at 16:00 finds nothing newer than 04:00 and
-the reading is 12 hours old. Anything tighter than a full publication cycle would
-demote healthy batteries every afternoon and rotate the scope daily. A unit must
-miss an entire night's publication to be judged idle. `--drop-idle-hours 0`
-restores a strict capacity top-N.
-
-Liveness is persisted so that a restart does not undo any of this. Without it,
-the first sight of an unreadable unit sets its clock to *now*, so a container
-restarted more often than the idle window hands every dead battery a fresh 36h
-reprieve and the rotation never converges — the Collie units would hold their
-slots forever, and every deploy would silently revert the demotions.
-`--liveness-file` (defaulting to `liveness.json` beside `--fleet-cache-file`)
-writes `{unit_code: epoch}` after every clean poll, atomically. The file is
-**liveness only** — when each unit was last seen publishing. No reading, energy
-value or SOC is ever written to it, so a restart still cannot serve a stale SOC
-as current. That is the same refusal the exporter applies everywhere else, and
-`test_only_liveness_is_persisted_never_a_reading` asserts it against the file's
-actual bytes. (Energy readings *are* persisted elsewhere — see
-`--reading-cache-file` below, which is a different file for a different reason.)
-Future-dated stamps are dropped rather than trusted, so a skewed
-clock cannot pin a dead battery in scope forever. An unreadable or corrupt file
-logs a warning and starts cold, which is the first-ever-run behaviour.
-
-The one thing rotation does *not* do for free is recovery: a demoted unit is
-never asked again, so it can only return by outranking a failure or by a
-restart clearing the in-memory state. `--watchlist-per-cycle N` re-asks N demoted
-units per cycle, round-robin from the largest, so a battery that comes back is
-back within `len(demoted)` cycles. It is off by default because it is the only
-part that costs anything — at 1 per cycle it adds ~24 requests/day, taking the
-total from 313 to 337. Probing and re-admission are separate steps, so the cycle
-that probes a unit reports the scope it actually polled and the unit is back in
-scope on the next one.
-
-### Narrow request windows (`--reading-cache-file`, `--poll-window-hours`)
-
-The exporter takes the newest non-null `storage_battery` sample *inside the
-window it asked for*, and that reading is 6–14h old by poll time. So the window
-has to be wide enough to reach back to it: 192h at `interval=5m`, which is not a
-cheap way to fetch one number. Measured against the live API, one facility:
-
-| window | response | points | fetch |
-| --- | --- | --- | --- |
-| 192h | 494 KB | 13,654 | 0.74s |
-| 48h | 120 KB | 3,288 | 0.60s |
-| 2h | 4.8 KB | 96 | 0.38s |
-
-That 494 KB was being re-sent every hour, per facility — about 5.9MB per cycle
-across the deployed 12 — mostly duplicating points already fetched.
-
-`--reading-cache-file` keeps the newest reading per unit locally
-(`readings.json` beside `--fleet-cache-file`), so a poll only has to cover the gap
-since the last one. `--poll-window-hours` (default 2) sets that minimum; against a
-1h poll interval that is 4x overlap, so a dropped poll cannot open a hole in the
-power series. `infer_soc` *drops* segments wider than `--infer-max-gap-hours` instead of
-integrating across them, so a hole is not a slightly-wrong number — it is the
-line going flat at the last good point.
-
-This does not change the API request count. The binding limit is 366
-requests/**day**, and N facilities is N requests per cycle whether the window is
-2h or 192h. What drops is bytes and server-side work per request, which is the
-scrape time that actually grew.
-
-The window returns to the full `--lookback-hours` automatically whenever it is not
-safe to narrow: no cache configured, a cold cache, a missed poll (the window
-tracks time since the last *attempt*, so a failed cycle cannot shrink the window
-that would have repaired it), or a unit **known to publish** that is no longer
-reachable. It stays wide on the first cycle after a restart even if the cache
-survived — that process has not yet proven it can fetch.
-
-A unit that has *never* published does not block narrowing. This matters in
-practice: 5 of the deployed 12 batteries never publish `storage_battery`, and
-requiring a reading from those would pin the window at 192h forever and make the
-whole mechanism dead code. The cache records which units it has seen publish
-(`seeded`), so "missing" means *regressed from an observed state*, not *absent of
-evidence*.
-
-**This does relax a safety invariant, deliberately.** Where the liveness file
-stores no readings, this one does, and a cached reading can reach a *measured*
-metric: if a narrow window returns power but no storage point inside it, the
-cached reading is exported as the measured one rather than the metric going
-blank. The bounds on that are explicit rather than assumed:
-
-- it keeps its own timestamp, so `oe_battery_sample_age_seconds` and
-  `oe_battery_anchor_age_hours` report its true age — verified to be
-  identical to the age the wide path reports;
-- `oe_battery_reading_from_cache` counts units in that state, so "the buffer has
-  become the only source of truth" is visible rather than silent;
-- it is **never** used for a facility that failed to answer — that stays
-  `scrape_success=0`, because reporting a battery as monitored during an
-  upstream outage is the one thing this exporter must not do;
-- a live reading always supersedes it, so the cache can lag but never contradict
-  what the API just said;
-- it is bounded by `--max-sample-age` and `--max-infer-hours`, and
-  future-dated stamps are dropped.
-
-To disable the whole mechanism and keep every request at the full reach, omit
-`--reading-cache-file`.
+**Retired on 2026-10-20.** The live SOC, stored energy, power, their timestamps
+and ages, the anchor gauges, the whole inferred/SOC estimate and its calibration
+metrics, the per-unit `oe_battery_scrape_success` /
+`oe_battery_capacity_rank` / `oe_battery_idle_seconds`, the scope counters
+(`oe_batteries_enumerated`, `_in_scope`, `_demoted`, `_monitored`,
+`oe_batteries_inferred`), `oe_battery_monitored_capacity_mwh`,
+`oe_battery_series_without_capacity`, `oe_battery_series_too_stale`,
+`oe_battery_reading_from_cache` and `oe_poll_cycle_duration_seconds` are all
+gone. AEMO now publishes the live numbers
+(`aemo_battery_power_mw`, `aemo_battery_energy_stored_mwh`,
+`aemo_battery_inferred_stored_mwh` and their age metrics) for the same units at
+5-minute resolution, and a second slower source for the same quantity is worse
+than a gap. Nothing emits the retired names and no dashboard or webmap query
+references them.
 
 ### Running
 
@@ -862,19 +466,17 @@ To disable the whole mechanism and keep every request at the full reach, omit
 # one-shot exposition on stdout (exit 1 if the poll failed)
 OPENEA_API_KEY=… ./oe_battery_exporter.py --once
 
-# long-running exporter, top 15, every 30 minutes
+# long-running exporter, refreshing metadata daily
 OPENEA_API_KEY=… ./oe_battery_exporter.py \
-    --listen-address 127.0.0.1 --port 9111 --top=15 --poll-interval=1800
+    --listen-address 127.0.0.1 --port 9111 --poll-interval=86400 \
+    --fleet-cache-file=/cache/fleet.json
 curl -s localhost:9111/metrics
 curl -s localhost:9111/healthz
 ```
 
 Options: `--api-key-env` (default `OPENEA_API_KEY`) and `--api-key-file` (mutually
-exclusive), `--top` (default 10, 0 for all), `--poll-interval` (default 3600s),
-`--lookback-hours` (36), `--max-sample-age` (129600s = 36h),
-`--drop-idle-hours` (36, 0 disables rotation), `--watchlist-per-cycle` (0),
-`--fleet-refresh-interval` (86400s), `--fleet-cache-file`, `--liveness-file`,
-`--reading-cache-file`, `--poll-window-hours` (2),
+exclusive), `--poll-interval` (default 86400s),
+`--fleet-refresh-interval` (default 86400s), `--fleet-cache-file`,
 `--include-undispatched`,
 `--listen-address`, `--port` (9111), `--timeout`, `--retries` (3),
 `--retry-budget` (6s), `--once`, `-v`.
@@ -883,67 +485,45 @@ The key is read from the environment or a file, **never from argv**, so it canno
 land in the process table, in shell history, or in a `docker inspect` command
 line. Do not add a `--api-key` flag to "make it easier".
 
-Three files are written to `--fleet-cache-file`'s volume, and they are not the same
-kind of thing. `fleet.json` is a *fallback*: it is only read when the API cannot
-be reached. `liveness.json` is *state*, and is read on every start.
-`readings.json` is an *anchor buffer* — it is read on every start and is what
-makes a narrow request window safe (see above), so omitting
-`--reading-cache-file` reverts every request to the full `--lookback-hours`.
-
-The *fleet* disk cache is a fallback, not a second source of truth: it is only
-read when the API cannot be reached, and its `cached_at` stamp is carried over as
-the refresh time so a stale cache is replaced as soon as the API answers.
-`liveness.json` deliberately holds no readings. `readings.json` does, and that is
-the one place this exporter knowingly gives up the refusal the other two make —
-bounded, timestamped and reported, as set out under `--reading-cache-file` above.
+`--fleet-cache-file` writes `fleet.json` atomically after every clean poll. In
+this exporter it is a *fallback*: it is only read when the API cannot be reached,
+and its `cached_at` stamp is carried over as the refresh time so a stale cache is
+replaced as soon as the API answers. **Its on-disk shape
+(`{"cached_at", "data": [...]}`, the raw unfiltered facilities JSON) is a shared
+interface**: the AEMO exporter reads the same file directly and needs every
+unit's fueltech and region, so it must not be narrowed to battery rows or
+re-shaped.
 
 ### Tests
 
 ```bash
-python3 -m unittest discover -s scrapers -t scrapers    # all four, 726 tests
-./scrapers/test_oe_battery_exporter.py                  # 338 tests, this one only
+python3 -m unittest discover -s scrapers -t scrapers    # all exporters
+./scrapers/test_oe_battery_exporter.py                  # this one only
 ```
 
 **No network access** — the fleet metadata, a real Eraring storage response, an
 empty response and a PII-redacted `/me` are replayed from `scrapers/fixtures/`,
-captured verbatim from the API on 2026-09-30.
+captured verbatim from the API on 2026-09-30. (The retired per-facility fixtures
+remain on disk but are no longer read.)
 
 The regressions worth naming, because each is a quiet failure:
 
 - **The 403 User-Agent rejection** raising `AuthError` rather than a generic
   scrape error, and HTTP 401/403 never being retried.
 - **`capacity_storage` being a *unit* field, not a facility field** — reading it
-  off the facility yields no denominator at all and silently drops every SOC.
-- **The three-series trap** — G1 and L1 counted, never summed into the SOC.
-- **A committed/unreported facility counting as a fleet *observation***, which
-  would push Eraring, Waratah and Orana out of the selected set to make room for
-  batteries that publish nothing.
+  off the facility yields no denominator and silently drops every capacity row.
+- **A committed/unreported facility counting as a fleet *observation*** — the
+  largest units in the country are unbuilt, so the numeric series must gate on
+  `data_last_seen` while the info metric must *not*.
 - **A stale cache pinning the fleet forever** — the cache is a fallback, and the
   daily metadata refresh has to still happen once a file exists.
-- **A null newest sample being reported as a SOC of 0** rather than omitted.
-- **WEM routed as NEM**, which returns a 404 that looks exactly like an empty
-  battery.
-- **One shared timestamp for two feeds.** Energy and power are hours apart; a
-  single clock would date a 7-hour-old SOC as current.
-- **The second metric costing a second request** — `power` has to ride along in
-  the same call, not be fetched on its own.
-- **A multi-unit facility double-sampled** when both units' series are present
-  in one response: the sample must be attributed to the row's own unit, not
-  concatenated across the block.
-- **A power block arriving with a unit the metadata did not declare** — checked
-  and warned, not silently accepted, so a change upstream is visible.
-- **A sample older than the feed's daily gap being dropped**, so a dead feed
-  loses its series instead of repeating a day-old reading as if it were current.
+- **The `/facilities/` request being fueltech-filtered**, which would silently
+  strip the non-battery rows the AEMO exporter reads from the same cache.
+- **WEM metadata losing its `network` label**, which the shared cache relies on.
 - **A 429/5xx transient being retried inside the time budget, and a 404 not
   being retried at all** — an absent facility is an answer, not a fault.
-- **Demoting on a count of empty polls instead of the age of the last reading.**
-  The feed only publishes ~18:00–04:00, so a poll in the late afternoon returns
-  nothing *new* while the battery is perfectly healthy. Counting empty polls
-  rotates the entire scope every afternoon; measuring reading age does not.
-- **A unit that recovers only being re-admitted a cycle late** — the probe runs
-  after the scope is chosen, so the exposition reports the scope that was
-  actually polled. Correct, and asserted as such.
-
+- **A retired family creeping back into the exposition** — pinned by a
+  `RETIRED_METRICS` list, because a stale duplicate is worse than a gap.
 ## AEMO reported battery energy storage exporter
 
 Two feeds from AEMO's NEMWEB archive, both free and anonymous, exposing

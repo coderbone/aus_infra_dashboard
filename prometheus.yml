@@ -36,8 +36,12 @@ scrape_configs:
     # changes a few times a year, refreshed at most once a day by its own poll
     # loop. 1h is plenty to keep the value current and the target's freshness
     # visible (`time() - oe_last_poll_timestamp_seconds`) without scraping a
-    # static dataset every five minutes.
-    scrape_interval: 1h
+    # static dataset every five minutes... however, we want samples every 5
+    # minutes so the values here work nicely in expressions that are sampled
+    # more frequently, so this scraper only hits the OE server once per hour
+    # and then keeps reporting the same values every 5 minutes until the next
+    # hour.
+    scrape_interval: 5m
     scrape_timeout: 30s
     metrics_path: /metrics
     static_configs:

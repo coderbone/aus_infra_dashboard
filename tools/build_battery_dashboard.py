@@ -34,6 +34,7 @@ INSTANT = "last_over_time(%s[2h])"
 # OE per-unit panels (whose metrics all carry `region`) filter in one place.
 REGION = 'region=~"$region"'
 SEL = 'name=~"$battery",%s' % REGION
+OE_META_WINDOW = "2h"
 
 # AEMO per-unit metrics carry only `duid`; the OE capacity gauge carries the
 # display labels keyed by the same code under `unit`. `label_replace` copies
@@ -42,8 +43,8 @@ SEL = 'name=~"$battery",%s' % REGION
 # battery use the `FLEET_*` form below instead. Verified against the live
 # datasource 2026-10-20.
 CAP_JOIN_DUID = (
-    'label_replace(oe_battery_capacity_storage_mwh{%s}, "duid", "$1", "unit", "(.*)")'
-    % SEL
+    'label_replace(last_over_time(oe_battery_capacity_storage_mwh{%s}[%s]), "duid", "$1", "unit", "(.*)")'
+    % (SEL, OE_META_WINDOW)
 )
 # Value-preserving form: capacity / capacity is 1 with the same labels, so
 # multiplying imports them without touching the value. (There is no metric
@@ -56,9 +57,10 @@ CAP_JOIN_ONE = "(%s / %s)" % (CAP_JOIN_DUID, CAP_JOIN_DUID)
 # so the join reaches every unit in the fleet metadata. Used
 # by the panels that are meant to show every battery AEMO publishes.
 FLEET_CAP_JOIN_DUID = (
-    'label_replace(oe_battery_fleet_capacity_storage_mwh{%s}, '
-    '"duid", "$1", "unit", "(.*)")' % SEL
+    'label_replace(last_over_time(oe_battery_fleet_capacity_storage_mwh{%s}[%s]), '
+    '"duid", "$1", "unit", "(.*)")' % (SEL, OE_META_WINDOW)
 )
+FLEET_INFO_STICKY = "last_over_time(oe_battery_fleet_info{%s}[%s])" % (REGION, OE_META_WINDOW)
 FLEET_CAP_JOIN_ONE = "(%s / %s)" % (FLEET_CAP_JOIN_DUID, FLEET_CAP_JOIN_DUID)
 
 
@@ -105,9 +107,10 @@ def unit_labels_fleet(expr):
     """Whole-fleet `unit_labels`: same labels, but joined through the fleet
     capacity gauge, so every unit AEMO publishes is included rather than just
     the twelve the OE exporter polls."""
-    return "%s * on(duid) group_left(name, region, facility, status) %s" % (
+    return "%s * on(duid) group_left(name, region, facility, status) (%s / %s)" % (
         expr,
-        FLEET_CAP_JOIN_ONE,
+        FLEET_CAP_JOIN_DUID,
+        FLEET_CAP_JOIN_DUID,
     )
 
 
@@ -156,7 +159,7 @@ def fast_chargers_not_nearly_full():
         "(aemo_battery_inferred_stored_mwh < on(duid) (0.99 * "
         "label_replace(max by (unit) (oe_battery_fleet_capacity_storage_mwh), "
         "\"duid\", \"$1\", \"unit\", \"(.*)\"))) "
-        "and on(duid) oe_battery_fleet_info{%s})" % REGION
+        "and on(duid) %s)" % FLEET_INFO_STICKY
     )
 
 
@@ -728,8 +731,8 @@ panels.append(
     stat(
         "Age of oldest reading",
         {"h": 4, "w": 6, "x": 12, "y": 9},
-        "max(aemo_battery_inferred_age_seconds and on(duid) oe_battery_fleet_info{%s})"
-        % REGION,
+        "max(aemo_battery_inferred_age_seconds and on(duid) %s)"
+        % FLEET_INFO_STICKY,
         "The oldest sample behind any SOC number on this board, across the "
         "selected regions. Both the SOC integration and the power measurement "
         "ride the same 5-minute `Dispatch_SCADA` feed, so this should sit near "
@@ -890,7 +893,8 @@ panels.append(
         {"h": 9, "w": 12, "x": 0, "y": 25},
         [
             target(
-                unit_labels_fleet("(aemo_battery_inferred_stored_mwh / 1000)"),
+                "(aemo_battery_inferred_stored_mwh / 1000) * on(duid) group_left(name, region, facility, status) label_replace(last_over_time(oe_battery_fleet_capacity_storage_mwh{name=~\"$battery\",region=~\"$region\"}[%s]), \"duid\", \"$1\", \"unit\", \"(.*)\")"
+                % OE_META_WINDOW,
                 instant=False,
                 legend="{{facility}}",
             )
@@ -922,41 +926,6 @@ panels.append(
 
 panels.append(
     timeseries(
-        "Sample age",
-        {"h": 9, "w": 12, "x": 12, "y": 25},
-        [
-            target(
-                unit_labels("aemo_battery_inferred_age_seconds"),
-                refid="A",
-                instant=False,
-                legend="{{name}} (SOC)",
-            ),
-            target(
-                unit_labels("aemo_battery_power_age_seconds"),
-                refid="B",
-                instant=False,
-                legend="{{name}} (power)",
-            ),
-        ],
-        "How old the sample behind each value is, for both AEMO series on one "
-        "axis - the honest companion to the panels above. Both ride the same "
-        "5-minute `Dispatch_SCADA` feed, so both should sit near zero and "
-        "reset every interval; either climbing past ~15 minutes means the "
-        "intraday feed stalled and the panels above are showing the last good "
-        "state rather than the current one. The **SOC** line integrates the "
-        "power (its timestamp is the interval the estimate covers); the "
-        "**power** line is the measurement itself. They track each other "
-        "closely in normal operation, and a split between them - power fresh, "
-        "SOC ageing - means the integration stopped even though measurements "
-        "keep arriving (no anchor, or a gap past the bridge limit).",
-        axis="age",
-        decimals=0,
-        span_nulls=False,
-    )
-)
-
-panels.append(
-    timeseries(
         "API credits remaining",
         {"h": 8, "w": 8, "x": 0, "y": 34},
         [target("oe_api_credits_remaining", instant=False, legend="credits left")],
@@ -970,38 +939,6 @@ panels.append(
     )
 )
 
-panels.append(
-    timeseries(
-        "API requests against the daily bucket",
-        {"h": 8, "w": 8, "x": 8, "y": 34},
-        [
-            target(
-                "sum(increase(oe_api_requests_total{job=\"openelectricity_battery\"}[1d]))",
-                refid="A",
-                instant=False,
-                legend="requests in the last 24h",
-            ),
-            target("vector(366)", refid="B", instant=False, legend="daily bucket ceiling, 366"),
-        ],
-        "Requests issued in the trailing 24h against the API's own 366/day bucket "
-        "- the real limit, and it binds long before the 500 daily credits run out. "
-        "Metadata-only polling is one `/facilities/` request plus a free `/me` read "
-        "per cycle, so steady state is a small handful a day against the ceiling. "
-        "Failed requests count too - the exporter increments the counter when a "
-        "request is issued, not when it succeeds - and a restart resets it, which "
-        "`increase` accounts for.",
-        axis="requests",
-        decimals=0,
-        span_nulls=False,
-        step="linear",
-        overrides=[
-            override(
-                by_frame("B"),
-                ["custom.fillOpacity", ("custom.lineWidth", 1), ("color", {"fixedColor": "text", "mode": "fixed"})],
-            )
-        ],
-    )
-)
 
 # --- AEMO Next_Day_Dispatch panels ---------------------------------------- #
 #
@@ -1019,8 +956,7 @@ panels.append(
         {"h": 11, "w": 24, "x": 0, "y": 42},
         [
             target(
-                "aemo_battery_power_mw and on(duid) oe_battery_fleet_info{%s}"
-                % REGION,
+                "aemo_battery_power_mw and on(duid) %s" % FLEET_INFO_STICKY,
                 instant=False,
                 legend="{{duid}}",
             )
@@ -1094,7 +1030,7 @@ panels.append(
                 "100 * aemo_battery_inferred_stored_mwh / on(duid) "
                 "label_replace(max by (unit) (oe_battery_fleet_capacity_storage_mwh), "
                 "\"duid\", \"$1\", \"unit\", \"(.*)\") "
-                "and on(duid) oe_battery_fleet_info{%s}" % REGION,
+                "and on(duid) %s" % FLEET_INFO_STICKY,
                 instant=False,
                 legend="{{duid}}",
             )
@@ -1292,16 +1228,16 @@ panels.append(
                 "label_replace(max by (unit) (oe_battery_fleet_capacity_storage_mwh), "
                 "\"duid\", \"$1\", \"unit\", \"(.*)\") "
                 "and on(duid) topk(12, aemo_battery_power_mw and on(duid) "
-                "oe_battery_fleet_info{%s}) "
-                "and on(duid) (aemo_battery_power_mw > 0)" % REGION,
+                "%s) "
+                "and on(duid) (aemo_battery_power_mw > 0)" % FLEET_INFO_STICKY,
                 instant=True,
                 legend="{{duid}}",
             ),
             target(
                 project_soc_1h(
                     "topk(12, aemo_battery_power_mw and on(duid) "
-                    "oe_battery_fleet_info{%s}) "
-                    "and on(duid) (aemo_battery_power_mw > 0)" % REGION
+                    "%s) "
+                    "and on(duid) (aemo_battery_power_mw > 0)" % FLEET_INFO_STICKY
                 ),
                 refid="B",
                 instant=True,

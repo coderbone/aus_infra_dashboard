@@ -19,6 +19,13 @@
 # of 2026-10 an AEMO dispatch duid (e.g. TB3B1, Tasmania) with no OE
 # facility in the fleet metadata will silently drop; that is the flag for
 # `oe_battery_fleet_info` to learn about the unit.
+#
+# The OE fleet metadata is near-constant (registered capacity, region, status)
+# and, since 2026-10-21, the OE exporter is polled hourly rather than every
+# 5m. A bare `aemo_battery_power_mw * on(duid) oe_battery_fleet_info` would
+# therefore emit a result only at the hourly OE scrape instants, collapsing
+# every AEMO-derived panel from 5-minute to hourly resolution. `last_over_time(oe_battery_fleet_info[2h])`
+# carries the last-seen metadata forward to every evaluation step instead.
 groups:
   - name: aemo_battery_region
     rules:
@@ -26,7 +33,7 @@ groups:
         expr: |-
           aemo_battery_power_mw
             * on(duid) group_left(region)
-              oe_battery_fleet_info
+              last_over_time(oe_battery_fleet_info[2h])
 
   # Peak stored energy per unit, used by the web map to show how much of a
   # commissioning battery has actually been energised (peak stored MWh divided

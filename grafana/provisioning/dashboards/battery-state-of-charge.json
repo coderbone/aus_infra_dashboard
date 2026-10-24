@@ -247,7 +247,7 @@
           },
           "editorMode": "code",
           "exemplar": false,
-          "expr": "max(aemo_battery_inferred_age_seconds and on(duid) oe_battery_fleet_info{region=~\"$region\"})",
+          "expr": "max(aemo_battery_inferred_age_seconds and on(duid) last_over_time(oe_battery_fleet_info{region=~\"$region\"}[2h]))",
           "instant": true,
           "legendFormat": "{{name}}",
           "range": false,
@@ -406,7 +406,7 @@
           },
           "editorMode": "code",
           "exemplar": false,
-          "expr": "100 * last_over_time(aemo_battery_inferred_stored_mwh[2h]) / on(duid) group_left(name, region, facility, status, unit) label_replace(oe_battery_fleet_capacity_storage_mwh{name=~\"$battery\",region=~\"$region\"}, \"duid\", \"$1\", \"unit\", \"(.*)\")",
+          "expr": "100 * last_over_time(aemo_battery_inferred_stored_mwh[2h]) / on(duid) group_left(name, region, facility, status, unit) label_replace(last_over_time(oe_battery_fleet_capacity_storage_mwh{name=~\"$battery\",region=~\"$region\"}[2h]), \"duid\", \"$1\", \"unit\", \"(.*)\")",
           "instant": true,
           "legendFormat": "{{name}}",
           "range": false,
@@ -662,7 +662,7 @@
           },
           "editorMode": "code",
           "exemplar": false,
-          "expr": "label_replace(max by (unit) (100 * aemo_battery_inferred_stored_mwh / on(duid) group_left(name, region, facility, status, unit) label_replace(oe_battery_fleet_capacity_storage_mwh{name=~\"$battery\",region=~\"$region\"}, \"duid\", \"$1\", \"unit\", \"(.*)\")), \"__name__\", \"SOC_pct\", \"\", \"\")",
+          "expr": "label_replace(max by (unit) (100 * aemo_battery_inferred_stored_mwh / on(duid) group_left(name, region, facility, status, unit) label_replace(last_over_time(oe_battery_fleet_capacity_storage_mwh{name=~\"$battery\",region=~\"$region\"}[2h]), \"duid\", \"$1\", \"unit\", \"(.*)\")), \"__name__\", \"SOC_pct\", \"\", \"\")",
           "format": "table",
           "instant": true,
           "legendFormat": "",
@@ -676,7 +676,7 @@
           },
           "editorMode": "code",
           "exemplar": false,
-          "expr": "label_replace(max by (unit) (aemo_battery_inferred_stored_mwh * on(duid) group_left(unit) (label_replace(oe_battery_fleet_capacity_storage_mwh{name=~\"$battery\",region=~\"$region\"}, \"duid\", \"$1\", \"unit\", \"(.*)\") / label_replace(oe_battery_fleet_capacity_storage_mwh{name=~\"$battery\",region=~\"$region\"}, \"duid\", \"$1\", \"unit\", \"(.*)\"))), \"__name__\", \"Stored_MWh\", \"\", \"\")",
+          "expr": "label_replace(max by (unit) (aemo_battery_inferred_stored_mwh * on(duid) group_left(unit) (label_replace(last_over_time(oe_battery_fleet_capacity_storage_mwh{name=~\"$battery\",region=~\"$region\"}[2h]), \"duid\", \"$1\", \"unit\", \"(.*)\") / label_replace(last_over_time(oe_battery_fleet_capacity_storage_mwh{name=~\"$battery\",region=~\"$region\"}[2h]), \"duid\", \"$1\", \"unit\", \"(.*)\"))), \"__name__\", \"Stored_MWh\", \"\", \"\")",
           "format": "table",
           "instant": true,
           "legendFormat": "",
@@ -690,7 +690,7 @@
           },
           "editorMode": "code",
           "exemplar": false,
-          "expr": "label_replace(1000 * max by (unit) (aemo_battery_inferred_timestamp_seconds * on(duid) group_left(unit) (label_replace(oe_battery_fleet_capacity_storage_mwh{name=~\"$battery\",region=~\"$region\"}, \"duid\", \"$1\", \"unit\", \"(.*)\") / label_replace(oe_battery_fleet_capacity_storage_mwh{name=~\"$battery\",region=~\"$region\"}, \"duid\", \"$1\", \"unit\", \"(.*)\"))), \"__name__\", \"Sampled_at\", \"\", \"\")",
+          "expr": "label_replace(1000 * max by (unit) (aemo_battery_inferred_timestamp_seconds * on(duid) group_left(unit) (label_replace(last_over_time(oe_battery_fleet_capacity_storage_mwh{name=~\"$battery\",region=~\"$region\"}[2h]), \"duid\", \"$1\", \"unit\", \"(.*)\") / label_replace(last_over_time(oe_battery_fleet_capacity_storage_mwh{name=~\"$battery\",region=~\"$region\"}[2h]), \"duid\", \"$1\", \"unit\", \"(.*)\"))), \"__name__\", \"Sampled_at\", \"\", \"\")",
           "format": "table",
           "instant": true,
           "legendFormat": "",
@@ -704,7 +704,7 @@
           },
           "editorMode": "code",
           "exemplar": false,
-          "expr": "label_replace(max by (unit) (aemo_battery_inferred_age_seconds * on(duid) group_left(unit) (label_replace(oe_battery_fleet_capacity_storage_mwh{name=~\"$battery\",region=~\"$region\"}, \"duid\", \"$1\", \"unit\", \"(.*)\") / label_replace(oe_battery_fleet_capacity_storage_mwh{name=~\"$battery\",region=~\"$region\"}, \"duid\", \"$1\", \"unit\", \"(.*)\"))), \"__name__\", \"Sample_age\", \"\", \"\")",
+          "expr": "label_replace(max by (unit) (aemo_battery_inferred_age_seconds * on(duid) group_left(unit) (label_replace(last_over_time(oe_battery_fleet_capacity_storage_mwh{name=~\"$battery\",region=~\"$region\"}[2h]), \"duid\", \"$1\", \"unit\", \"(.*)\") / label_replace(last_over_time(oe_battery_fleet_capacity_storage_mwh{name=~\"$battery\",region=~\"$region\"}[2h]), \"duid\", \"$1\", \"unit\", \"(.*)\"))), \"__name__\", \"Sample_age\", \"\", \"\")",
           "format": "table",
           "instant": true,
           "legendFormat": "",
@@ -851,7 +851,7 @@
           },
           "editorMode": "code",
           "exemplar": false,
-          "expr": "(aemo_battery_inferred_stored_mwh / 1000) * on(duid) group_left(name, region, facility, status) (label_replace(oe_battery_fleet_capacity_storage_mwh{name=~\"$battery\",region=~\"$region\"}, \"duid\", \"$1\", \"unit\", \"(.*)\") / label_replace(oe_battery_fleet_capacity_storage_mwh{name=~\"$battery\",region=~\"$region\"}, \"duid\", \"$1\", \"unit\", \"(.*)\"))",
+          "expr": "(aemo_battery_inferred_stored_mwh / 1000) * on(duid) group_left(name, region, facility, status) label_replace(last_over_time(oe_battery_fleet_capacity_storage_mwh{name=~\"$battery\",region=~\"$region\"}[2h]), \"duid\", \"$1\", \"unit\", \"(.*)\")",
           "instant": false,
           "legendFormat": "{{facility}}",
           "range": true,
@@ -859,114 +859,6 @@
         }
       ],
       "title": "Energy stored, GWh",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "PBFA97CFB590B2093"
-      },
-      "description": "How old the sample behind each value is, for both AEMO series on one axis - the honest companion to the panels above. Both ride the same 5-minute `Dispatch_SCADA` feed, so both should sit near zero and reset every interval; either climbing past ~15 minutes means the intraday feed stalled and the panels above are showing the last good state rather than the current one. The **SOC** line integrates the power (its timestamp is the interval the estimate covers); the **power** line is the measurement itself. They track each other closely in normal operation, and a split between them - power fresh, SOC ageing - means the integration stopped even though measurements keep arriving (no anchor, or a gap past the bridge limit).",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "age",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 0,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "stepAfter",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "showValues": false,
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "decimals": 0,
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "text",
-                "value": 0
-              }
-            ]
-          }
-        }
-      },
-      "gridPos": {
-        "h": 9,
-        "w": 12,
-        "x": 12,
-        "y": 25
-      },
-      "id": 9,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "multi",
-          "sort": "none"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "PBFA97CFB590B2093"
-          },
-          "editorMode": "code",
-          "exemplar": false,
-          "expr": "aemo_battery_inferred_age_seconds * on(duid) group_left(name, region, facility, status) (label_replace(oe_battery_capacity_storage_mwh{name=~\"$battery\",region=~\"$region\"}, \"duid\", \"$1\", \"unit\", \"(.*)\") / label_replace(oe_battery_capacity_storage_mwh{name=~\"$battery\",region=~\"$region\"}, \"duid\", \"$1\", \"unit\", \"(.*)\"))",
-          "instant": false,
-          "legendFormat": "{{name}} (SOC)",
-          "range": true,
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "PBFA97CFB590B2093"
-          },
-          "editorMode": "code",
-          "exemplar": false,
-          "expr": "aemo_battery_power_age_seconds * on(duid) group_left(name, region, facility, status) (label_replace(oe_battery_capacity_storage_mwh{name=~\"$battery\",region=~\"$region\"}, \"duid\", \"$1\", \"unit\", \"(.*)\") / label_replace(oe_battery_capacity_storage_mwh{name=~\"$battery\",region=~\"$region\"}, \"duid\", \"$1\", \"unit\", \"(.*)\"))",
-          "instant": false,
-          "legendFormat": "{{name}} (power)",
-          "range": true,
-          "refId": "B"
-        }
-      ],
-      "title": "Sample age",
       "type": "timeseries"
     },
     {
@@ -1032,7 +924,7 @@
         "x": 0,
         "y": 34
       },
-      "id": 10,
+      "id": 9,
       "options": {
         "legend": {
           "calcs": [],
@@ -1062,141 +954,6 @@
         }
       ],
       "title": "API credits remaining",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "PBFA97CFB590B2093"
-      },
-      "description": "Requests issued in the trailing 24h against the API's own 366/day bucket - the real limit, and it binds long before the 500 daily credits run out. Metadata-only polling is one `/facilities/` request plus a free `/me` read per cycle, so steady state is a small handful a day against the ceiling. Failed requests count too - the exporter increments the counter when a request is issued, not when it succeeds - and a restart resets it, which `increase` accounts for.",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "requests",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 0,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "showValues": false,
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "decimals": 0,
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "text",
-                "value": 0
-              }
-            ]
-          }
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byFrameRefID",
-              "options": "B"
-            },
-            "properties": [
-              {
-                "id": "custom.fillOpacity",
-                "value": {
-                  "fixed": 0
-                }
-              },
-              {
-                "id": "custom.lineWidth",
-                "value": 1
-              },
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "text",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          }
-        ]
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 8,
-        "y": 34
-      },
-      "id": 11,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "multi",
-          "sort": "none"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "PBFA97CFB590B2093"
-          },
-          "editorMode": "code",
-          "exemplar": false,
-          "expr": "sum(increase(oe_api_requests_total{job=\"openelectricity_battery\"}[1d]))",
-          "instant": false,
-          "legendFormat": "requests in the last 24h",
-          "range": true,
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "PBFA97CFB590B2093"
-          },
-          "editorMode": "code",
-          "exemplar": false,
-          "expr": "vector(366)",
-          "instant": false,
-          "legendFormat": "daily bucket ceiling, 366",
-          "range": true,
-          "refId": "B"
-        }
-      ],
-      "title": "API requests against the daily bucket",
       "type": "timeseries"
     },
     {
@@ -1263,7 +1020,7 @@
         "x": 0,
         "y": 42
       },
-      "id": 12,
+      "id": 10,
       "options": {
         "legend": {
           "calcs": [],
@@ -1285,7 +1042,7 @@
           },
           "editorMode": "code",
           "exemplar": false,
-          "expr": "aemo_battery_power_mw and on(duid) oe_battery_fleet_info{region=~\"$region\"}",
+          "expr": "aemo_battery_power_mw and on(duid) last_over_time(oe_battery_fleet_info{region=~\"$region\"}[2h])",
           "instant": false,
           "legendFormat": "{{duid}}",
           "range": true,
@@ -1359,7 +1116,7 @@
         "x": 0,
         "y": 53
       },
-      "id": 13,
+      "id": 11,
       "options": {
         "legend": {
           "calcs": [],
@@ -1455,7 +1212,7 @@
         "x": 0,
         "y": 64
       },
-      "id": 14,
+      "id": 12,
       "options": {
         "legend": {
           "calcs": [],
@@ -1477,7 +1234,7 @@
           },
           "editorMode": "code",
           "exemplar": false,
-          "expr": "100 * aemo_battery_inferred_stored_mwh / on(duid) label_replace(max by (unit) (oe_battery_fleet_capacity_storage_mwh), \"duid\", \"$1\", \"unit\", \"(.*)\") and on(duid) oe_battery_fleet_info{region=~\"$region\"}",
+          "expr": "100 * aemo_battery_inferred_stored_mwh / on(duid) label_replace(max by (unit) (oe_battery_fleet_capacity_storage_mwh), \"duid\", \"$1\", \"unit\", \"(.*)\") and on(duid) last_over_time(oe_battery_fleet_info{region=~\"$region\"}[2h])",
           "instant": false,
           "legendFormat": "{{duid}}",
           "range": true,
@@ -1551,7 +1308,7 @@
         "x": 0,
         "y": 74
       },
-      "id": 15,
+      "id": 13,
       "options": {
         "legend": {
           "calcs": [],
@@ -1660,7 +1417,7 @@
         "x": 0,
         "y": 83
       },
-      "id": 16,
+      "id": 14,
       "options": {
         "legend": {
           "calcs": [],
@@ -1732,7 +1489,7 @@
         "x": 0,
         "y": 92
       },
-      "id": 17,
+      "id": 15,
       "options": {
         "barShape": "flat",
         "barWidthFactor": 0.54,
@@ -1851,7 +1608,7 @@
         "x": 0,
         "y": 101
       },
-      "id": 18,
+      "id": 16,
       "options": {
         "legend": {
           "calcs": [],
@@ -1940,7 +1697,7 @@
         "x": 0,
         "y": 110
       },
-      "id": 19,
+      "id": 17,
       "options": {
         "barShape": "flat",
         "barWidthFactor": 0.54,
@@ -1985,7 +1742,7 @@
           },
           "editorMode": "code",
           "exemplar": false,
-          "expr": "100 * aemo_battery_inferred_stored_mwh / on(duid) label_replace(max by (unit) (oe_battery_fleet_capacity_storage_mwh), \"duid\", \"$1\", \"unit\", \"(.*)\") and on(duid) topk(12, -aemo_battery_power_mw and on(duid) (aemo_battery_power_mw < -1) and on(duid) (aemo_battery_inferred_stored_mwh < on(duid) (0.99 * label_replace(max by (unit) (oe_battery_fleet_capacity_storage_mwh), \"duid\", \"$1\", \"unit\", \"(.*)\"))) and on(duid) oe_battery_fleet_info{region=~\"$region\"})",
+          "expr": "100 * aemo_battery_inferred_stored_mwh / on(duid) label_replace(max by (unit) (oe_battery_fleet_capacity_storage_mwh), \"duid\", \"$1\", \"unit\", \"(.*)\") and on(duid) topk(12, -aemo_battery_power_mw and on(duid) (aemo_battery_power_mw < -1) and on(duid) (aemo_battery_inferred_stored_mwh < on(duid) (0.99 * label_replace(max by (unit) (oe_battery_fleet_capacity_storage_mwh), \"duid\", \"$1\", \"unit\", \"(.*)\"))) and on(duid) last_over_time(oe_battery_fleet_info{region=~\"$region\"}[2h]))",
           "instant": true,
           "legendFormat": "{{duid}}",
           "range": false,
@@ -1998,7 +1755,7 @@
           },
           "editorMode": "code",
           "exemplar": false,
-          "expr": "clamp_min(clamp_max(100 * (aemo_battery_inferred_stored_mwh - aemo_battery_power_mw) / on(duid) label_replace(max by (unit) (oe_battery_fleet_capacity_storage_mwh), \"duid\", \"$1\", \"unit\", \"(.*)\"), 100), 0) and on(duid) topk(12, -aemo_battery_power_mw and on(duid) (aemo_battery_power_mw < -1) and on(duid) (aemo_battery_inferred_stored_mwh < on(duid) (0.99 * label_replace(max by (unit) (oe_battery_fleet_capacity_storage_mwh), \"duid\", \"$1\", \"unit\", \"(.*)\"))) and on(duid) oe_battery_fleet_info{region=~\"$region\"})",
+          "expr": "clamp_min(clamp_max(100 * (aemo_battery_inferred_stored_mwh - aemo_battery_power_mw) / on(duid) label_replace(max by (unit) (oe_battery_fleet_capacity_storage_mwh), \"duid\", \"$1\", \"unit\", \"(.*)\"), 100), 0) and on(duid) topk(12, -aemo_battery_power_mw and on(duid) (aemo_battery_power_mw < -1) and on(duid) (aemo_battery_inferred_stored_mwh < on(duid) (0.99 * label_replace(max by (unit) (oe_battery_fleet_capacity_storage_mwh), \"duid\", \"$1\", \"unit\", \"(.*)\"))) and on(duid) last_over_time(oe_battery_fleet_info{region=~\"$region\"}[2h]))",
           "instant": true,
           "legendFormat": "{{duid}} (1h)",
           "range": false,
@@ -2065,7 +1822,7 @@
         "x": 0,
         "y": 119
       },
-      "id": 20,
+      "id": 18,
       "options": {
         "barShape": "flat",
         "barWidthFactor": 0.54,
@@ -2110,7 +1867,7 @@
           },
           "editorMode": "code",
           "exemplar": false,
-          "expr": "100 * aemo_battery_inferred_stored_mwh / on(duid) label_replace(max by (unit) (oe_battery_fleet_capacity_storage_mwh), \"duid\", \"$1\", \"unit\", \"(.*)\") and on(duid) topk(12, aemo_battery_power_mw and on(duid) oe_battery_fleet_info{region=~\"$region\"}) and on(duid) (aemo_battery_power_mw > 0)",
+          "expr": "100 * aemo_battery_inferred_stored_mwh / on(duid) label_replace(max by (unit) (oe_battery_fleet_capacity_storage_mwh), \"duid\", \"$1\", \"unit\", \"(.*)\") and on(duid) topk(12, aemo_battery_power_mw and on(duid) last_over_time(oe_battery_fleet_info{region=~\"$region\"}[2h])) and on(duid) (aemo_battery_power_mw > 0)",
           "instant": true,
           "legendFormat": "{{duid}}",
           "range": false,
@@ -2123,7 +1880,7 @@
           },
           "editorMode": "code",
           "exemplar": false,
-          "expr": "clamp_min(clamp_max(100 * (aemo_battery_inferred_stored_mwh - aemo_battery_power_mw) / on(duid) label_replace(max by (unit) (oe_battery_fleet_capacity_storage_mwh), \"duid\", \"$1\", \"unit\", \"(.*)\"), 100), 0) and on(duid) topk(12, aemo_battery_power_mw and on(duid) oe_battery_fleet_info{region=~\"$region\"}) and on(duid) (aemo_battery_power_mw > 0)",
+          "expr": "clamp_min(clamp_max(100 * (aemo_battery_inferred_stored_mwh - aemo_battery_power_mw) / on(duid) label_replace(max by (unit) (oe_battery_fleet_capacity_storage_mwh), \"duid\", \"$1\", \"unit\", \"(.*)\"), 100), 0) and on(duid) topk(12, aemo_battery_power_mw and on(duid) last_over_time(oe_battery_fleet_info{region=~\"$region\"}[2h])) and on(duid) (aemo_battery_power_mw > 0)",
           "instant": true,
           "legendFormat": "{{duid}} (1h)",
           "range": false,

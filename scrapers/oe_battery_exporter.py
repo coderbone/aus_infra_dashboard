@@ -139,8 +139,11 @@ INCLUDED_STATUSES = ("operating", "commissioning")
 DEFAULT_POLL_INTERVAL = 24 * 3600.0
 
 # Metadata is essentially static - capacity changes a few times a year - so
-# re-reading `/facilities/` more often than daily buys nothing.
+# re-reading `/facilities/` more often than daily buys nothing. Prometheus now
+# scrapes every 5m, so the exporter must re-serve the cached metadata on every
+# scrape while only hitting the OE API approximately once per hour.
 DEFAULT_FLEET_REFRESH_INTERVAL = 24 * 3600.0
+HOURLY_REFRESH_INTERVAL = 3600.0
 
 # The /me credit read is free, but there is no reason to make it more than once
 # per poll.
@@ -657,10 +660,17 @@ class BatteryScraper:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._health = (True, "no poll completed yet")
+        # Prometheus now scrapes every 5m; only hit the OE API ~once per hour,
+        # re-serving cached metadata between real refreshes.
+        self._last_api_refresh = 0.0
+        self._api_refresh_interval = HOURLY_REFRESH_INTERVAL
+        # Keep the last successful API responses to re-serve between refreshes.
+        self._last_facilities: list[dict] | None = None
+        self._last_credits = None
 
     # -- fleet -------------------------------------------------------------- #
 
-    def load_fleet(self) -> list[dict]:
+    def load_fleet(self, force: bool = False) -> list[dict]:
         """Re-read the fleet metadata, at most once per refresh interval.
 
         The metadata is essentially static - capacity does not change - so
@@ -676,7 +686,7 @@ class BatteryScraper:
         now = self.now_fn()
         with self._lock:
             fresh = self._fleet and (now - self._fleet_at) < self.fleet_refresh_interval
-        if fresh:
+        if fresh and not force:
             return self._fleet
         try:
             facilities = self.client.facilities()
@@ -703,6 +713,7 @@ class BatteryScraper:
             # rows cannot describe. Both row shapes are computed from the same
             # facilities response so they can never disagree.
             self._fleet_meta = unit_rows(facilities, require_data=False)
+            self._last_facilities = facilities
         return rows
 
     def cached_fleet(self) -> tuple[list[dict], list[dict], float] | None:
@@ -730,11 +741,24 @@ class BatteryScraper:
         started = time.monotonic()
         errors: list[str] = []
         rows: list[dict] = []
+        now = self.now_fn()
+        with self._lock:
+            fleet_ready = bool(self._fleet) and (now - self._fleet_at) < self.fleet_refresh_interval
+            need_api_refresh = (now - self._last_api_refresh) >= self._api_refresh_interval
+
         try:
-            rows = self.load_fleet()
-            # /me is free and non-fatal; read it after the metadata so a failed
-            # metadata fetch does not also spend the credit read.
-            credits = self.client.credits_remaining()
+            if need_api_refresh or not fleet_ready:
+                rows = self.load_fleet(force=True)
+                credits = self.client.credits_remaining()
+                with self._lock:
+                    self._last_api_refresh = now
+                    self._last_credits = credits
+            else:
+                # No API call - re-serve cached metadata every 5m scrape.
+                with self._lock:
+                    rows = self._fleet
+                    self._fleet_meta = self._fleet_meta
+                    credits = self._last_credits
         except AuthError as exc:
             log.error("authentication rejected: %s", exc)
             with self._lock:

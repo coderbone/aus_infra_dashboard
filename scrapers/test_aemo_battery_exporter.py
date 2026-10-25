@@ -1386,7 +1386,7 @@ class RenderIntradayTest(unittest.TestCase):
         text = exporter.render_intraday(self.scada, True, self.isr, False, 1.5, self.now)
         self.assertIn("aemo_battery_dispatchis_success 0", text)
         self.assertNotIn("aemo_battery_region_stored_mwh", text)
-        self.assertIn('aemo_battery_power_mw{duid="ERB01"}', text)
+        self.assertIn('aemo_battery_power_mw{unit="",duid="ERB01"}', text)
 
     def test_reports_info_carries_the_processed_files(self):
         text = self.text()
@@ -1573,12 +1573,12 @@ class IntradayPollerTest(unittest.TestCase):
             l for l in body.splitlines() if l.startswith("aemo_battery_power_mw{")
         ]
         self.assertEqual(len(battery_lines), 3)
-        self.assertIn('aemo_battery_power_mw{duid="ERB01"} -120.0092', body)
+        self.assertIn('aemo_battery_power_mw{unit="",duid="ERB01"} -120.0092', body)
         # The legacy battery series stays filtered to storage; the unit series
         # carries every dispatch unit in the SCADA file, DPNTB1 included.
-        self.assertNotIn('aemo_battery_power_mw{duid="DPNTB1"', body)
-        self.assertIn('aemo_unit_power_mw{duid="DPNTB1"', body)
-        self.assertIn('aemo_unit_power_mw{duid="ERB01"', body)
+        self.assertNotIn('aemo_battery_power_mw{unit="",duid="DPNTB1"', body)
+        self.assertIn('aemo_unit_power_mw{unit="",duid="DPNTB1"', body)
+        self.assertIn('aemo_unit_power_mw{unit="",duid="ERB01"', body)
         self.assertIn("aemo_unit_power_units 4", body)
         self.assertIn('aemo_battery_region_stored_mwh{region="NSW1"}', body)
         self.assertIn("aemo_battery_scada_success 1", body)
@@ -1613,7 +1613,7 @@ class IntradayPollerTest(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(self.zip_fetches(fetcher), 0)
         self.assertGreaterEqual(len(fetcher.fetches), 2)  # both listings re-read
-        self.assertIn('aemo_battery_power_mw{duid="WTAHB1"}', body)
+        self.assertIn('aemo_battery_power_mw{unit="",duid="WTAHB1"}', body)
 
     def test_a_publisher_advance_downloads_the_new_file(self):
         newer = "PUBLIC_DISPATCHSCADA_202610081525_0000000541813358.zip"
@@ -1639,7 +1639,7 @@ class IntradayPollerTest(unittest.TestCase):
             if "/Dispatch_SCADA/" in url and url.endswith(".zip")
         )
         self.assertEqual(scada_downloads, 2)
-        self.assertIn('aemo_battery_power_mw{duid="ERB01"} 5', body)
+        self.assertIn('aemo_battery_power_mw{unit="",duid="ERB01"} 5', body)
 
     def test_a_failed_scada_read_keeps_regions_but_drops_power(self):
         fetcher = self.battery_fetcher()
@@ -1658,7 +1658,7 @@ class IntradayPollerTest(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("aemo_battery_dispatchis_success 0", body)
         self.assertNotIn("aemo_battery_region_stored_mwh", body)
-        self.assertIn('aemo_battery_power_mw{duid="ERB01"}', body)
+        self.assertIn('aemo_battery_power_mw{unit="",duid="ERB01"}', body)
 
     def test_a_zip_without_the_interconnector_table_keeps_regions(self):
         # The DISPATCH,INTERCONNECTORRES table can be missing or unparsable
@@ -1681,7 +1681,7 @@ class IntradayPollerTest(unittest.TestCase):
             poller.poll_once()
             body, ok = poller.exposition()
         self.assertTrue(ok)
-        self.assertIn('aemo_battery_power_mw{duid="WTAHB1"}', body)
+        self.assertIn('aemo_battery_power_mw{unit="",duid="WTAHB1"}', body)
         self.assertIn("aemo_battery_scada_success 1", body)
 
     # -- fossil generation (region = OE fleet metadata) --------------------- #
@@ -1839,26 +1839,26 @@ class IntradayPollerTest(unittest.TestCase):
             )
         self.assertTrue(ok)
         self.assertIn(
-            'aemo_unit_power_mw{duid="BW01",fueltech="coal_black",region="NSW1"} 500', body
+            'aemo_unit_power_mw{unit="BW01",duid="BW01",fueltech="coal_black",region="NSW1"} 500', body
         )
         self.assertIn(
-            'aemo_unit_power_mw{duid="MACARTH1",fueltech="wind",region="NSW1"} 210.5', body
+            'aemo_unit_power_mw{unit="MACARTH1",duid="MACARTH1",fueltech="wind",region="NSW1"} 210.5', body
         )
         self.assertIn(
-            'aemo_unit_power_mw{duid="SUNSHINE1",fueltech="solar_utility",region="VIC1"} 88', body
+            'aemo_unit_power_mw{unit="SUNSHINE1",duid="SUNSHINE1",fueltech="solar_utility",region="VIC1"} 88', body
         )
         self.assertIn(
-            'aemo_unit_power_mw{duid="TUMUT3",fueltech="hydro",region="NSW1"} 120', body
+            'aemo_unit_power_mw{unit="TUMUT3",duid="TUMUT3",fueltech="hydro",region="NSW1"} 120', body
         )
         # Pumps are loads: the negative value is carried verbatim.
         self.assertIn(
-            'aemo_unit_power_mw{duid="MURRAY1",fueltech="pumps",region="VIC1"} -45', body
+            'aemo_unit_power_mw{unit="MURRAY1",duid="MURRAY1",fueltech="pumps",region="VIC1"} -45', body
         )
         # The new series is a superset: the storage unit is present too.
-        self.assertIn('aemo_unit_power_mw{duid="WTAHB1",fueltech="battery",region="NSW1"}', body)
+        self.assertIn('aemo_unit_power_mw{unit="WTAHB1",duid="WTAHB1",fueltech="battery",region="NSW1"}', body)
         self.assertIn("aemo_unit_power_units 7", body)
         # A unit absent from the cache still appears, with empty labels.
-        self.assertIn('aemo_unit_power_mw{duid="UNKNOWN1",fueltech="",region=""} 7', body)
+        self.assertIn('aemo_unit_power_mw{unit="",duid="UNKNOWN1",fueltech="",region=""} 7', body)
 
     def test_unit_power_omitted_when_the_scada_read_fails(self):
         fetcher = IntradayFetcher(
@@ -1881,7 +1881,7 @@ class IntradayPollerTest(unittest.TestCase):
                 poller.poll_once()
                 body, ok = poller.poll_once()
         self.assertTrue(ok)
-        self.assertIn('aemo_unit_power_mw{duid="BW01",fueltech="coal_black",region="NSW1"} 500', body)
+        self.assertIn('aemo_unit_power_mw{unit="BW01",duid="BW01",fueltech="coal_black",region="NSW1"} 500', body)
 
 
 # --------------------------------------------------------------------------- #
@@ -1972,7 +1972,7 @@ class HandlerTest(unittest.TestCase):
             server.server_close()
             thread.join(timeout=5.0)
         self.assertIn("aemo_battery_scada_success 1", body)
-        self.assertIn('aemo_battery_power_mw{duid="ERB01"}', body)
+        self.assertIn('aemo_battery_power_mw{unit="",duid="ERB01"}', body)
         self.assertIn("aemo_battery_report_info{", body)  # the daily side is still served
 
 
@@ -2063,7 +2063,7 @@ class InferenceTest(unittest.TestCase):
         }
         now = NOW + 40000.0
         text = exporter.render_intraday(scada, True, isr, True, 1.5, now, infer, True)
-        self.assertIn("aemo_battery_inferred_stored_mwh{duid=\"ERB01\"} 128.5", text)
+        self.assertIn("aemo_battery_inferred_stored_mwh{unit=\"\",duid=\"ERB01\"} 128.5", text)
         self.assertIn("aemo_battery_inferred_units 2", text)
         self.assertIn("aemo_battery_infer_success 1", text)
         self.assertIn("aemo_battery_infer_charge_efficiency 0.9", text)
@@ -2192,7 +2192,7 @@ class InferenceTest(unittest.TestCase):
     def test_an_aliased_duid_resolves_to_its_fleet_capacity(self):
         """AEMO and OpenElectricity do not always spell a unit's name alike.
 
-        AEMO calls the Torrens BESS 3 unit `TB3B1`; the fleet calls it
+        AEMO calls the Tailem Bend 3 unit `TB3B1`; the fleet calls it
         `TBBESS3B1`. A DUID-keyed lookup that knew only the fleet's spelling
         found nothing, so that unit had no registered capacity - and without a
         capacity the 100% top clamp on its inferred stored energy cannot hold it
@@ -2239,8 +2239,8 @@ class InferenceTest(unittest.TestCase):
         }
         now = NOW + 40000.0
         text = exporter.render_intraday(scada, True, isr, True, 1.5, now, infer, True)
-        self.assertIn('aemo_battery_inferred_clamped{duid="ERB01"} 1', text)
-        self.assertIn('aemo_battery_inferred_clamped{duid="LIMBESS1"} 0', text)
+        self.assertIn('aemo_battery_inferred_clamped{unit="",duid="ERB01"} 1', text)
+        self.assertIn('aemo_battery_inferred_clamped{unit="",duid="LIMBESS1"} 0', text)
         self.assertIn("aemo_battery_inferred_clamped_units 1", text)
         self.assertIn(
             "# HELP aemo_battery_inferred_clamped Whether the raw SCADA-", text
@@ -2418,8 +2418,8 @@ class InferenceBackfillTest(unittest.TestCase):
         v = poller._infer_view(ts_1205 + 300.0)
         self.assertIn("ERB01", v["units"])
         self.assertNotIn("LIMBESS1", v["units"])
-        self.assertIn("aemo_battery_inferred_stored_mwh{duid=\"ERB01\"}", body)
-        self.assertNotIn("aemo_battery_inferred_stored_mwh{duid=\"LIMBESS1\"}", body)
+        self.assertIn("aemo_battery_inferred_stored_mwh{unit=\"\",duid=\"ERB01\"}", body)
+        self.assertNotIn("aemo_battery_inferred_stored_mwh{unit=\"\",duid=\"LIMBESS1\"}", body)
 
     def test_backfill_runs_once_per_anchor(self):
         fetcher = self.archive([self.A1000, self.A1100, self.A1200])

@@ -58,25 +58,34 @@ LIVE_QUERIES = {
         # families it used to export were retired 2026-10-20 once AEMO coverage
         # (below) was verified a superset, so capacity is the only OE series here.
         "capacity_mwh": {"expr": "oe_battery_capacity_storage_mwh", "key": "unit"},
-        # whole-fleet live coverage from the AEMO exporter's per-duid estimates
-        "inf_stored_mwh": {"expr": "aemo_battery_inferred_stored_mwh", "key": "duid"},
-        "inf_age_s": {"expr": "aemo_battery_inferred_age_seconds", "key": "duid"},
-        "inf_timestamp": {"expr": "aemo_battery_inferred_timestamp_seconds", "key": "duid"},
+        # whole-fleet live coverage from the AEMO exporter's per-unit estimates
+        "inf_stored_mwh": {"expr": "aemo_battery_inferred_stored_mwh", "key": "unit"},
+        "inf_age_s": {"expr": "aemo_battery_inferred_age_seconds", "key": "unit"},
+        "inf_timestamp": {"expr": "aemo_battery_inferred_timestamp_seconds", "key": "unit"},
         # peak stored energy over the commissioning window (recording rule), used
         # to shade a commissioning facility's progress arc
-        "peak_stored_mwh": {"expr": "aemo_battery_peak_stored_mwh", "key": "duid"},
+        "peak_stored_mwh": {"expr": "aemo_battery_peak_stored_mwh", "key": "unit"},
         # fresh 5-min SCADA power from AEMO
-        "aemo_power_mw": {"expr": "aemo_battery_power_mw", "key": "duid"},
-        "aemo_power_age_s": {"expr": "aemo_battery_power_age_seconds", "key": "duid"},
-        "aemo_power_ts": {"expr": "aemo_battery_power_timestamp_seconds", "key": "duid"},
+        "aemo_power_mw": {"expr": "aemo_battery_power_mw", "key": "unit"},
+        "aemo_power_age_s": {"expr": "aemo_battery_power_age_seconds", "key": "unit"},
+        "aemo_power_ts": {"expr": "aemo_battery_power_timestamp_seconds", "key": "unit"},
     },
     # Every dispatch unit (generators, loads, storage) with its live measured MW
-    # and fueltech/region labels, keyed by DUID. This is what lets the map shade
+    # and fueltech/region labels. This is what lets the map shade
     # each wind/solar marker by its own generation instead of a region estimate.
+    #
+    # Every field in both per-unit groups is keyed by `unit`, the fleet unit
+    # code, rather than by `duid` - the AEMO spelling. The front end looks
+    # these groups up by the unit code it has from the fleet, and AEMO and
+    # OpenElectricity spell a handful of units differently (AEMO's `TB3B1` is
+    # the fleet's `TBBESS3B1`), so a `duid` key left that unit with no power
+    # and no state of charge. Keying everything the same way also collapses
+    # two label namespaces into one. Units with no fleet row carry an empty
+    # `unit` and so never match a lookup. See docs/adr/0001.
     "units": {
-        "power_mw": {"expr": "aemo_unit_power_mw", "key": "duid"},
-        "age_s": {"expr": "aemo_unit_power_age_seconds", "key": "duid"},
-        "timestamp": {"expr": "aemo_unit_power_timestamp_seconds", "key": "duid"},
+        "power_mw": {"expr": "aemo_unit_power_mw", "key": "unit"},
+        "age_s": {"expr": "aemo_unit_power_age_seconds", "key": "unit"},
+        "timestamp": {"expr": "aemo_unit_power_timestamp_seconds", "key": "unit"},
     },
     # Snowy Hydro reservoir levels, reported per reservoir label by the
     # reservoir-exporter (compose runs it with --all-reservoirs). Wrapped in

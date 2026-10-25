@@ -27,7 +27,7 @@ The dispatch unit identifier: `aemo_battery_power_mw{duid=…}`.
 
 **Unit code**:
 OpenElectricity's identifier for a unit. Usually the same string as the AEMO
-DUID, but not always — the Torrens BESS 3 unit is `TBBESS3B1` in
+DUID, but not always — the Tailem Bend 3 unit is `TBBESS3B1` in
 OpenElectricity and `TB3B1` in AEMO.
 _Avoid_: DUID (a different identifier, even when the strings match)
 

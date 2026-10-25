@@ -506,7 +506,7 @@ class PublishedLabelsMatchModuleTest(unittest.TestCase):
                 parsed = dict(
                     re.findall(r'(\w+)="((?:[^"\\]|\\.)*)"', match.group(1))
                 )
-                labels[parsed["duid"]] = parsed
+                labels[parsed["unit"]] = parsed
         return labels
 
     def module_battery_units(self) -> dict:

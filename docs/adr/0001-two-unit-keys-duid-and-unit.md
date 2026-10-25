@@ -4,8 +4,8 @@ A unit in the NEM has two identifiers, and this stack was publishing both under
 one label. `duid` meant AEMO's dispatch unit id on the AEMO exporter's series
 and OpenElectricity's unit code on `oe_battery_fleet_info`. The `on(duid)` join
 between them worked only because the two strings happened to be equal for 67 of
-the 68 dispatching units. They are not always equal: AEMO calls the Torrens
-BESS 3 unit `TB3B1`, OpenElectricity calls it `TBBESS3B1`, so that unit
+the 68 dispatching units. They are not always equal: AEMO calls the Tailem
+Bend 3 unit `TB3B1`, OpenElectricity calls it `TBBESS3B1`, so that unit
 silently lost its region, its fueltech and its registered capacity.
 
 We publish both keys explicitly: `duid` always means AEMO's dispatch unit

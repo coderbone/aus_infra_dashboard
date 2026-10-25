@@ -443,21 +443,27 @@ def label_set(sample: dict) -> str:
 def info_set(row: dict) -> str:
     """Label set for `oe_battery_fleet_info`.
 
-    The battery's own code is published under `duid` here (rather than the
-    `unit` the other series use) because that is the identifier AEMO dispatch
-    series join to: `aemo_battery_power_mw` and friends carry `duid`, so a
-    `group_left(region) oe_battery_fleet_info` needs the same name on both
-    sides. The capacity figures ride as label strings - that is what an info
-    metric is for - and a missing figure (registered MW on an old metadata
-    row) renders as an empty value rather than `NaN`.
+    `unit` is the fleet unit code: the identifier this stack joins on, and the
+    one the AEMO exporter now publishes as well.
+
+    `duid` carries the same value during the transition. AEMO dispatch series
+    call the key `duid`, so the recording rule and the dashboards keep joining
+    on that name until they have moved across to `unit`; it is dropped from
+    this metric once they have. See docs/adr/0001 for why the two are distinct
+    identifiers even though they are equal for all but a handful of units.
+
+    The capacity figures ride as label strings - that is what an info metric is
+    for - and a missing figure (registered MW on an old metadata row) renders as
+    an empty value rather than `NaN`.
     """
     capacity_mwh = row.get("capacity_mwh")
     registered_mw = row.get("registered_mw")
     return (
-        'duid="%s",facility="%s",facility_name="%s",region="%s",'
+        'unit="%s",duid="%s",facility="%s",facility_name="%s",region="%s",'
         'network="%s",status="%s",capacity_storage_mwh="%s",'
         'capacity_registered_mw="%s",data_last_seen="%s"'
         % (
+            escape_label(row.get("unit", "")),
             escape_label(row.get("unit", "")),
             escape_label(row.get("facility", "")),
             escape_label(row.get("facility_name", "")),
@@ -510,12 +516,14 @@ def render(state: dict, now: float) -> str:
     if fleet_meta:
         lines.append(
             "# HELP oe_battery_fleet_info Registration metadata for a NEM/WEM "
-            "battery unit. Value is always 1; the unit lives in the labels: duid, "
-            "facility, facility_name, region, network, status, storage capacity in "
+            "battery unit. Value is always 1; the unit lives in the labels: "
+            "unit (the fleet unit code, and duid alongside it while the "
+            "consumers join on that name), facility, facility_name, region, "
+            "network, status, storage capacity in "
             "MWh and registered capacity in MW (both as label strings, suitable "
             "for display and filtering), and the date the unit was last seen on "
             "the data endpoint, empty for units that have never published. Covers "
-            "the whole fleet including committed, never-built units, so a duid "
+            "the whole fleet including committed, never-built units, so a unit "
             "appears here whenever the metadata knows it, dispatched or not."
         )
         lines.append("# TYPE oe_battery_fleet_info gauge")

@@ -1460,9 +1460,13 @@ def render_intraday(
     so existing dashboards keep their exact semantics while consumers migrate.
     """
     lines: list[str] = []
+    # `unit` is the fleet unit code for this DUID, empty when the fleet does not
+    # name it. It rides on every per-unit series so consumers can join on the
+    # fleet's own identifier rather than on AEMO's spelling of it - see
+    # docs/adr/0001 and fleet.UNIT_ALIASES.
+    meta = unit_meta or {}
     all_units = scada.get("all_units") or {}
     if all_units and scada_ok:
-        meta = unit_meta or {}
         lines += [
             "# HELP aemo_unit_power_mw Measured output at the newest interval, "
             "MW, for every dispatch unit in Dispatch_SCADA "
@@ -1473,17 +1477,18 @@ def render_intraday(
             u = all_units[duid]
             m = meta.get(duid) or {}
             lines += [
-                'aemo_unit_power_mw{duid="%s",fueltech="%s",region="%s"} %s'
+                'aemo_unit_power_mw{unit="%s",duid="%s",fueltech="%s",region="%s"} %s'
                 % (
+                    escape_label(m.get("unit") or ""),
                     escape_label(duid),
                     escape_label(m.get("fueltech") or ""),
                     escape_label(m.get("region") or ""),
                     fmt(u["scada"]),
                 ),
-                'aemo_unit_power_timestamp_seconds{duid="%s"} %s'
-                % (escape_label(duid), fmt(u["ts"])),
-                'aemo_unit_power_age_seconds{duid="%s"} %s'
-                % (escape_label(duid), fmt(now - u["ts"])),
+                'aemo_unit_power_timestamp_seconds{unit="%s",duid="%s"} %s'
+                % (escape_label(m.get("unit") or ""), escape_label(duid), fmt(u["ts"])),
+                'aemo_unit_power_age_seconds{unit="%s",duid="%s"} %s'
+                % (escape_label(m.get("unit") or ""), escape_label(duid), fmt(now - u["ts"])),
             ]
         lines += [
             "# HELP aemo_unit_power_report_info Processed Dispatch_SCADA file.",
@@ -1512,12 +1517,14 @@ def render_intraday(
         ]
         for duid in sorted(units):
             u = units[duid]
+            m = meta.get(duid) or {}
             lines += [
-                'aemo_battery_power_mw{duid="%s"} %s' % (escape_label(duid), fmt(u["scada"])),
-                'aemo_battery_power_timestamp_seconds{duid="%s"} %s'
-                % (escape_label(duid), fmt(u["ts"])),
-                'aemo_battery_power_age_seconds{duid="%s"} %s'
-                % (escape_label(duid), fmt(now - u["ts"])),
+                'aemo_battery_power_mw{unit="%s",duid="%s"} %s'
+                % (escape_label(m.get("unit") or ""), escape_label(duid), fmt(u["scada"])),
+                'aemo_battery_power_timestamp_seconds{unit="%s",duid="%s"} %s'
+                % (escape_label(m.get("unit") or ""), escape_label(duid), fmt(u["ts"])),
+                'aemo_battery_power_age_seconds{unit="%s",duid="%s"} %s'
+                % (escape_label(m.get("unit") or ""), escape_label(duid), fmt(now - u["ts"])),
             ]
         lines += [
             "# HELP aemo_battery_power_report_info Processed Dispatch_SCADA file.",
@@ -1835,15 +1842,15 @@ def render_intraday(
         ]
         for duid in sorted(infer_units):
             u = infer_units[duid]
+            m = meta.get(duid) or {}
+            unit = escape_label(m.get("unit") or "")
+            key = 'unit="%s",duid="%s"' % (unit, escape_label(duid))
             lines += [
-                'aemo_battery_inferred_stored_mwh{duid="%s"} %s'
-                % (escape_label(duid), fmt(u["mwh"])),
-                'aemo_battery_inferred_clamped{duid="%s"} %s'
-                % (escape_label(duid), fmt(u.get("clamped", 0.0))),
-                'aemo_battery_inferred_timestamp_seconds{duid="%s"} %s'
-                % (escape_label(duid), fmt(u["ts"])),
-                'aemo_battery_inferred_age_seconds{duid="%s"} %s'
-                % (escape_label(duid), fmt(now - u["ts"])),
+                'aemo_battery_inferred_stored_mwh{%s} %s' % (key, fmt(u["mwh"])),
+                'aemo_battery_inferred_clamped{%s} %s'
+                % (key, fmt(u.get("clamped", 0.0))),
+                'aemo_battery_inferred_timestamp_seconds{%s} %s' % (key, fmt(u["ts"])),
+                'aemo_battery_inferred_age_seconds{%s} %s' % (key, fmt(now - u["ts"])),
             ]
         lines += [
             "# HELP aemo_battery_inferred_units Inferred units being served.",
@@ -2741,7 +2748,11 @@ class IntradayPoller:
             if unit.is_fossil and unit.region
         }
         unit_meta: dict[str, dict] = {
-            unit.code: {"fueltech": unit.fueltech, "region": unit.region}
+            unit.code: {
+                "fueltech": unit.fueltech,
+                "region": unit.region,
+                "unit": unit.code,
+            }
             for unit in fl.units
         }
         # Index the same facts under AEMO's dispatch unit id where the two

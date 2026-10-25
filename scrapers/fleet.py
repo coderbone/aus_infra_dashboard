@@ -73,8 +73,9 @@ FOSSIL_CATEGORIES: frozenset[str] = frozenset({"coal", "gas", "distillate"})
 PUMPED_DESC_RE = re.compile(r"pumped|pump[- ]?storage", re.IGNORECASE)
 
 # AEMO dispatch unit id -> OpenElectricity unit code, for the units where the
-# two disagree. The only known case is the Torrens BESS 3 unit: AEMO abbreviates
-# the facility code, OpenElectricity does not, so `TB3B1` and `TBBESS3B1` name
+# two disagree. The only known case is the Tailem Bend 3 unit: AEMO abbreviates
+# the facility code (`TB3`), OpenElectricity does not (`TBBESS3`), so `TB3B1`
+# and `TBBESS3B1` name
 # the same unit and a string-equality join silently drops it - it lost its
 # region, its fueltech and its registered capacity, and therefore the 100% top
 # clamp on its inferred stored energy.

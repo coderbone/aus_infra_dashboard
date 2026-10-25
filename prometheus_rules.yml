@@ -5,24 +5,37 @@
 # without restating a join in every expression.
 #
 # Why a join rather than a region label on the AEMO exporter: its source
-# (`Dispatch_SCADA`) carries no per-duid region - region only appears
+# (`Dispatch_SCADA`) carries no per-unit region - region only appears
 # aggregated in `REGIONSUM` - so the exporter would need a maintained
-# duid->region table. The OpenElectricity exporter already publishes one per
-# fleet battery: `oe_battery_fleet_info{duid, region, ...}`, an always-1 info
+# unit->region table. The OpenElectricity exporter already publishes one per
+# fleet battery: `oe_battery_fleet_info{unit, region, ...}`, an always-1 info
 # metric covering the *whole* battery fleet metadata (committed units
 # included). PromQL's join operator is `*`, but the info metric already sits
 # at 1, so no value-pinning is needed - `aemo_battery_power_mw` routes through
 # unchanged and `group_left(region)` just renames the carrier.
 #
-# Units with no OE metadata carry no region and drop out of any region
-# grouping - same "OE fleet qualifies" scoping the dashboards already use. As
-# of 2026-10 an AEMO dispatch duid with no OE
-# facility in the fleet metadata will silently drop; that is the flag for
-# `oe_battery_fleet_info` to learn about the unit.
+# The join key is `unit`, the fleet unit code, on both sides - not `duid`.
+# AEMO and OpenElectricity spell a handful of units differently (AEMO's
+# `TB3B1` is the fleet's `TBBESS3B1`), and a `duid` join silently dropped
+# those units from every region panel. The fleet module owns that mapping
+# (fleet.UNIT_ALIASES), and the AEMO exporter publishes the resolved `unit`
+# label so this rule does not have to. See docs/adr/0001.
+#
+# Units with no fleet row carry an empty `unit` and drop out of any region
+# grouping - same "OE fleet qualifies" scoping the dashboards already use. That
+# is no longer silent: the AEMO exporter publishes
+# `aemo_battery_fleet_metadata_missing` for each storage unit in that position,
+# so a unit that vanishes from every region panel reports itself.
+#
+# `unit!=""` on the selector is a guard against rows that predate the label:
+# `last_over_time` looks back two hours, so a series published before `unit`
+# existed is still reachable and would collide with every other such row inside
+# the match group, failing the whole rule. It also states the intent - a row
+# the fleet does not name has nothing to contribute here.
 #
 # The OE fleet metadata is near-constant (registered capacity, region, status)
 # and, since 2026-10-21, the OE exporter is polled hourly rather than every
-# 5m. A bare `aemo_battery_power_mw * on(duid) oe_battery_fleet_info` would
+# 5m. A bare `aemo_battery_power_mw * on(unit) oe_battery_fleet_info` would
 # therefore emit a result only at the hourly OE scrape instants, collapsing
 # every AEMO-derived panel from 5-minute to hourly resolution. `last_over_time(oe_battery_fleet_info[2h])`
 # carries the last-seen metadata forward to every evaluation step instead.
@@ -32,8 +45,8 @@ groups:
       - record: aemo_battery_power_mw_region
         expr: |-
           aemo_battery_power_mw
-            * on(duid) group_left(region)
-              last_over_time(oe_battery_fleet_info[2h])
+            * on(unit) group_left(region)
+              last_over_time(oe_battery_fleet_info{unit!=""}[2h])
 
   # Peak stored energy per unit, used by the web map to show how much of a
   # commissioning battery has actually been energised (peak stored MWh divided

@@ -314,7 +314,7 @@ class RenderTest(unittest.TestCase):
         operating = lines[0]
         self.assertTrue(operating.endswith(" 1"), operating)
         for label in (
-            'duid="ERB01"', 'facility="ERB"', 'facility_name="Eraring"',
+            'unit="ERB01"', 'facility="ERB"', 'facility_name="Eraring"',
             'region="NSW1"', 'network="NEM"', 'status="operating"',
         ):
             self.assertIn(label, operating)
@@ -324,7 +324,7 @@ class RenderTest(unittest.TestCase):
 
         # Missing figures render as empty label values, never as "NaN" text.
         committed = lines[1]
-        self.assertIn('duid="GRPYDS1"', committed)
+        self.assertIn('unit="GRPYDS1"', committed)
         self.assertIn('status="committed"', committed)
         self.assertIn('capacity_registered_mw=""', committed)
         self.assertIn('data_last_seen=""}', committed)
@@ -647,7 +647,7 @@ class ScraperTest(unittest.TestCase):
         for line in infos:
             self.assertTrue(line.endswith(" 1"), line)
 
-        baranduda = next(l for l in infos if 'duid="BARANDUDAB1"' in l)
+        baranduda = next(l for l in infos if 'unit="BARANDUDAB1"' in l)
         # A committed, never-dispatched unit: region-classified metadata, but
         # no data_last_seen.
         self.assertIn('region="VIC1"', baranduda)

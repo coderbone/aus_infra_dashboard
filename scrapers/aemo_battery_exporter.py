@@ -290,6 +290,8 @@ import zipfile
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import fleet
+
 DEFAULT_DATA_URL = "https://nemweb.com.au/Reports/Current/Next_Day_Dispatch/"
 SCADA_DATA_URL = "https://nemweb.com.au/Reports/Current/Dispatch_SCADA/"
 DISPATCHIS_DATA_URL = "https://nemweb.com.au/Reports/Current/DispatchIS_Reports/"
@@ -374,23 +376,11 @@ DEFAULT_RETRY_BUDGET = 30.0
 # pinned offset is exact here, not an approximation.
 AEST_UTC_OFFSET_SECONDS = 10 * 3600
 
-# OpenElectricity `fueltech_id` values counted as fossil for the per-region
-# fossil generation series: coal, gas and distillate. Bioenergy and hydro are
-# deliberately excluded. OpenElectricity is the fuel/region source because AEMO
-# publishes no per-region fuel breakdown - Dispatch_SCADA carries measured MW
-# but only a DUID - so each measured unit is attributed with this map.
-FOSSIL_FUELTECHS = frozenset(
-    {
-        "coal_black",
-        "coal_brown",
-        "gas_ccgt",
-        "gas_ocgt",
-        "gas_steam",
-        "gas_recip",
-        "gas_wcmg",
-        "distillate",
-    }
-)
+# OpenElectricity is the fuel/region source for every per-region attribution in
+# this exporter: AEMO publishes no per-region fuel breakdown (Dispatch_SCADA
+# carries measured MW but only a DUID), so which units are fossil generation
+# comes from the fleet module's `is_fossil` predicate rather than a local set.
+# See fleet.FOSSIL_CATEGORIES.
 
 # The DispatchIS REGIONSUM columns carrying, per region, the self-forecast
 # (`UIGF`) and dispatch-cleared (`CLEAREDMW`) MW for each variable renewable
@@ -1543,6 +1533,35 @@ def render_intraday(
             "# TYPE aemo_battery_units_with_power gauge",
             "aemo_battery_units_with_power %d" % len(units),
         ]
+
+    # Which dispatch units in the storage set have no fleet row. Without one
+    # they get no fueltech, no region and no registered capacity, so they drop
+    # out of every region grouping and out of the 100% top clamp on their
+    # inferred stored energy - and that used to happen silently.
+    #
+    # Scoped to the storage set rather than every dispatch unit in SCADA: the
+    # aggregate DUIDs AEMO publishes for rooftop PV and distributed generation
+    # are not facilities and will never be in OpenElectricity's fleet, so
+    # counting them would make the baseline permanent instead of zero. Gated on
+    # a non-empty map for the same reason: an empty `unit_meta` means the fleet
+    # cache has not been read yet, not that every unit is missing.
+    fleet_by_duid = unit_meta or {}
+    if units and fleet_by_duid:
+        missing = [duid for duid in sorted(units) if duid not in fleet_by_duid]
+        if missing:
+            lines += [
+                "# HELP aemo_battery_fleet_metadata_missing Dispatch units in "
+                "the storage set with no OpenElectricity fleet row, and "
+                "therefore no fueltech, region or registered capacity. Expected "
+                "to be empty; a DUID listed here is one to add to "
+                "fleet.UNIT_ALIASES or to raise upstream.",
+                "# TYPE aemo_battery_fleet_metadata_missing gauge",
+            ]
+            for duid in missing:
+                lines.append(
+                    'aemo_battery_fleet_metadata_missing{duid="%s"} 1'
+                    % escape_label(duid)
+                )
 
     regions = region_storage.get("regions") or {}
     if regions and region_ok:
@@ -2698,47 +2717,44 @@ class IntradayPoller:
         if not force and now - self._fleet_metadata_last_attempt < 300.0:
             return
         self._fleet_metadata_last_attempt = now
-        try:
-            with open(self.fleet_cache_file, "r", encoding="utf-8") as handle:
-                payload = json.load(handle)
-        except (OSError, ValueError) as exc:
+        fl = fleet.load(self.fleet_cache_file)
+        if fl is None:
             log.warning(
-                "fleet cache %s unreadable (%s); inference is floored at zero "
+                "fleet cache %s unusable; inference is floored at zero "
                 "only and fossil generation is omitted",
-                self.fleet_cache_file, exc,
+                self.fleet_cache_file,
             )
             return
-        data = payload.get("data") if isinstance(payload, dict) else None
-        if not isinstance(data, list):
-            return
-        caps: dict[str, float] = {}
-        fossil_region: dict[str, str] = {}
-        unit_meta: dict[str, dict] = {}
-        for facility in data:
-            if not isinstance(facility, dict):
-                continue
-            region = facility.get("network_region")
-            for unit in facility.get("units") or ():
-                if not isinstance(unit, dict):
-                    continue
-                code = unit.get("code")
-                if not isinstance(code, str):
-                    continue
-                cap = unit.get("capacity_storage")
-                if isinstance(cap, (int, float)) and cap > 0:
-                    caps[code] = float(cap)
-                fueltech = unit.get("fueltech_id")
-                if isinstance(fueltech, str) and isinstance(region, str):
-                    unit_meta[code] = {
-                        "fueltech": fueltech,
-                        "region": region,
-                    }
-                    if fueltech in FOSSIL_FUELTECHS:
-                        fossil_region[code] = region
-                elif isinstance(fueltech, str):
-                    unit_meta[code] = {"fueltech": fueltech, "region": region or ""}
-                elif isinstance(region, str):
-                    unit_meta[code] = {"fueltech": fueltech or "", "region": region}
+        # Three views of the same parsed fleet, each keyed by fleet unit code.
+        # `is_fossil` rather than a local fueltech set: the taxonomy is the
+        # fleet's, and AEMO publishes no per-region fuel breakdown - Dispatch_SCADA
+        # carries measured MW but only a DUID - so every attribution runs through
+        # this map.
+        caps: dict[str, float] = {
+            unit.code: unit.capacity_storage_mwh
+            for unit in fl.units
+            if unit.capacity_storage_mwh is not None
+        }
+        fossil_region: dict[str, str] = {
+            unit.code: unit.region
+            for unit in fl.units
+            if unit.is_fossil and unit.region
+        }
+        unit_meta: dict[str, dict] = {
+            unit.code: {"fueltech": unit.fueltech, "region": unit.region}
+            for unit in fl.units
+        }
+        # Index the same facts under AEMO's dispatch unit id where the two
+        # identifiers disagree, so the lookups below - which are all keyed by
+        # DUID - resolve for every unit rather than all but one. See
+        # fleet.UNIT_ALIASES and docs/adr/0001.
+        for duid, code in fleet.UNIT_ALIASES.items():
+            if code in caps:
+                caps[duid] = caps[code]
+            if code in fossil_region:
+                fossil_region[duid] = fossil_region[code]
+            if code in unit_meta:
+                unit_meta[duid] = unit_meta[code]
         if caps:
             self._fleet_capacity = caps
             log.info(

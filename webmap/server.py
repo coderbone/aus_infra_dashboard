@@ -19,12 +19,15 @@ Stdlib only; runs inside python:3.12-alpine.
 import argparse
 import json
 import os
-import re
 import threading
 import time
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# Mounted from ../scrapers/fleet.py so all three readers of the fleet cache -
+# this server and the two exporters - interpret it one way. See docs/adr/0002.
+import fleet
 
 STATIC_DIR = os.environ.get("WEBMAP_STATIC", os.path.join(os.path.dirname(__file__), "static"))
 DATA_DIR = os.environ.get("WEBMAP_DATA", os.path.join(os.path.dirname(__file__), "data"))
@@ -154,36 +157,22 @@ def build_live(at: float | None = None):
 
 _fleet_cache = {"mtime": None, "data": None}
 
-# OpenNEM has no "pumped hydro" fueltech: pumped stations report `hydro`
-# (+ a sibling `pumps` unit where the load DUID is in the fleet) and their
-# facility description is free text. Classify a facility as pumped storage
-# from any of three independent signals; otherwise draw it as classic hydro.
-_PUMPED_DESC_RE = re.compile(r"pumped|pump[- ]?storage", re.I)
-
-# Thermal generation, split into the two categories the map draws. Coal lumps
-# black and brown together (the popup still breaks the grade down); gas is every
-# gas-fired fueltech. `distillate` and the bioenergy fuels are deliberately not
-# here: they are neither, and folding them in would misreport the capacity.
-_COAL_FUELS = ("coal_black", "coal_brown")
-_GAS_FUELS = ("gas_ccgt", "gas_ocgt", "gas_steam", "gas_recip", "gas_wcmg")
+# What a facility and a unit *are* - its category, whether its capacity counts,
+# whether a scheme is pumped storage - is the fleet module's answer, not this
+# server's. Two decisions about drawing stay here: a point source with no
+# coordinate is dropped rather than pinned to (0, 0), and the solar/wind
+# markers carry the fueltech spelling the front end expects.
 
 
-def _thermal_unit(unit, ft):
-    """A drawable coal/gas unit, or None when it should be skipped. Retired
-    units still carry a registered capacity but produce nothing, so they are
-    excluded - the same rule the hydro bucket uses (e.g. the closed Hazelwood
-    and Callide A blocks must not read as 1 GW of idle coal)."""
-    if (unit.get("status_id") or "") == "retired":
-        return None
-    cap = unit.get("capacity_registered") or unit.get("capacity_maximum")
-    if isinstance(cap, (int, float)) and not isinstance(cap, bool) and cap > 0:
-        return {
-            "code": unit.get("code") or "",
-            "capacity_mw": float(cap),
-            "fueltech_id": ft,
-            "status": unit.get("status_id") or "",
-        }
-    return None
+def _facility_entry(fac: fleet.Facility, units: list, kind: str) -> dict:
+    return {
+        "facility": fac.code,
+        "name": fac.name,
+        "region": fac.region,
+        "location": fac.location,
+        "units": units,
+        "kind": kind,
+    }
 
 
 def build_fleet():
@@ -195,127 +184,82 @@ def build_fleet():
     cached = _fleet_cache
     if cached["mtime"] == mtime:
         return cached["data"]
-    try:
-        with open(path, encoding="utf-8") as fh:
-            raw = json.load(fh).get("data") or []
-    except Exception:  # noqa: BLE001
+    fl = fleet.load(path)
+    if fl is None:
         return []
-    fleet = []
-    renewables = []
-    hydro = []
-    coal = []
-    gas = []
-    distillate = []
-    for facility in raw:
-        if not isinstance(facility, dict):
-            continue
-        units_bat = []
-        units_ren = []
-        units_hyd = []
-        units_coal = []
-        units_gas = []
-        units_distillate = []
-        pumped_hint = False
-        for unit in facility.get("units") or []:
-            if not isinstance(unit, dict):
+    out = {"fleet": [], "renewables": [], "hydro": [],
+           "coal": [], "gas": [], "distillate": []}
+    for fac in fl.facilities:
+        drawn = {"battery": [], "renewable": [], "hydro": [],
+                 "coal": [], "gas": [], "distillate": []}
+        for unit in fac.units:
+            if not unit.counts_toward_capacity:
+                # Retired units keep a registered capacity but produce nothing
+                # (closed Hazelwood must not read as 1 GW of idle coal), and a
+                # battery's charge/discharge siblings re-report the facility's
+                # storage rather than adding to it. `fleet` owns both rules.
                 continue
-            ft = unit.get("fueltech_id") or ""
-            if ft == "battery":
-                capacity = unit.get("capacity_storage")
-                if isinstance(capacity, (int, float)) and not isinstance(capacity, bool) and capacity > 0:
-                    units_bat.append({
-                        "code": unit.get("code") or "",
-                        "capacity_mwh": float(capacity),
-                        "registered_mw": unit.get("capacity_registered"),
-                        "status": unit.get("status_id") or "",
-                        "data_last_seen": unit.get("data_last_seen"),
+            category = unit.category
+            if category == "battery":
+                if unit.capacity_storage_mwh is not None:
+                    drawn["battery"].append({
+                        "code": unit.code,
+                        "capacity_mwh": unit.capacity_storage_mwh,
+                        "registered_mw": unit.capacity_registered_mw,
+                        "status": unit.status,
+                        "data_last_seen": unit.data_last_seen,
                         "fueltech_id": "battery",
                     })
-            elif ft in ("solar", "solar_utility", "wind", "wind_farm"):
-                cap = unit.get("capacity_registered") or unit.get("capacity_maximum")
-                if isinstance(cap, (int, float)) and not isinstance(cap, bool) and cap > 0:
-                    units_ren.append({
-                        "code": unit.get("code") or "",
-                        "capacity_mw": float(cap),
-                        "fueltech_id": ft if ft in ("solar", "solar_utility", "wind") else ("solar" if "solar" in str(ft) else "wind"),
-                        "status": unit.get("status_id") or "",
-                    })
-            elif ft in ("hydro", "pumps"):
-                # pumped-hydro detection runs over every unit (a retired pump
-                # DUID still identifies the scheme); retired units themselves
-                # are dropped from the drawn capacity below.
-                storage = unit.get("capacity_storage")
-                if isinstance(storage, (int, float)) and not isinstance(storage, bool) and storage > 0:
-                    pumped_hint = True
-                if ft == "pumps":
-                    pumped_hint = True
-                if (unit.get("status_id") or "") != "retired":
-                    cap = unit.get("capacity_registered") or unit.get("capacity_maximum")
-                    if isinstance(cap, (int, float)) and not isinstance(cap, bool) and cap > 0:
-                        units_hyd.append({
-                            "code": unit.get("code") or "",
-                            "capacity_mw": float(cap),
-                            "fueltech_id": ft,
-                            "status": unit.get("status_id") or "",
-                        })
-            elif ft in _COAL_FUELS:
-                u = _thermal_unit(unit, ft)
-                if u:
-                    units_coal.append(u)
-            elif ft in _GAS_FUELS:
-                u = _thermal_unit(unit, ft)
-                if u:
-                    units_gas.append(u)
-            elif ft == "distillate":
-                u = _thermal_unit(unit, ft)
-                if u:
-                    units_distillate.append(u)
-        if units_bat:
-            fleet.append({
-                "facility": facility.get("code") or "",
-                "name": facility.get("facility_name") or facility.get("name") or "",
-                "region": facility.get("network_region") or "",
-                "location": facility.get("location"),
-                "units": units_bat,
-                "kind": "battery",
-            })
-        if units_ren:
-            renewables.append({
-                "facility": facility.get("code") or "",
-                "name": facility.get("facility_name") or facility.get("name") or "",
-                "region": facility.get("network_region") or "",
-                "location": facility.get("location"),
-                "units": units_ren,
-                "kind": "renewable",
-            })
-        if units_hyd:
-            loc = facility.get("location")
-            if isinstance(loc, dict) and loc.get("lat") and loc.get("lng"):
-                hydro.append({
-                    "facility": facility.get("code") or "",
-                    "name": facility.get("facility_name") or facility.get("name") or "",
-                    "region": facility.get("network_region") or "",
-                    "location": loc,
-                    "units": units_hyd,
-                    "kind": "hydro",
-                    "pumped": bool(pumped_hint) or bool(_PUMPED_DESC_RE.search(str(facility.get("description") or ""))),
+                continue
+            capacity = unit.capacity_registered_mw or unit.capacity_maximum_mw
+            if capacity is None:
+                continue
+            if category in ("solar", "wind"):
+                drawn["renewable"].append({
+                    "code": unit.code,
+                    "capacity_mw": capacity,
+                    # The front end keys its markers off these spellings, so
+                    # `wind_farm` is drawn as `wind` while `solar_utility`
+                    # keeps the value it already matches on.
+                    "fueltech_id": (unit.fueltech if unit.fueltech in
+                                    ("solar", "solar_utility", "wind") else category),
+                    "status": unit.status,
                 })
-        # Coal and gas are point sources like hydro, so they need a coordinate to
-        # be drawn; a plant missing one is dropped rather than pinned to (0, 0).
-        for bucket, units, kind in ((coal, units_coal, "coal"), (gas, units_gas, "gas"), (distillate, units_distillate, "distillate")):
-            loc = facility.get("location")
-            if units and isinstance(loc, dict) and loc.get("lat") and loc.get("lng"):
-                bucket.append({
-                    "facility": facility.get("code") or "",
-                    "name": facility.get("facility_name") or facility.get("name") or "",
-                    "region": facility.get("network_region") or "",
-                    "location": loc,
-                    "units": units,
-                    "kind": kind,
+            elif category in ("hydro", "pumped hydro"):
+                drawn["hydro"].append({
+                    "code": unit.code,
+                    "capacity_mw": capacity,
+                    "fueltech_id": unit.fueltech,
+                    "status": unit.status,
                 })
+            elif category in ("coal", "gas", "distillate"):
+                drawn[category].append({
+                    "code": unit.code,
+                    "capacity_mw": capacity,
+                    "fueltech_id": unit.fueltech,
+                    "status": unit.status,
+                })
+        if drawn["battery"]:
+            out["fleet"].append(_facility_entry(fac, drawn["battery"], "battery"))
+        if drawn["renewable"]:
+            out["renewables"].append(
+                _facility_entry(fac, drawn["renewable"], "renewable")
+            )
+        # Hydro and the point sources are drawn at a coordinate; a plant
+        # missing one is dropped rather than pinned to (0, 0). Batteries and
+        # renewables are markers that do not need one to be placed.
+        located = bool(
+            fac.location and fac.location.get("lat") and fac.location.get("lng")
+        )
+        if drawn["hydro"] and located:
+            entry = _facility_entry(fac, drawn["hydro"], "hydro")
+            entry["pumped"] = fac.is_pumped
+            out["hydro"].append(entry)
+        for category in ("coal", "gas", "distillate"):
+            if drawn[category] and located:
+                out[category].append(_facility_entry(fac, drawn[category], category))
     _fleet_cache["mtime"] = mtime
-    _fleet_cache["data"] = {"fleet": fleet, "renewables": renewables, "hydro": hydro,
-                            "coal": coal, "gas": gas, "distillate": distillate}
+    _fleet_cache["data"] = out
     return _fleet_cache["data"]
 
 

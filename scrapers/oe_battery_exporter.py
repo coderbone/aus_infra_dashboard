@@ -115,6 +115,8 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import fleet
+
 DEFAULT_API_BASE = "https://api.openelectricity.org.au"
 DEFAULT_NETWORK = "NEM"
 
@@ -127,14 +129,10 @@ USER_AGENT = "aus-infra-dashboard/1.0 (+battery-soc-exporter)"
 # Fueltech this exporter keeps when flattening the (unfiltered) fleet response
 # into battery rows. The API separates a battery into `battery`,
 # `battery_charging` and `battery_discharging`; `battery` is the facility
-# classification and is what carries capacity_storage.
+# classification and is what carries capacity_storage. The siblings are the
+# facility's storage re-reported through its charge and discharge paths, so they
+# are not separate rows - see scrapers/README.md.
 BATTERY_FUELTECH = "battery"
-
-# Statuses worth exporting. `committed` units have not operated yet and
-# `retired` similarly; both are still published in `oe_battery_fleet_info`
-# (the whole point of that metric is to describe units the live feed will never
-# mention), but the numeric capacity series skip them.
-INCLUDED_STATUSES = ("operating", "commissioning")
 
 DEFAULT_POLL_INTERVAL = 24 * 3600.0
 
@@ -151,9 +149,6 @@ DEFAULT_REQUEST_INTERVAL = 0.6
 
 MAX_ERROR_BODY = 200
 RETRY_BASE_DELAY = 0.5
-
-# Statuses from /facilities that are not a usable battery, kept for reporting.
-SKIPPED_STATUSES = ("committed", "retired")
 
 log = logging.getLogger("oe_battery_exporter")
 
@@ -352,12 +347,18 @@ class OpenElectricityClient:
 # --------------------------------------------------------------------------- #
 
 
-def unit_rows(facilities: list[dict], require_data: bool = True) -> list[dict]:
-    """Flatten `/facilities/` into one row per battery unit.
+def unit_rows(fl: "fleet.Fleet | None", require_data: bool = True) -> list[dict]:
+    """One row per battery unit in a parsed fleet.
+
+    What comes from `fleet`: which unit codes are units (a duplicated code is
+    one unit, not two), which facility each belongs to, and its region, network
+    and status. What stays here is which units this exporter publishes and how
+    it labels them - presentation, not fleet knowledge.
 
     `capacity_storage` is a *unit* field, not a facility field, so the capacity
-    has to be looked up per unit code. A facility whose units carry no positive
-    capacity is dropped here rather than emitting a series with no value.
+    has to be looked up per unit. A unit with no positive capacity yields no row
+    rather than a series with no value: there would be no registered capacity to
+    publish for it.
 
     `require_data` drops units with no `data_last_seen`, and it defaults on for
     a reason that is not tidiness. **The largest batteries in the fleet are
@@ -368,45 +369,41 @@ def unit_rows(facilities: list[dict], require_data: bool = True) -> list[dict]:
     has no data to report. The numeric capacity series skip them; the
     whole-fleet info metric does not (callers pass `require_data=False` for
     that), because describing exactly those units is its purpose.
+
+    No status filter: `committed` and `retired` units are published in both
+    shapes, gated only by `require_data` - see scrapers/README.md.
     """
+    if fl is None:
+        return []
     rows: list[dict] = []
-    for facility in facilities or []:
-        if not isinstance(facility, dict):
+    for unit in fl.units:
+        if unit.fueltech != BATTERY_FUELTECH:
             continue
-        for unit in facility.get("units") or []:
-            if not isinstance(unit, dict):
-                continue
-            if unit.get("fueltech_id") != BATTERY_FUELTECH:
-                continue
-            capacity = unit.get("capacity_storage")
-            if not isinstance(capacity, (int, float)) or isinstance(capacity, bool):
-                continue
-            capacity = float(capacity)
-            if capacity <= 0:
-                continue
-            if require_data and not unit.get("data_last_seen"):
-                continue
-            rows.append(
-                {
-                    "facility": facility.get("code") or "",
-                    "facility_name": facility.get("name") or "",
-                    "region": facility.get("network_region") or "",
-                    # The endpoint is per-network, and the fleet spans two. Ten
-                    # of the battery facilities are WEM and querying one of those
-                    # under network_code=NEM returns HTTP 404 - which was masking
-                    # a routing bug, so the network is carried per row from the
-                    # facility metadata rather than assumed.
-                    "network": facility.get("network_id") or DEFAULT_NETWORK,
-                    "unit": unit.get("code") or "",
-                    "status": unit.get("status_id") or "",
-                    "capacity_mwh": capacity,
-                    # Named for what it is, not `power_mw`: `power_mw` is the
-                    # battery's *instantaneous* dispatch power, and the two would
-                    # be silently interchangeable in a name.
-                    "registered_mw": unit.get("capacity_registered"),
-                    "data_last_seen": unit.get("data_last_seen"),
-                }
-            )
+        if unit.capacity_storage_mwh is None:
+            continue
+        if require_data and not unit.data_last_seen:
+            continue
+        rows.append(
+            {
+                "facility": unit.facility,
+                "facility_name": unit.facility_name,
+                "region": unit.region,
+                # The endpoint is per-network, and the fleet spans two. Ten
+                # of the battery facilities are WEM and querying one of those
+                # under network_code=NEM returns HTTP 404 - which was masking
+                # a routing bug, so the network is carried per row from the
+                # facility metadata rather than assumed.
+                "network": unit.network,
+                "unit": unit.code,
+                "status": unit.status,
+                "capacity_mwh": unit.capacity_storage_mwh,
+                # Named for what it is, not `power_mw`: `power_mw` is the
+                # battery's *instantaneous* dispatch power, and the two would
+                # be silently interchangeable in a name.
+                "registered_mw": unit.capacity_registered_mw,
+                "data_last_seen": unit.data_last_seen,
+            }
+        )
     return rows
 
 
@@ -584,45 +581,9 @@ def render(state: dict, now: float) -> str:
     return "\n".join(lines) + "\n"
 
 
-# --------------------------------------------------------------------------- #
-# Fleet cache
-# --------------------------------------------------------------------------- #
-
-
-def load_cache_entry(path: str) -> tuple[list[dict], float] | None:
-    """Read the cached fleet as `(facilities, cached_at)`, or None if unusable.
-
-    `cached_at` is what lets the caller tell a fresh cache from a stale one; it
-    is recorded by `save_cache` and is 0.0 for a cache file written by hand.
-    """
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            payload = json.load(handle)
-    except (OSError, ValueError) as exc:
-        log.warning("fleet cache %s unusable: %s", path, exc)
-        return None
-    data = payload.get("data") if isinstance(payload, dict) else payload
-    if not isinstance(data, list) or not data:
-        log.warning("fleet cache %s has no facilities", path)
-        return None
-    cached_at = float(payload.get("cached_at") or 0.0) if isinstance(payload, dict) else 0.0
-    return data, cached_at
-
-
-def load_cache(path: str) -> list[dict] | None:
-    entry = load_cache_entry(path)
-    return entry[0] if entry is not None else None
-
-
-def save_cache(path: str, facilities: list[dict]) -> None:
-    try:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump({"cached_at": time.time(), "data": facilities}, handle, indent=1, sort_keys=True)
-        os.replace(tmp, path)
-    except OSError as exc:
-        log.warning("could not write fleet cache %s: %s", path, exc)
+# The fleet cache file itself - its on-disk shape, the atomic write, and the
+# read that tolerates a missing or corrupt file - lives in `fleet`, next to the
+# parse that this exporter and its two readers share. See docs/adr/0002.
 
 
 # --------------------------------------------------------------------------- #
@@ -665,7 +626,6 @@ class BatteryScraper:
         self._last_api_refresh = 0.0
         self._api_refresh_interval = HOURLY_REFRESH_INTERVAL
         # Keep the last successful API responses to re-serve between refreshes.
-        self._last_facilities: list[dict] | None = None
         self._last_credits = None
 
     # -- fleet -------------------------------------------------------------- #
@@ -700,37 +660,41 @@ class BatteryScraper:
                 self._fleet, self._fleet_at = rows, cached_at
                 self._fleet_meta = meta
             return rows
-        rows = unit_rows(facilities, self.require_data)
+        fl = fleet.from_facilities(facilities)
+        rows = unit_rows(fl, self.require_data)
         if not rows:
             raise ScrapeError("/facilities/ -> no battery units with a storage capacity")
         if self.fleet_file:
-            save_cache(self.fleet_file, facilities)
+            fleet.write_fleet(self.fleet_file, facilities)
         with self._lock:
             self._fleet, self._fleet_at = rows, now
             # require_data=False here is not an oversight: the info metric is
             # metadata for the whole fleet, and the units `require_data` drops
             # (committed, never dispatched) are precisely the ones the numeric
-            # rows cannot describe. Both row shapes are computed from the same
-            # facilities response so they can never disagree.
-            self._fleet_meta = unit_rows(facilities, require_data=False)
-            self._last_facilities = facilities
+            # rows cannot describe. Both row shapes come from the same parsed
+            # fleet, so they can never disagree.
+            self._fleet_meta = unit_rows(fl, require_data=False)
         return rows
 
     def cached_fleet(self) -> tuple[list[dict], list[dict], float] | None:
         """Rows, full-fleet metadata rows, and cache age from the on-disk
         fleet, or None if unusable. The metadata rows are the `require_data=False`
-        shape, mirroring what a live fetch stores."""
+        shape, mirroring what a live fetch stores.
+
+        Read through `fleet` rather than by parsing the JSON here, so the file
+        is interpreted one way whether it has just been written by this exporter
+        or read back days later after the API failed.
+        """
         if not self.fleet_file:
             return None
-        cached = load_cache_entry(self.fleet_file)
-        if cached is None:
+        fl = fleet.load(self.fleet_file)
+        if fl is None:
             return None
-        data, cached_at = cached
-        rows = unit_rows(data, self.require_data)
+        rows = unit_rows(fl, self.require_data)
         if not rows:
             return None
-        meta = unit_rows(data, require_data=False)
-        return (rows, meta, cached_at)
+        meta = unit_rows(fl, require_data=False)
+        return (rows, meta, fl.cached_at)
 
     # -- poll --------------------------------------------------------------- #
 
@@ -757,7 +721,6 @@ class BatteryScraper:
                 # No API call - re-serve cached metadata every 5m scrape.
                 with self._lock:
                     rows = self._fleet
-                    self._fleet_meta = self._fleet_meta
                     credits = self._last_credits
         except AuthError as exc:
             log.error("authentication rejected: %s", exc)

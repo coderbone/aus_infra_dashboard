@@ -155,6 +155,10 @@ services:
       - 9.9.9.9
     volumes:
       - ./scrapers/oe_battery_exporter.py:/app/oe_battery_exporter.py:ro
+      # The shared fleet module: it writes the cache below and owns how it is
+      # read, so all three readers apply the same rules. Reopens the one-file-
+      # per-exporter convention - see docs/adr/0002.
+      - ./scrapers/fleet.py:/app/fleet.py:ro
       # A fleet-metadata cache and nothing else. Deliberately NOT the same
       # volume as tbm-exporter's: that one holds discovered ArcGIS layer
       # configuration, and two exporters sharing a volume means one of them
@@ -228,6 +232,9 @@ services:
       - 9.9.9.9
     volumes:
       - ./scrapers/aemo_battery_exporter.py:/app/aemo_battery_exporter.py:ro
+      # Shared fleet module, mounted beside the exporter so `import fleet`
+      # resolves with no PYTHONPATH. See docs/adr/0002.
+      - ./scrapers/fleet.py:/app/fleet.py:ro
       # aemo-state holds this exporter's own files only. The OE fleet cache is
       # mounted read-only at a separate path (/oefleet) so it can supply the
       # per-DUID capacity and fueltech without either exporter clobbering the
@@ -368,6 +375,9 @@ services:
     # from what the scrapers last fetched.
     volumes:
       - ./webmap/server.py:/app/server.py:ro
+      # From the scrapers tree: the fleet is a scraper-side fact the map
+      # consumes alongside the cache volume below. See docs/adr/0002.
+      - ./scrapers/fleet.py:/app/fleet.py:ro
       - ./webmap/static:/app/static:ro
       - ./webmap/data:/app/data:ro
       - battery-fleet-cache:/cache:ro

@@ -51,6 +51,7 @@ from http.server import ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import fleet  # noqa: E402
 import oe_battery_exporter as exporter  # noqa: E402
 from oe_battery_exporter import (  # noqa: E402
     AuthError,
@@ -79,6 +80,16 @@ def fixture_json(name: str):
 
 def facilities() -> list:
     return fixture_json("oe_facilities_battery.json")["data"]
+
+
+def fl() -> fleet.Fleet:
+    """The fixture as the module parses it.
+
+    `unit_rows` takes a parsed fleet: the de-duplication, the facility context
+    and the capacity normalisation all happen in `fleet`, so a caller hands it a
+    `Fleet` rather than the raw facility list.
+    """
+    return fleet.from_facilities(facilities())
 
 
 # --------------------------------------------------------------------------- #
@@ -122,32 +133,32 @@ class UnitRowsTest(unittest.TestCase):
         Without this filter the top ten is seven `committed` projects that
         return no data, and Eraring/Waratah/Orana fall out of scope entirely.
         """
-        rows = exporter.unit_rows(facilities())
+        rows = exporter.unit_rows(fl())
         codes = {r["facility"] for r in rows}
         self.assertNotIn("RICHMOND", codes)
         self.assertNotIn("TOMAGOBESS", codes)
         self.assertIn("ERB", codes)
 
     def test_include_undispatched_restores_them(self):
-        rows = exporter.unit_rows(facilities(), require_data=False)
+        rows = exporter.unit_rows(fl(), require_data=False)
         codes = {r["facility"] for r in rows}
         self.assertIn("RICHMOND", codes)
         self.assertIn("TOMAGOBESS", codes)
         self.assertEqual(len(rows), 119)
 
     def test_counts(self):
-        self.assertEqual(len(exporter.unit_rows(facilities())), 74)
-        self.assertEqual(len(exporter.unit_rows(facilities(), False)), 119)
+        self.assertEqual(len(exporter.unit_rows(fl())), 74)
+        self.assertEqual(len(exporter.unit_rows(fl(), False)), 119)
 
     def test_eraring_carries_its_own_capacity_not_its_facilitys(self):
-        row = next(r for r in exporter.unit_rows(facilities()) if r["facility"] == "ERB")
+        row = next(r for r in exporter.unit_rows(fl()) if r["facility"] == "ERB")
         self.assertEqual(row["capacity_mwh"], ERB_CAPACITY_MWH)
         self.assertEqual(row["unit"], "ERB01")
         self.assertEqual(row["region"], "NSW1")
 
     def test_network_is_carried_per_row(self):
         """WEM facilities 404 when queried as NEM, so it cannot be assumed."""
-        rows = {r["facility"]: r for r in exporter.unit_rows(facilities(), False)}
+        rows = {r["facility"]: r for r in exporter.unit_rows(fl(), False)}
         self.assertEqual(rows["ERB"]["network"], "NEM")
         self.assertEqual(rows["COLLIE_ESR4"]["network"], "WEM")
 
@@ -171,11 +182,16 @@ class UnitRowsTest(unittest.TestCase):
                 ],
             }
         ]
-        self.assertEqual([r["unit"] for r in exporter.unit_rows(payload)], ["X5"])
+        self.assertEqual(
+            [r["unit"] for r in exporter.unit_rows(fleet.from_facilities(payload))],
+            ["X5"],
+        )
 
     def test_malformed_input_is_tolerated(self):
         self.assertEqual(exporter.unit_rows(None), [])
-        self.assertEqual(exporter.unit_rows(["nope", 3, None]), [])
+        self.assertEqual(
+            exporter.unit_rows(fleet.from_facilities(["nope", 3, None])), []
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -186,8 +202,8 @@ class UnitRowsTest(unittest.TestCase):
 def render_rows(**over):
     """A caller-shaped state: rows (numeric series) and fleet_meta (info)."""
     base = {
-        "fleet_rows": exporter.unit_rows(facilities()),
-        "fleet_meta": exporter.unit_rows(facilities(), require_data=False),
+        "fleet_rows": exporter.unit_rows(fl()),
+        "fleet_meta": exporter.unit_rows(fl(), require_data=False),
         "oe_battery_fleet_capacity_mwh": ERB_FLEET_CAPACITY_MWH,
         "oe_last_poll_timestamp_seconds": 1790742930.0,
         "oe_last_fleet_refresh_timestamp_seconds": 1790742926.0,
@@ -353,7 +369,7 @@ class RenderTest(unittest.TestCase):
             self.assertEqual(line[0].split(" ", 1)[0], "%s{%s}" % (metric, expected), metric)
 
     def test_labels_are_escaped(self):
-        row = dict(exporter.unit_rows(facilities())[0])
+        row = dict(exporter.unit_rows(fl())[0])
         row["facility"] = 'A"B'
         row["facility_name"] = "back\\slash"
         text = exporter.render(render_rows(fleet_rows=[row]), self.now)
@@ -512,44 +528,10 @@ class ClientTest(unittest.TestCase):
         self.assertIsNone(client.credits_remaining())
 
 
-# --------------------------------------------------------------------------- #
-# Fleet cache
-# --------------------------------------------------------------------------- #
-
-
-class FleetCacheTest(unittest.TestCase):
-    def test_round_trip(self):
-        """The on-disk shape is shared: the AEMO exporter reads this file as
-        raw JSON `{"cached_at", "data": [...]}`, so it must not change."""
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "nested", "fleet.json")
-            exporter.save_cache(path, facilities())
-            payload = json.load(open(path, encoding="utf-8"))
-            self.assertIn("cached_at", payload)
-            self.assertEqual(payload["data"], facilities())
-            self.assertEqual(exporter.load_cache(path), facilities())
-
-    def test_missing_file_returns_none(self):
-        self.assertIsNone(exporter.load_cache("/nonexistent/fleet.json"))
-
-    def test_unusable_file_returns_none(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "fleet.json")
-            with open(path, "w", encoding="utf-8") as handle:
-                handle.write("{not json")
-            self.assertIsNone(exporter.load_cache(path))
-
-    def test_empty_facility_list_returns_none(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "fleet.json")
-            exporter.save_cache(path, [])
-            self.assertIsNone(exporter.load_cache(path))
-
-    def test_cache_written_atomically(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "fleet.json")
-            exporter.save_cache(path, facilities())
-            self.assertFalse(os.path.exists(path + ".tmp"))
+# The fleet cache file - its on-disk shape, the atomic write, and the reads
+# that tolerate a missing or unusable file - is now `fleet`'s contract rather
+# than this exporter's, so those assertions live in test_fleet.py alongside the
+# module they describe.
 
 
 # --------------------------------------------------------------------------- #
@@ -695,7 +677,7 @@ class ScraperTest(unittest.TestCase):
         """
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "fleet.json")
-            exporter.save_cache(path, facilities())
+            fleet.write_fleet(path, facilities())
             payload = json.load(open(path, encoding="utf-8"))
             payload["cached_at"] = 0.0
             json.dump(payload, open(path, "w", encoding="utf-8"))

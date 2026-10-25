@@ -16,7 +16,7 @@
 #
 # Units with no OE metadata carry no region and drop out of any region
 # grouping - same "OE fleet qualifies" scoping the dashboards already use. As
-# of 2026-10 an AEMO dispatch duid (e.g. TB3B1, Tasmania) with no OE
+# of 2026-10 an AEMO dispatch duid with no OE
 # facility in the fleet metadata will silently drop; that is the flag for
 # `oe_battery_fleet_info` to learn about the unit.
 #

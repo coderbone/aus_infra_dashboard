@@ -1344,6 +1344,38 @@ class RenderIntradayTest(unittest.TestCase):
         self.assertIn("aemo_battery_dispatchis_success 1", text)
         self.assertIn("aemo_battery_units_with_power 4", text)
 
+    # -- aemo_battery_fleet_metadata_missing ------------------------------- #
+
+    def test_missing_fleet_metadata_is_withheld_until_the_fleet_is_read(self):
+        # No `unit_meta` means the cache has not been read yet, not that every
+        # unit is missing - publishing on a cold start would look like a total
+        # outage rather than an unparsed cache.
+        self.assertNotIn("aemo_battery_fleet_metadata_missing", self.text())
+
+    def test_a_storage_unit_without_a_fleet_row_is_named(self):
+        # Only the storage set is considered, so AEMO's rooftop and distributed
+        # generation aggregates - never in the fleet - cannot pad the list.
+        known = ("DPNTB1", "ERB01", "LIMBESS1")
+        text = exporter.render_intraday(
+            self.scada, True, self.isr, True, 1.5, self.now,
+            unit_meta={d: {"fueltech": "battery", "region": "NSW1"} for d in known},
+        )
+        self.assertIn('aemo_battery_fleet_metadata_missing{duid="WTAHB1"} 1', text)
+        for duid in known:
+            with self.subTest(duid=duid):
+                self.assertNotIn(
+                    'aemo_battery_fleet_metadata_missing{duid="%s"}' % duid, text
+                )
+
+    def test_the_metric_is_absent_when_every_storage_unit_resolves(self):
+        # The steady state: baseline zero, so a new series is a real event.
+        all_duids = ("DPNTB1", "ERB01", "LIMBESS1", "WTAHB1")
+        text = exporter.render_intraday(
+            self.scada, True, self.isr, True, 1.5, self.now,
+            unit_meta={d: {"fueltech": "battery", "region": "NSW1"} for d in all_duids},
+        )
+        self.assertNotIn("aemo_battery_fleet_metadata_missing", text)
+
     def test_a_failed_scada_read_omits_power_but_keeps_regions(self):
         text = exporter.render_intraday(self.scada, False, self.isr, True, 1.5, self.now)
         self.assertIn("aemo_battery_scada_success 0", text)
@@ -2156,6 +2188,30 @@ class InferenceTest(unittest.TestCase):
         poller._advance_inference(self.scada_at("LIMBESS1", 0.0, 1791396000.0)["units"], NOW)
         # Of the two served units, both have a capacity in scope.
         self.assertEqual(poller._infer_view(NOW)["capacity_units"], 2)
+
+    def test_an_aliased_duid_resolves_to_its_fleet_capacity(self):
+        """AEMO and OpenElectricity do not always spell a unit's name alike.
+
+        AEMO calls the Torrens BESS 3 unit `TB3B1`; the fleet calls it
+        `TBBESS3B1`. A DUID-keyed lookup that knew only the fleet's spelling
+        found nothing, so that unit had no registered capacity - and without a
+        capacity the 100% top clamp on its inferred stored energy cannot hold it
+        back. The alias is asserted data in `fleet.UNIT_ALIASES`, because neither
+        upstream payload carries a bridge between the two. See docs/adr/0001.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_fleet_cache(
+                tmp, [{"code": "TBBESS3B1", "capacity_storage": 1140.0}]
+            )
+            poller = make_intraday(
+                battery_duids={"TB3B1"}, fleet_cache_file=path
+            )
+        self.assertEqual(
+            poller._fleet_capacity,
+            {"TBBESS3B1": 1140.0, "TB3B1": 1140.0},
+        )
+        # Which is the exact lookup the top clamp makes.
+        self.assertEqual(poller._fleet_capacity.get("TB3B1"), 1140.0)
 
     def test_missing_fleet_cache_degrades_to_the_floor(self):
         poller = make_intraday(

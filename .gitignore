@@ -1,4 +1,5 @@
 */__pycache__/
+.opencode/
 
 # Secrets. .env holds the OpenElectricity API key (OPENEA_API_KEY) and the
 # Grafana admin password (GRAFANA_ADMIN_PASSWORD). .env.example is the tracked

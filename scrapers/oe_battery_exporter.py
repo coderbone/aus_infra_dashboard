@@ -443,14 +443,12 @@ def label_set(sample: dict) -> str:
 def info_set(row: dict) -> str:
     """Label set for `oe_battery_fleet_info`.
 
-    `unit` is the fleet unit code: the identifier this stack joins on, and the
-    one the AEMO exporter now publishes as well.
-
-    `duid` carries the same value during the transition. AEMO dispatch series
-    call the key `duid`, so the recording rule and the dashboards keep joining
-    on that name until they have moved across to `unit`; it is dropped from
-    this metric once they have. See docs/adr/0001 for why the two are distinct
-    identifiers even though they are equal for all but a handful of units.
+    `unit` is the fleet unit code - the identifier this stack joins on, and the
+    one the AEMO exporter publishes as well. `duid` is dropped now that every
+    consumer has moved across to `unit`: it carried the same value here (the
+    fleet's spelling, not AEMO's), so it said one thing on this metric and
+    another on the AEMO side. `duid` now means AEMO's dispatch unit identifier
+    everywhere, and `unit` means the fleet's. See docs/adr/0001.
 
     The capacity figures ride as label strings - that is what an info metric is
     for - and a missing figure (registered MW on an old metadata row) renders as
@@ -459,11 +457,10 @@ def info_set(row: dict) -> str:
     capacity_mwh = row.get("capacity_mwh")
     registered_mw = row.get("registered_mw")
     return (
-        'unit="%s",duid="%s",facility="%s",facility_name="%s",region="%s",'
+        'unit="%s",facility="%s",facility_name="%s",region="%s",'
         'network="%s",status="%s",capacity_storage_mwh="%s",'
         'capacity_registered_mw="%s",data_last_seen="%s"'
         % (
-            escape_label(row.get("unit", "")),
             escape_label(row.get("unit", "")),
             escape_label(row.get("facility", "")),
             escape_label(row.get("facility_name", "")),
@@ -517,8 +514,8 @@ def render(state: dict, now: float) -> str:
         lines.append(
             "# HELP oe_battery_fleet_info Registration metadata for a NEM/WEM "
             "battery unit. Value is always 1; the unit lives in the labels: "
-            "unit (the fleet unit code, and duid alongside it while the "
-            "consumers join on that name), facility, facility_name, region, "
+            "unit (the fleet unit code, and the key every join in this stack "
+            "uses), facility, facility_name, region, "
             "network, status, storage capacity in "
             "MWh and registered capacity in MW (both as label strings, suitable "
             "for display and filtering), and the date the unit was last seen on "

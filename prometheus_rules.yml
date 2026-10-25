@@ -33,6 +33,14 @@
 # the match group, failing the whole rule. It also states the intent - a row
 # the fleet does not name has nothing to contribute here.
 #
+# `max by (unit, region)` makes the rule survive a change to this metric's
+# label set: dropping a label re-creates every series, so for up to two hours
+# `last_over_time` returns the old and the new shape side by side with the same
+# `unit`, which a plain join reports as a duplicate match group. Collapsing
+# them first leaves one. The fleet module guarantees one row per unit code, so
+# `(unit, region)` is a unique key - and `region` is the only label this rule
+# imports anyway.
+#
 # The OE fleet metadata is near-constant (registered capacity, region, status)
 # and, since 2026-10-21, the OE exporter is polled hourly rather than every
 # 5m. A bare `aemo_battery_power_mw * on(unit) oe_battery_fleet_info` would
@@ -46,7 +54,9 @@ groups:
         expr: |-
           aemo_battery_power_mw
             * on(unit) group_left(region)
-              last_over_time(oe_battery_fleet_info{unit!=""}[2h])
+              max by (unit, region) (
+                last_over_time(oe_battery_fleet_info{unit!=""}[2h])
+              )
 
   # Peak stored energy per unit, used by the web map to show how much of a
   # commissioning battery has actually been energised (peak stored MWh divided

@@ -148,6 +148,7 @@ def build_live(at: float | None = None):
     out["hydro"] = fl.get("hydro", []) if isinstance(fl, dict) else []
     out["coal"] = fl.get("coal", []) if isinstance(fl, dict) else []
     out["gas"] = fl.get("gas", []) if isinstance(fl, dict) else []
+    out["distillate"] = fl.get("distillate", []) if isinstance(fl, dict) else []
     return out
 
 
@@ -204,6 +205,7 @@ def build_fleet():
     hydro = []
     coal = []
     gas = []
+    distillate = []
     for facility in raw:
         if not isinstance(facility, dict):
             continue
@@ -212,6 +214,7 @@ def build_fleet():
         units_hyd = []
         units_coal = []
         units_gas = []
+        units_distillate = []
         pumped_hint = False
         for unit in facility.get("units") or []:
             if not isinstance(unit, dict):
@@ -263,6 +266,10 @@ def build_fleet():
                 u = _thermal_unit(unit, ft)
                 if u:
                     units_gas.append(u)
+            elif ft == "distillate":
+                u = _thermal_unit(unit, ft)
+                if u:
+                    units_distillate.append(u)
         if units_bat:
             fleet.append({
                 "facility": facility.get("code") or "",
@@ -295,7 +302,7 @@ def build_fleet():
                 })
         # Coal and gas are point sources like hydro, so they need a coordinate to
         # be drawn; a plant missing one is dropped rather than pinned to (0, 0).
-        for bucket, units, kind in ((coal, units_coal, "coal"), (gas, units_gas, "gas")):
+        for bucket, units, kind in ((coal, units_coal, "coal"), (gas, units_gas, "gas"), (distillate, units_distillate, "distillate")):
             loc = facility.get("location")
             if units and isinstance(loc, dict) and loc.get("lat") and loc.get("lng"):
                 bucket.append({
@@ -308,7 +315,7 @@ def build_fleet():
                 })
     _fleet_cache["mtime"] = mtime
     _fleet_cache["data"] = {"fleet": fleet, "renewables": renewables, "hydro": hydro,
-                            "coal": coal, "gas": gas}
+                            "coal": coal, "gas": gas, "distillate": distillate}
     return _fleet_cache["data"]
 
 

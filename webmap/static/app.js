@@ -40,11 +40,13 @@ const state = {
 let metric = "stored";
 let showSchematic = true;
 let showBatteries = true;
+let showIdle = true;
 let showSolar = true;
 let showWind = true;
 let showHydro = true;
 let showCoal = true;
 let showGas = true;
+let showDistillate = true;
 let showStatus = {
   operating: true,
   operational: true,
@@ -63,6 +65,7 @@ const hydroLayers = {}; // facility -> hexagon
 const hydroRings = {}; // facility -> concentric inner hexagon (pumped storage only)
 const coalLayers = {}; // facility -> square
 const gasLayers = {}; // facility -> pentagon
+const distillateLayers = {}; // facility -> triangle
 
 /* ---------- colour helpers ---------- */
 
@@ -217,7 +220,7 @@ function regionTip(code, r) {
 // (see ringSwatch / regionRingSVG) so "spilled generation" reads as the same
 // resource the region could have used, not a separate one.
 const RING_COLOR = {
-  coal: "#94a3b8", gas: "#fb923c", hydro: "#38bdf8", wind: "#34d399",
+  coal: "#94a3b8", gas: "#fb923c", distillate: "#f472b6", hydro: "#38bdf8", wind: "#34d399",
   solar: "#fbbf24", battery: "#c084fc", pumps: "#2dd4bf",
   rooftop: "#f59e0b",
   imports: "#f472b6", exports: "#a3e635",
@@ -258,6 +261,7 @@ function regionFlows(code) {
   };
   add(gen, "coal", "Coal", RING_COLOR.coal, genSum(state.coal));
   add(gen, "gas", "Gas", RING_COLOR.gas, genSum(state.gas));
+  add(gen, "distillate", "Distillate", RING_COLOR.distillate, genSum(state.distillate));
   add(gen, "hydro", "Hydro", RING_COLOR.hydro, genSum(state.hydro, (u) => u.fueltech_id === "hydro"));
   add(gen, "wind", "Wind", RING_COLOR.wind, genSum(state.renewables, (u) => u.fueltech_id === "wind" || u.fueltech_id === "wind_farm"));
   add(gen, "solar", "Solar", RING_COLOR.solar, genSum(state.renewables, (u) => u.fueltech_id === "solar" || u.fueltech_id === "solar_utility"));
@@ -513,9 +517,77 @@ function isCommissioning(fac) {
   return (fac.units || []).some((u) => u.status === "commissioning");
 }
 
+function isIdleFacility(fac) {
+  if (!fac || !fac.units) return false;
+  // Batteries are idle if not charging/discharging significantly
+  if (fac.kind === "battery") {
+    let sumMw = 0;
+    let has = false;
+    for (const u of fac.units || []) {
+      const p = unitPower ? unitPower(u.code) : null;
+      if (p && typeof p.mw === "number") { sumMw += p.mw; has = true; }
+    }
+    if (!has) {
+      const fp = facilityPower(fac);
+      if (!fp || typeof fp.mw !== "number") return true;
+      return Math.abs(fp.mw) < 0.5;
+    }
+    return Math.abs(sumMw) < 0.5;
+  }
+  // For generators, check if they're producing significant power
+  if (fac.kind === "renewable") {
+    let gen = 0, measured = false;
+    for (const u of fac.units) {
+      const m = state.units && state.units[u.code];
+      if (!m || typeof m.power_mw !== "number") continue;
+      measured = true;
+      gen += Math.max(0, m.power_mw);
+    }
+    if (!measured) return true;
+    return gen < 0.5;
+  }
+  if (fac.kind === "hydro") {
+    let activity = 0, measured = false;
+    for (const u of fac.units || []) {
+      const m = state.units && state.units[u.code];
+      if (!m || typeof m.power_mw !== "number") continue;
+      measured = true;
+      activity += Math.abs(m.power_mw);
+    }
+    if (!measured) {
+      const agg = hydroAgg ? hydroAgg(fac) : null;
+      if (agg && agg.measured) return (agg.activity || 0) < 0.5;
+      return false;
+    }
+    return activity < 0.5;
+  }
+  if (fac.kind === "coal" || fac.kind === "gas" || fac.kind === "distillate") {
+    const agg = thermalAgg(fac);
+    if (!agg.measured) {
+      // If we don't have live data, don't hide based on idle
+      return false;
+    }
+    return agg.gen < 0.5;
+  }
+  // Fallback: check any unit power
+  let anyMw = null;
+  for (const u of fac.units) {
+    const p = unitPower && unitPower(u.code);
+    if (p && typeof p.mw === "number") { anyMw = p.mw; break; }
+  }
+  if (anyMw !== null) return Math.abs(anyMw) < 0.5;
+  return false;
+}
+
 function facilityStatusVisible(fac) {
   if (!fac || !fac.units) return false;
   const units = fac.units || [];
+  // Apply idle filter first - applies to units of any fuel type
+  if (typeof showIdle !== 'undefined' && !showIdle) {
+    if (fac.kind === 'battery' || fac.kind === 'hydro' || fac.kind === 'coal' || fac.kind === 'gas' || fac.kind === 'distillate' || fac.kind === 'renewable') {
+      if (isIdleFacility(fac)) return false;
+    }
+  }
   // If any unit is in a selected status, show. Also handle facilities that are all committed.
   for (const u of units) {
     const st = (u.status || "").toLowerCase();
@@ -683,7 +755,7 @@ function applyBatteries() {
   for (const fac of state.fleet) {
     const loc = fac.location;
     let layer = batteryLayers[fac.facility];
-    if (!loc || !loc.lat || !loc.lng || !showBatteries || !facilityStatusVisible(fac)) {
+    if (!loc || !loc.lat || !loc.lng || !showBatteries || !facilityStatusVisible(fac) || (typeof showIdle !== 'undefined' && !showIdle && isIdleFacility(fac))) {
       removeBattery(fac.facility);
       continue;
     }
@@ -896,6 +968,7 @@ function updateLegend() {
     '<div class="row">' + hydroGlyph(true) + '<span>pumped hydro</span></div>' +
     '<div class="row">' + thermalGlyph(THERMAL_SHAPE.coal.sides, THERMAL_SHAPE.coal.offsetDeg) + '<span>coal</span></div>' +
     '<div class="row">' + thermalGlyph(THERMAL_SHAPE.gas.sides, THERMAL_SHAPE.gas.offsetDeg) + '<span>gas</span></div>' +
+    '<div class="row">' + thermalGlyph(THERMAL_SHAPE.distillate.sides, THERMAL_SHAPE.distillate.offsetDeg) + '<span>distillate</span></div>' +
     '<div class="cap">commissioning: arc length = % capacity energised, colour = stored now vs peak (red&rarr;green)</div>' +
     '<div class="cap">solar/wind: shape = type, colour = generation (% of capacity)</div>' +
     '<div class="cap">hydro: colour = output (% of capacity), pulse = &ge;5% (floor 1 MW) generating or pumping</div>' +
@@ -918,12 +991,25 @@ function wireControls() {
     showBatteries = ev.target.checked;
     applyBatteries();
   });
+  const togIdle = document.getElementById("tog-idle");
+  if (togIdle) {
+    togIdle.addEventListener("change", (ev) => {
+      showIdle = ev.target.checked;
+      applyBatteries();
+      applyHydro();
+      applyThermal("coal", state.coal, showCoal, coalLayers);
+      applyThermal("gas", state.gas, showGas, gasLayers);
+      applyThermal("distillate", state.distillate, showDistillate, distillateLayers);
+      applyRenewables();
+    });
+  }
   document.getElementById("tog-status-operating").addEventListener("change", (ev) => {
     showStatus.operating = ev.target.checked;
     applyBatteries();
     applyHydro();
     applyThermal("coal", state.coal, showCoal, coalLayers);
     applyThermal("gas", state.gas, showGas, gasLayers);
+    applyThermal("distillate", state.distillate, showDistillate, distillateLayers);
     applyRenewables();
   });
   document.getElementById("tog-status-operational").addEventListener("change", (ev) => {
@@ -932,6 +1018,7 @@ function wireControls() {
     applyHydro();
     applyThermal("coal", state.coal, showCoal, coalLayers);
     applyThermal("gas", state.gas, showGas, gasLayers);
+    applyThermal("distillate", state.distillate, showDistillate, distillateLayers);
     applyRenewables();
   });
   document.getElementById("tog-status-commissioning").addEventListener("change", (ev) => {
@@ -940,6 +1027,7 @@ function wireControls() {
     applyHydro();
     applyThermal("coal", state.coal, showCoal, coalLayers);
     applyThermal("gas", state.gas, showGas, gasLayers);
+    applyThermal("distillate", state.distillate, showDistillate, distillateLayers);
     applyRenewables();
   });
   document.getElementById("tog-status-committed").addEventListener("change", (ev) => {
@@ -948,6 +1036,7 @@ function wireControls() {
     applyHydro();
     applyThermal("coal", state.coal, showCoal, coalLayers);
     applyThermal("gas", state.gas, showGas, gasLayers);
+    applyThermal("distillate", state.distillate, showDistillate, distillateLayers);
     applyRenewables();
   });
   document.getElementById("tog-solar").addEventListener("change", (ev) => {
@@ -969,6 +1058,10 @@ function wireControls() {
   document.getElementById("tog-gas").addEventListener("change", (ev) => {
     showGas = ev.target.checked;
     applyThermal("gas", state.gas, showGas, gasLayers);
+  });
+  document.getElementById("tog-distillate").addEventListener("change", (ev) => {
+    showDistillate = ev.target.checked;
+    applyThermal("distillate", state.distillate, showDistillate, distillateLayers);
   });
   document.getElementById("play-24h").addEventListener("click", () => {
     if (playing) stopPlayback();
@@ -1003,6 +1096,7 @@ function applySnapshot(data, isHistorical) {
   state.hydro = data.hydro || [];
   state.coal = data.coal || [];
   state.gas = data.gas || [];
+  state.distillate = data.distillate || [];
   state.reservoirs = data.reservoirs || {};
   state.fetchedAt = data.fetched_at;
   state.historicalAt = isHistorical ? (data.at || null) : null;
@@ -1015,6 +1109,7 @@ function applySnapshot(data, isHistorical) {
   applyHydro();
   applyThermal("coal", state.coal, showCoal, coalLayers);
   applyThermal("gas", state.gas, showGas, gasLayers);
+  applyThermal("distillate", state.distillate, showDistillate, distillateLayers);
   applyBatteries();
   applyRenewables();
   restackMarkers();
@@ -1161,6 +1256,10 @@ function applyRenewables() {
       if (ust === "committed" && !showStatus.committed) continue;
       if (ust === "commissioning" && !showStatus.commissioning) continue;
       if ((ust === "operating" || ust === "operational") && !(showStatus.operating || showStatus.operational)) continue;
+      if (typeof showIdle !== 'undefined' && !showIdle) {
+        const unitPow = (state.units && state.units[u.code] && state.units[u.code].power_mw);
+        if (typeof unitPow === 'number' && Math.abs(unitPow) < 0.5) continue;
+      }
       const ft = u.fueltech_id || (u.code && u.code.includes("WF") ? "wind" : "solar");
       const isWind = (ft === "wind" || ft === "wind_farm");
       const isSolar = (ft === "solar" || ft === "solar_utility");
@@ -1310,7 +1409,7 @@ function applyHydro() {
   for (const fac of state.hydro) {
     const loc = fac.location;
     const agg = hydroAgg(fac);
-    if (!showHydro || !loc || !loc.lat || !loc.lng || !facilityStatusVisible(fac)) {
+    if (!showHydro || !loc || !loc.lat || !loc.lng || !facilityStatusVisible(fac) || (typeof showIdle !== 'undefined' && !showIdle && isIdleFacility(fac))) {
       removeHydro(fac.facility);
       continue;
     }
@@ -1380,11 +1479,12 @@ function applyHydro() {
 // as a share of registered capacity, on the same red->yellow->green scale the
 // other sources use. No pulse: unlike hydro these run as baseload, so a marker
 // would be throbbing almost constantly and the motion would carry no signal.
-const THERMAL_SHAPE = { coal: { sides: 4, offsetDeg: 45 }, gas: { sides: 5, offsetDeg: 0 } };
+const THERMAL_SHAPE = { coal: { sides: 4, offsetDeg: 45 }, gas: { sides: 5, offsetDeg: 0 }, distillate: { sides: 3, offsetDeg: 180 } };
 const FUEL_LABEL = {
   coal_black: "black coal", coal_brown: "brown coal",
   gas_ccgt: "CCGT", gas_ocgt: "OCGT", gas_steam: "steam",
   gas_recip: "recip", gas_wcmg: "wcmg",
+  distillate: "distillate",
 };
 
 function thermalAgg(fac) {
@@ -1442,7 +1542,7 @@ function thermalPopup(kind, fac, agg) {
 function applyThermal(kind, facs, show, layers) {
   for (const fac of facs || []) {
     const loc = fac.location;
-    if (!show || !loc || !loc.lat || !loc.lng || !facilityStatusVisible(fac)) {
+    if (!show || !loc || !loc.lat || !loc.lng || !facilityStatusVisible(fac) || (typeof showIdle !== 'undefined' && !showIdle && isIdleFacility(fac))) {
       const l = layers[fac.facility];
       if (l) { map.removeLayer(l); delete layers[fac.facility]; }
       continue;
@@ -1489,6 +1589,7 @@ function rescaleMarkers() {
   applyHydro();
   applyThermal("coal", state.coal, showCoal, coalLayers);
   applyThermal("gas", state.gas, showGas, gasLayers);
+  applyThermal("distillate", state.distillate, showDistillate, distillateLayers);
   applyBatteries();
   restackMarkers();
 }
@@ -1504,7 +1605,7 @@ function rescaleMarkers() {
 // of being buried by it.
 function restackMarkers() {
   const all = [];
-  for (const dict of [batteryLayers, hydroLayers, coalLayers, gasLayers, renLayers,
+  for (const dict of [batteryLayers, hydroLayers, coalLayers, gasLayers, distillateLayers, renLayers,
                       hydroRings, batteryArcs]) {
     for (const k in dict) {
       const l = dict[k];

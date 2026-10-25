@@ -433,7 +433,7 @@ never-built units included:
 
 | Metric | Type | Meaning |
 | --- | --- | --- |
-| `oe_battery_fleet_info{duid, facility, facility_name, region, network, status, capacity_storage_mwh, capacity_registered_mw, data_last_seen}` | gauge | Registration metadata for one unit. `duid` is the join key: AEMO per-unit dispatch series carry `duid`, so `aemo_battery_power_mw * on(duid) group_left(region) oe_battery_fleet_info` enriches them with region/network/status with no lookup table. Capacity figures ride as label strings for display and filtering; `data_last_seen` is empty for units that have never published. Absent entirely until the fleet metadata is first read. |
+| `oe_battery_fleet_info{unit, facility, facility_name, region, network, status, capacity_storage_mwh, capacity_registered_mw, data_last_seen}` | gauge | Registration metadata for one unit. `unit` is the fleet unit code and the join key: AEMO per-unit dispatch series carry it too, so `aemo_battery_power_mw * on(unit) group_left(region) oe_battery_fleet_info` enriches them with region/network/status with no lookup table. `duid` was dropped once every consumer had moved across to `unit` — on this metric it held the fleet's spelling while on the AEMO side it held AEMO's, so the same name meant two things across the join. Capacity figures ride as label strings for display and filtering; `data_last_seen` is empty for units that have never published. Absent entirely until the fleet metadata is first read. |
 
 Unlabelled fleet and poll gauges:
 
@@ -575,9 +575,11 @@ A second thread polls two tiny archives on `--intraday-poll-interval` (default
    `PUBLIC_DISPATCHSCADA_<YYYYMMDDHHMM>_<seq>.zip`, a ~4KB single-interval
    `SCADAVALUE` in MW (negative = charging/absorbing). Verified live
    2026-10-08 15:20: ERB01 −120, WTAHB1 −34, LIMBESS1 +0.9. Every row is
-   published as `aemo_unit_power_mw{duid,fueltech,region}` — generators, loads
+   published as `aemo_unit_power_mw{unit,duid,fueltech,region}` — generators, loads
    and storage alike, labelled from the OE fleet cache (empty labels for a unit
-   the cache does not know). The legacy `aemo_battery_power_mw` series stays
+   the cache does not know). `unit` is the fleet unit code, `duid` is AEMO's
+   name for the same unit; they differ for a handful of units (Tailem Bend 3
+   is `TBBESS3B1`/`TB3B1`). The legacy `aemo_battery_power_mw` series stays
    filtered to the units the daily report has learned are storage units (the
    battery set is seeded from the state file at startup so a restart does not
    wait for the daily poll); a DUID the daily file has never clocked as storage
@@ -700,15 +702,15 @@ wrong number — until a fresh daily report re-anchors it.
 | `aemo_battery_report_reused` | 1 if served from the state-file cache this poll |
 | `aemo_battery_scrape_success` | 1 on success, 0 on failure (daily only) |
 | `aemo_battery_poll_duration_seconds`, `aemo_battery_last_poll_timestamp_seconds` | poll timing |
-| `aemo_battery_power_mw{duid}` | live measured output from `UNIT_SCADA` `SCADAVALUE`, MW (negative = charging). Legacy storage-filtered series; superseded by `aemo_unit_power_mw` |
-| `aemo_battery_power_timestamp_seconds{duid}` | the 5-minute interval behind the power reading |
-| `aemo_battery_power_age_seconds{duid}` | its age at export time |
+| `aemo_battery_power_mw{unit,duid}` | live measured output from `UNIT_SCADA` `SCADAVALUE`, MW (negative = charging). Legacy storage-filtered series; superseded by `aemo_unit_power_mw` |
+| `aemo_battery_power_timestamp_seconds{unit,duid}` | the 5-minute interval behind the power reading |
+| `aemo_battery_power_age_seconds{unit,duid}` | its age at export time |
 | `aemo_battery_power_report_info{file}` | the processed `PUBLIC_DISPATCHSCADA` file |
 | `aemo_battery_power_interval_timestamp_seconds` | its interval |
 | `aemo_battery_units_with_power` | storage units with a reading in the SCADA snapshot |
-| `aemo_unit_power_mw{duid,fueltech,region}` | live measured output from `UNIT_SCADA` `SCADAVALUE`, MW, for **every** dispatch unit in the file (generators, loads, storage; negative = charging/absorbing). Superset of `aemo_battery_power_mw`; `fueltech`/`region` come from the OE fleet cache (empty when a unit is absent from it) |
-| `aemo_unit_power_timestamp_seconds{duid}` | the 5-minute interval behind the unit reading |
-| `aemo_unit_power_age_seconds{duid}` | its age at export time |
+| `aemo_unit_power_mw{unit,duid,fueltech,region}` | live measured output from `UNIT_SCADA` `SCADAVALUE`, MW, for **every** dispatch unit in the file (generators, loads, storage; negative = charging/absorbing). Superset of `aemo_battery_power_mw`; `fueltech`/`region` come from the OE fleet cache (empty when a unit is absent from it) |
+| `aemo_unit_power_timestamp_seconds{unit,duid}` | the 5-minute interval behind the unit reading |
+| `aemo_unit_power_age_seconds{unit,duid}` | its age at export time |
 | `aemo_unit_power_report_info{file}` | the processed `PUBLIC_DISPATCHSCADA` file |
 | `aemo_unit_power_interval_timestamp_seconds` | its interval |
 | `aemo_unit_power_units` | dispatch units with a reading in the SCADA snapshot |
@@ -736,10 +738,10 @@ wrong number — until a fresh daily report re-anchors it.
 | `aemo_interconnector_count` | links with a reading; 0 when the INTERCONNECTORRES table was missing/unparsable |
 | `aemo_battery_scada_success`, `aemo_battery_dispatchis_success` | 1 on success, 0 on failure, per intraday feed |
 | `aemo_battery_intraday_poll_duration_seconds`, `aemo_battery_intraday_last_poll_timestamp_seconds` | intraday poll timing |
-| `aemo_battery_inferred_stored_mwh{duid}` | live per-unit estimate: daily `ENERGY_STORAGE` anchor + integrated SCADA MW, MWh |
-| `aemo_battery_inferred_timestamp_seconds{duid}` | the integrated SCADA interval behind the estimate |
-| `aemo_battery_inferred_age_seconds{duid}` | its age at export time |
-| `aemo_battery_inferred_clamped{duid}` | 1 when the raw integral left `[0, capacity]` and is pinned at a boundary |
+| `aemo_battery_inferred_stored_mwh{unit,duid}` | live per-unit estimate: daily `ENERGY_STORAGE` anchor + integrated SCADA MW, MWh |
+| `aemo_battery_inferred_timestamp_seconds{unit,duid}` | the integrated SCADA interval behind the estimate |
+| `aemo_battery_inferred_age_seconds{unit,duid}` | its age at export time |
+| `aemo_battery_inferred_clamped{unit,duid}` | 1 when the raw integral left `[0, capacity]` and is pinned at a boundary |
 | `aemo_battery_inferred_units` | inferred units being served |
 | `aemo_battery_inferred_clamped_units` | ... of them pinned at a boundary |
 | `aemo_battery_inferred_fleet_capacity_units` | ... of them with a known registered capacity (`--fleet-cache-file`), feeding the 100% clamp |
@@ -791,8 +793,8 @@ plain dark background, so it renders with no internet at all. `./webmap/data`
 is hand-authored schematic `*.geojson` (six regions, the seven
 interconnectors/MNSP links plus the Snowy link, and intra-regional corridors
 AEMO does not publish numbers for). `./webmap/static/app.js` polls
-`/data/live` every 30s, which the server builds from a single Prometheus
-instant query batch — live for the interconnector flow/limits and region
+`/data/live` every 30s, which the server builds from one Prometheus instant
+query per field — 26 of them, for the interconnector flow/limits and region
 stored/fossil/curtailment series above, plus the top dozen `oe_battery_*`
 units — and it ships so the map is not left depending on the point-in-time
 state of any one poll.

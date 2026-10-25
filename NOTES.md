@@ -372,14 +372,15 @@ discovery step, so its cold start is a single ~190 KB fetch and lands around
   section 7 describes for the other two.
 - No alerting rules; `prometheus.yml` has scrape configs only. There *is* one
   recording rule (see `prometheus_rules.yml`): `aemo_battery_power_mw_region`,
-  which enriches per-duid AEMO dispatch power with a `region` label by joining
+  which enriches per-unit AEMO dispatch power with a `region` label by joining
   it to the OE exporter's whole-fleet info gauge
-  (`oe_battery_fleet_info{aemo_battery_power_mw_region := aemo_battery_power_mw
-  * on(duid) group_left(region) oe_battery_fleet_info}`). The rule replaces an
+  (`aemo_battery_power_mw * on(unit) group_left(region) oe_battery_fleet_info`,
+  wrapped in `max by (unit, region)` so a label change on the info metric
+  cannot present as a duplicate match group). The rule replaces an
   earlier version joined to `oe_battery_capacity_storage_mwh`, which only knew
   the 12 monitored units; the info metric covers the whole fleet metadata, so
-  every AEMO dispatch duid the OE fleet knows (SA1 now included; 67 of 68
-  power duids, all but TB3B1) appears in region groupings.
+  every AEMO dispatch duid the OE fleet knows (SA1 now included; all 68 of 68,
+  Tailem Bend 3 resolving through its alias) appears in region groupings.
 - The dashboards are provisioned from `grafana/provisioning/dashboards/` (see
   section 7), but there is no provisioning of Grafana *users* or folders.
 - **Editing `prometheus.yml` needs `curl -XPOST localhost:9090/-/reload`, not a

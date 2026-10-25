@@ -1647,8 +1647,8 @@ matcher is folded into the shared `SEL` constant, so one edit covers them all.
 
 Filtered: all OE per-unit panels (via `SEL`), `Age of oldest reading`
 (`max(oe_battery_sample_age_seconds{region=~"$region"})`), the live-SCADA
-per-unit rate and inferred-SoC panels (an `and on(duid) oe_battery_fleet_info`
-join — `duid` is the only per-unit region key), the by-region rate
+per-unit rate and inferred-SoC panels (an `and on(unit) oe_battery_fleet_info`
+join — `unit` is the fleet unit code and the per-unit key), the by-region rate
 (`sum by (region) (aemo_battery_power_mw_region{...})`), the by-region BDU
 stored timeseries and gauges, the fossil runtime, and the two
 most-active-battery gauges. Deliberately *not* filtered: the OE aggregate stat
@@ -1657,14 +1657,18 @@ total by definition), and the API credit/request/poll-duration scalars.
 
 ### Traps (Region filter)
 
-- **The per-unit region join drops TB3B1 even under All.** It is a Tasmania
-  battery with a SCADA series but no OE facility, so `aemo_battery_power_mw`
-  (68 series) joins to `oe_battery_fleet_info` as 67. This is not the filter
-  misbehaving — it is the same scoping the `aemo_battery_power_mw_region`
-  recording rule and the region BDU aggregates already use (no OE facility ⇒ no
-  region ⇒ excluded), just now visible in per-unit panels too. Verified live.
+- **The per-unit region join covers all 68.** It used to drop one: AEMO calls
+  the Tailem Bend 3 unit `TB3B1`, OpenElectricity calls it `TBBESS3B1`, so a
+  string-equality join found no fleet row and that unit lost its region, its
+  fueltech and its registered capacity — 68 joined to 67. (It was never a
+  Tasmanian battery, and OE does list the facility; `TAS1` has no battery
+  dispatch units at all.) The fleet module now carries the alias
+  (`fleet.UNIT_ALIASES`), both sides publish `unit`, and the join returns
+  68 of 68. `aemo_battery_fleet_metadata_missing` reports any storage unit the
+  fleet does not name, so this failure mode is no longer silent.
+  See docs/adr/0001.
 - **The region join on the most-active gauges belongs *inside* `topk`.** Written
-  after it (`topk(12, …) and on(duid) …region…`) the panel would pick the global
+  after it (`topk(12, …) and on(unit) …region…`) the panel would pick the global
   twelve and then hide the out-of-region ones, silently showing fewer than
   twelve for a small region; inside, it picks the twelve fastest *within the
   selected regions*.

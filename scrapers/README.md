@@ -794,17 +794,23 @@ is hand-authored schematic `*.geojson` (six regions, the seven
 interconnectors/MNSP links plus the Snowy link, and intra-regional corridors
 AEMO does not publish numbers for). `./webmap/static/app.js` polls
 `/data/live` every 30s, which the server builds from one Prometheus instant
-query per field — 26 of them, for the interconnector flow/limits and region
+query per field — 28 of them, for the interconnector flow/limits/nominal and region
 stored/fossil/curtailment series above, plus the top dozen `oe_battery_*`
 units — and it ships so the map is not left depending on the point-in-time
 state of any one poll.
 
 Two properties matter for the sign convention this README insists on: the map
-reads the `aemo_interconnector_*` series verbatim (flow arrows drawn from the
-sign, utilization from `|flow|` against the limits), and it reads the fleet
-**straight off the `battery-fleet-cache` volume the OE exporter writes** —
-read-only, never a copy, so the map cannot drift from what the scrapers last
-fetched. The unmonitored ~110 batteries render grey at their cached capacity,
+takes a link's flow sign from `aemo_interconnector_flow_mw` unchanged, and it
+reads the fleet **straight off the `battery-fleet-cache` volume the OE
+exporter writes** — read-only, never a copy, so the map cannot drift from what
+the scrapers last fetched.
+
+Utilisation is derived in the server from the nominal ratings
+(`aemo_interconnector_nominal_{forward,reverse}_mw`, the system-normal
+capability), never from the dynamic dispatch limits: those bend to the binding
+constraint, can go negative, and can collapse onto the flow itself, so a load
+factor taken against them is meaningless. The limits still reach the front end,
+labelled as limits, for display only. The unmonitored ~110 batteries render grey at their cached capacity,
 which is why the whole-fleet cache (facility coordinates included) is the map's
 data source rather than a fresh API call. Healthcheck hits `127.0.0.1:9119`
 like the other services.

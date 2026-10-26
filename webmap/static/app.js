@@ -399,12 +399,6 @@ function regionPopup(code, name) {
 
 /* ---------- lines ---------- */
 
-function lineUtilization(f) {
-  const ex = Math.abs(f.export_limit), im = Math.abs(f.import_limit);
-  const lim = Math.max(ex, im, 0.0001);
-  return Math.abs(f.flow) / lim;
-}
-
 function applyLines() {
   for (const e of lineLayers) {
     if (e.snow) continue;
@@ -423,12 +417,28 @@ function applyLines() {
       hideArrow(e);
       continue;
     }
-    const u = Math.min(1.2, lineUtilization(f));
-    const col = u > 0.85 ? LINE_COLORS.high : u > 0.6 ? LINE_COLORS.mid : LINE_COLORS.low;
-    e.layer.setStyle({ color: col, weight: 1.5 + 3.5 * Math.min(u, 1), opacity: 0.95, dashArray: null });
+    const u = f.utilisation;
+    if (typeof u !== "number" || !isFinite(u)) {
+      // Flowing, but the rating is unknown: draw it and show the direction
+      // rather than pretending it is idle or saturated. There is no
+      // denominator, so no load factor is stated.
+      e.layer.setStyle({ color: LINE_COLORS.nodata, weight: 2, opacity: 0.8, dashArray: null });
+      updateLineTip(e, f);
+      updateArrow(e, f);
+      continue;
+    }
+    const loaded = Math.min(1.2, u);
+    const col = loaded > 0.85 ? LINE_COLORS.high : loaded > 0.6 ? LINE_COLORS.mid : LINE_COLORS.low;
+    e.layer.setStyle({ color: col, weight: 1.5 + 3.5 * Math.min(loaded, 1), opacity: 0.95, dashArray: null });
     updateLineTip(e, f);
     updateArrow(e, f);
   }
+}
+
+function num(v, digits) {
+  // NaN and infinities are numbers in JS, so test for them too - otherwise a
+  // missing reading renders as the string "NaN".
+  return typeof v === "number" && isFinite(v) ? v.toFixed(digits) : "n/a";
 }
 
 function updateLineTip(e, f) {
@@ -437,10 +447,14 @@ function updateLineTip(e, f) {
   let html = '<b>' + p.name + '</b><br>' + p.id;
   if (!f) { html += ' &middot; no data'; }
   else {
-    html += '<br>flow ' + f.flow.toFixed(1) + ' MW';
-    if (typeof f.metered === "number") html += ' &middot; metered ' + f.metered.toFixed(1) + ' MW';
-    html += '<br>export ' + (typeof f.export_limit === "number" ? f.export_limit.toFixed(0) : "n/a") +
-            ' &middot; import ' + (typeof f.import_limit === "number" ? f.import_limit.toFixed(0) : "n/a") + ' MW';
+    html += '<br>flow ' + num(f.flow, 1) + ' MW';
+    if (typeof f.metered === "number") html += ' &middot; metered ' + num(f.metered, 1) + ' MW';
+    if (typeof f.utilisation === "number" && isFinite(f.utilisation))
+      html += ' &middot; ' + (f.utilisation * 100).toFixed(0) + '% of nominal';
+    html += '<br>nominal ' + num(f.nominal_forward, 0) +
+            ' fwd &middot; ' + num(f.nominal_reverse, 0) + ' rev MW';
+    html += '<br>limits ' + num(f.export_limit, 0) +
+            ' &middot; ' + num(f.import_limit, 0) + ' MW';
     if (stale) html += ' &middot; <span style="color:#e0a63c">stale</span>';
     else if (typeof f.age === "number") html += ' &middot; ' + f.age.toFixed(0) + 's old';
   }

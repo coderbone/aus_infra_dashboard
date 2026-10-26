@@ -50,6 +50,20 @@ A unit whose fueltech is coal, gas or distillate — the set that rolls up into 
 region's fossil generation. Wider than the map's coal and gas buckets, which
 exclude distillate because the map draws it on its own.
 
+## Interconnectors
+
+**Nominal rating**:
+A link's transfer capability in one direction under system-normal conditions,
+in MW. Published separately for each direction, because a link can be
+asymmetric — VIC1-NSW1 is 1700 MW one way and 1450 the other.
+_Avoid_: capacity (that word is taken by registered capacity and registered
+storage capacity, which are per unit, not per link and not per direction)
+
+**Utilisation**:
+A link's flow as a fraction of the nominal rating for the direction it is
+travelling. Never taken against the dynamic dispatch limits.
+_Avoid_: load factor
+
 ## Capacity
 
 **Registered storage capacity**:

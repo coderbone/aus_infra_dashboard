@@ -18,6 +18,7 @@ Stdlib only; runs inside python:3.12-alpine.
 
 import argparse
 import json
+import math
 import os
 import threading
 import time
@@ -40,8 +41,16 @@ LIVE_QUERIES = {
     "interconnectors": {
         "flow": {"expr": "aemo_interconnector_flow_mw", "key": "interconnector"},
         "metered": {"expr": "aemo_interconnector_metered_flow_mw", "key": "interconnector"},
+        # Dynamic dispatch limits, carried for display only. They are NOT the
+        # denominator of any load factor: they bend to the binding constraint,
+        # go negative on some links and can collapse onto the flow itself, so a
+        # utilisation taken against them is meaningless. The nominal ratings
+        # below are the system-normal capability and are what a link is measured
+        # against. See the exporter's INTERCONNECTOR_NOMINAL_MW comment.
         "export_limit": {"expr": "aemo_interconnector_export_limit_mw", "key": "interconnector"},
         "import_limit": {"expr": "aemo_interconnector_import_limit_mw", "key": "interconnector"},
+        "nominal_forward": {"expr": "aemo_interconnector_nominal_forward_mw", "key": "interconnector"},
+        "nominal_reverse": {"expr": "aemo_interconnector_nominal_reverse_mw", "key": "interconnector"},
         "timestamp": {"expr": "aemo_interconnector_timestamp_seconds", "key": "interconnector"},
         "age": {"expr": "aemo_interconnector_age_seconds", "key": "interconnector"},
     },
@@ -140,6 +149,45 @@ def _merge(accum, field, spec, labels, value):
         obj[field] = float(value)
 
 
+def _number(value):
+    """`value` as a finite float, or None when it is not one.
+
+    Readings arrive as strings, and the exporter writes `NaN` for a missing
+    one - `float("NaN")` is a float that satisfies neither `< 0` nor `<= 0`,
+    so it would sail past a plain isinstance check, reach `json.dumps`, and
+    come out as a bare `NaN` that the browser's `response.json()` rejects,
+    taking the whole payload with it.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _utilisation(link):
+    """How loaded a link is, as a fraction of its nominal rating.
+
+    Each direction has its own nominal: AEMO publishes them separately and a
+    link can be asymmetric (VIC1-NSW1 is 1700 MW one way, 1450 the other), so
+    the flow's sign picks the denominator - positive is the forward direction,
+    which is how `nominal_forward` is defined.
+
+    Deliberately not the dynamic dispatch limits, although those are also in the
+    payload for display. They bend to the binding constraint, go negative on
+    some links and can collapse onto the flow itself, so dividing by them reads
+    a heavily loaded link as idle and an idle one as full.
+
+    None when there is no rating to divide by: a link with flow but no known
+    nominal is unknown, not infinitely loaded.
+    """
+    flow = _number(link.get("flow"))
+    if flow is None:
+        return None
+    nominal = _number(link.get("nominal_reverse") if flow < 0 else link.get("nominal_forward"))
+    if nominal is None or nominal <= 0:
+        return None
+    return abs(flow) / nominal
+
+
 def build_live(at: float | None = None):
     out = {"fetched_at": time.time(), "prometheus": "ok", "errors": [],
            "interconnectors": {}, "regions": {}, "batteries": {}, "units": {},
@@ -154,6 +202,10 @@ def build_live(at: float | None = None):
             except Exception as exc:  # noqa: BLE001 - one bad metric must not sink the page
                 out["prometheus"] = "degraded"
                 out["errors"].append(f"{spec['expr']}: {exc}")
+    # Derived here rather than in the browser: the front end styles from a
+    # number instead of recomputing a rule it has no way to test.
+    for link in out["interconnectors"].values():
+        link["utilisation"] = _utilisation(link)
     fl = build_fleet()
     out["fleet"] = fl.get("fleet", []) if isinstance(fl, dict) else fl
     out["renewables"] = fl.get("renewables", []) if isinstance(fl, dict) else []

@@ -419,7 +419,7 @@ INTERCONNECTOR_OPTIONAL = (
 # the system-normal nominal ratings, deliberately *not* the dynamic
 # EXPORTLIMIT/IMPORTLIMIT the dispatch engine publishes: those bend to the
 # binding constraint, go negative on some links and even collapse onto the flow
-# itself, so a load factor taken against them is meaningless. A link absent
+# itself, so a utilisation taken against them is meaningless. A link absent
 # here publishes no nominal series. VNI's rating is a range under different
 # network conditions (400-1700 MW); the upper bound is used as the nominal.
 INTERCONNECTOR_NOMINAL_MW = {

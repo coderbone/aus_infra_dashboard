@@ -200,6 +200,19 @@ Because a personal key is tied to one person's quota and account, a stack meant
 to be cloned should read its own key from the cloner. That is what
 `.env.example` is for. If you share this stack, do not ship your `.env`.
 
+## Tests
+
+```bash
+python3 -m unittest discover -s scrapers -t scrapers   # the four exporters
+python3 -m unittest discover -s webmap -t webmap       # the web map's live feed
+```
+
+Two roots, because `unittest discover` takes a single start directory and the
+importable top-level directory has to match it (`-t`), and the map's server is
+not an exporter. Both run from the repo root, offline: the
+exporters replay captured upstream responses from `scrapers/fixtures/`, and the
+map's payload builder is tested with Prometheus stubbed.
+
 ## Verify
 
 ```bash

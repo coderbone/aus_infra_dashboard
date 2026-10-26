@@ -671,7 +671,11 @@ series are genuinely live (age = the 5-minute interval behind the reading).
 No public per-DUID live SOC exists, so the intraday poller builds one: each
 storage unit is anchored at the daily report's `ENERGY_STORAGE` and the measured
 `Dispatch_SCADA` MW is integrated across every 5-minute interval
-(`charge_efficiency×|MW|×dt` while charging, `MW×dt` while discharging). The raw
+(`charge_efficiency×|MW|×dt` while charging, `MW×dt` while discharging). The
+arithmetic and its policy live in the pure `inference` module
+(`scrapers/inference.py`, see `docs/adr/0004`); the poller supplies the anchor,
+the measured steps and the impure parts (archive backfill, state file, the
+live-step guard). The raw
 integral is clamped into `[0, capacity]`: the zero floor always applies, and the
 100% ceiling applies wherever `--fleet-cache-file` supplies the unit's
 registered storage capacity (the OE exporter's cache). `--no-infer-clamp` serves

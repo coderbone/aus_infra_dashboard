@@ -291,6 +291,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import fleet
+import inference
 import links
 
 DEFAULT_DATA_URL = "https://nemweb.com.au/Reports/Current/Next_Day_Dispatch/"
@@ -2437,50 +2438,44 @@ class IntradayPoller:
         return True
 
     def _prune_stale(self, now: float) -> None:
-        limit = now - MAX_INFER_GAP_HOURS * 3600.0
+        limit = now - self._infer_policy().max_gap_hours * 3600.0
         self._inferred = {d: u for d, u in self._inferred.items() if u["ts"] > limit}
+
+    def _infer_policy(self) -> inference.Policy:
+        """The estimator's policy, stated from this poller's live settings.
+
+        Built per call because the tests - and the CLI - mutate
+        `charge_efficiency` and `infer_clamp` after construction.
+        """
+        return inference.Policy(
+            charge_efficiency=self.charge_efficiency,
+            max_gap_hours=MAX_INFER_GAP_HOURS,
+            clamp=self.infer_clamp,
+        )
 
     def _clamp_inferred(
         self, raw: float, capacity: float | None = None
     ) -> tuple[float, float]:
         """Clamp the inferred stored MWh into [0, capacity]; returns (mwh, flag).
 
-        Stored energy cannot go below zero, and - when the unit's registered
-        storage capacity is known (OE fleet cache) - cannot exceed it either, so
-        a raw integral outside that envelope is pinned at the boundary. The flag
-        reports the raw integral leaving the envelope whether or not clamping is
-        applied, so a battery held at empty or full is distinguishable from one
-        genuinely there - the OE exporter's `saturated` convention. A unit with
-        no known capacity (not in the OE fleet, or no cache file) is floored at
-        zero only, the pre-capacity behaviour.
+        Thin delegation to `inference.clamp_stored`, which owns the rule: the
+        zero floor applies regardless; the top clamp only where a registered
+        storage capacity is known; the flag reports the raw integral leaving
+        the envelope whether or not clamping is applied.
         """
-        high = float(capacity) if capacity is not None and capacity > 0.0 else None
-        clamped = 1.0 if (raw < 0.0 or (high is not None and raw > high)) else 0.0
-        if not self.infer_clamp:
-            return raw, clamped
-        mwh = max(0.0, raw)
-        if high is not None:
-            mwh = min(mwh, high)
-        return mwh, clamped
+        return inference.clamp_stored(raw, capacity, self._infer_policy())
 
     def _advance_entry(
         self, entry: dict, ts: float, power: float, capacity: float | None = None
     ) -> dict:
         """Integrate one measured 5-minute power step into the inferred entry.
 
-        Shared by the live advance and the archive backfill. A step that does
-        not move the clock returns the entry unchanged, so re-sent or out-of-
-        order archive rows never double-count.
+        Thin delegation to `inference.advance`, shared by the live advance and
+        the archive backfill. A step that does not move the clock returns the
+        entry unchanged, so re-sent or out-of-order archive rows never
+        double-count.
         """
-        delta_hours = (ts - entry["ts"]) / 3600.0
-        if delta_hours <= 0:
-            return entry
-        if power > 0:
-            delta = -power * delta_hours
-        else:
-            delta = -power * delta_hours * self.charge_efficiency
-        mwh, clamped = self._clamp_inferred(entry["mwh"] + delta, capacity)
-        return {"ts": ts, "mwh": mwh, "clamped": clamped}
+        return inference.advance(entry, ts, power, capacity, self._infer_policy())
 
     def _backfill_if_stale(self, end_ts: float | None, now: float) -> None:
         """Reconstruct any anchor->live gap from the SCADA archive, once.
@@ -2622,6 +2617,7 @@ class IntradayPoller:
                     "ts": float(entry["ts"]), "mwh": mwh, "clamped": clamped,
                 }
         self._backfill_if_stale(end_ts, now)
+        policy = self._infer_policy()
         for duid, u in scada_units.items():
             if not isinstance(duid, str) or not isinstance(u, dict):
                 continue
@@ -2637,7 +2633,7 @@ class IntradayPoller:
             if delta_hours <= 0:
                 continue
             delta_seconds = delta_hours * 3600.0
-            if delta_hours > MAX_INFER_GAP_HOURS:
+            if delta_hours > policy.max_gap_hours:
                 self._inferred.pop(duid, None)
                 continue
             if (
@@ -2774,7 +2770,7 @@ class IntradayPoller:
 
     def _infer_view(self, now: float) -> dict:
         """Snapshot for rendering: live units only, plus the anchor's age."""
-        limit = now - MAX_INFER_GAP_HOURS * 3600.0
+        limit = now - self._infer_policy().max_gap_hours * 3600.0
         with self._lock:
             anchor = self._anchor_file
             inferred = {

@@ -38,7 +38,6 @@ import argparse
 import errno
 import json
 import logging
-import math
 import os
 import random
 import re
@@ -50,6 +49,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from exposition import escape_label, fmt
 
 DEFAULT_PAGE_URL = "https://caportal.com.au/rms/wht/tbm-tracker"
 ARCGIS_ITEM_DATA = "https://www.arcgis.com/sharing/rest/content/items/{item_id}/data?f=json"
@@ -489,21 +490,6 @@ def collect(
 # --------------------------------------------------------------------------- #
 # Prometheus exposition
 # --------------------------------------------------------------------------- #
-
-
-def escape_label(value: str) -> str:
-    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
-
-
-def fmt(value) -> str:
-    if value is None:
-        return "NaN"
-    number = float(value)
-    if math.isnan(number) or math.isinf(number):
-        return "NaN" if math.isnan(number) else ("+Inf" if number > 0 else "-Inf")
-    if number.is_integer():
-        return str(int(number))
-    return repr(round(number, 4))
 
 
 def render(

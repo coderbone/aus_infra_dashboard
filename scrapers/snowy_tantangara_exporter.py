@@ -63,7 +63,6 @@ import argparse
 import errno
 import json
 import logging
-import math
 import os
 import random
 import socket
@@ -75,6 +74,8 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from exposition import escape_label, fmt
 
 DEFAULT_DATA_URL = (
     "https://www.snowyhydro.com.au/wp-content/themes/snowyhydro/inc/getData.php"
@@ -496,21 +497,6 @@ def collect(
 # --------------------------------------------------------------------------- #
 # Prometheus exposition
 # --------------------------------------------------------------------------- #
-
-
-def escape_label(value: str) -> str:
-    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
-
-
-def fmt(value) -> str:
-    if value is None:
-        return "NaN"
-    number = float(value)
-    if math.isnan(number) or math.isinf(number):
-        return "NaN" if math.isnan(number) else ("+Inf" if number > 0 else "-Inf")
-    if number.is_integer():
-        return str(int(number))
-    return repr(round(number, 4))
 
 
 # Ordered as they are documented. `change_days` is a parameter, so the metric

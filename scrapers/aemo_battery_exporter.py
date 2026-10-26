@@ -275,7 +275,6 @@ import errno
 import io
 import json
 import logging
-import math
 import os
 import random
 import re
@@ -291,6 +290,7 @@ from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from exposition import escape_label, fmt
 import fleet
 import inference
 import links
@@ -1235,21 +1235,6 @@ def region_interchange(interconnectors: dict) -> dict:
 # --------------------------------------------------------------------------- #
 # Prometheus exposition
 # --------------------------------------------------------------------------- #
-
-
-def escape_label(value: str) -> str:
-    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
-
-
-def fmt(value) -> str:
-    if value is None:
-        return "NaN"
-    number = float(value)
-    if math.isnan(number) or math.isinf(number):
-        return "NaN" if math.isnan(number) else ("+Inf" if number > 0 else "-Inf")
-    if number.is_integer():
-        return str(int(number))
-    return repr(round(number, 4))
 
 
 # Per-unit gauges, in the order they are documented. `key` is the per-unit

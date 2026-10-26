@@ -103,7 +103,6 @@ import argparse
 import errno
 import json
 import logging
-import math
 import os
 import random
 import socket
@@ -115,6 +114,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from exposition import escape_label, fmt
 import fleet
 
 DEFAULT_API_BASE = "https://api.openelectricity.org.au"
@@ -410,21 +410,6 @@ def unit_rows(fl: "fleet.Fleet | None", require_data: bool = True) -> list[dict]
 # --------------------------------------------------------------------------- #
 # Prometheus exposition
 # --------------------------------------------------------------------------- #
-
-
-def escape_label(value: str) -> str:
-    return str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
-
-
-def fmt(value) -> str:
-    if value is None:
-        return "NaN"
-    number = float(value)
-    if math.isnan(number) or math.isinf(number):
-        return "NaN" if math.isnan(number) else ("+Inf" if number > 0 else "-Inf")
-    if number.is_integer():
-        return str(int(number))
-    return repr(round(number, 6))
 
 
 def label_set(sample: dict) -> str:

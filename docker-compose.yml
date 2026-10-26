@@ -64,6 +64,9 @@ services:
       - 9.9.9.9
     volumes:
       - ./scrapers/wht_tbm_exporter.py:/app/wht_tbm_exporter.py:ro
+      # The shared exposition formatter (`escape_label`/`fmt`), mounted beside
+      # the exporter so `from exposition import ...` resolves. See docs/adr/0007.
+      - ./scrapers/exposition.py:/app/exposition.py:ro
       - exporter-cache:/cache
     networks: [monitoring]
     restart: unless-stopped
@@ -112,6 +115,9 @@ services:
     # copy - a cached level would be exported as if it were a current reading.
     volumes:
       - ./scrapers/snowy_tantangara_exporter.py:/app/snowy_tantangara_exporter.py:ro
+      # The shared exposition formatter (`escape_label`/`fmt`), mounted beside
+      # the exporter so `from exposition import ...` resolves. See docs/adr/0007.
+      - ./scrapers/exposition.py:/app/exposition.py:ro
     networks: [monitoring]
     restart: unless-stopped
     # TCP probe only, same reasoning as tbm-exporter: /healthz triggers a real
@@ -155,6 +161,10 @@ services:
       - 9.9.9.9
     volumes:
       - ./scrapers/oe_battery_exporter.py:/app/oe_battery_exporter.py:ro
+      # The shared exposition formatter (`escape_label`/`fmt`): one definition
+      # across all four exporters, replacing this exporter's private six-
+      # decimal copy. See docs/adr/0007.
+      - ./scrapers/exposition.py:/app/exposition.py:ro
       # The shared fleet module: it writes the cache below and owns how it is
       # read, so all three readers apply the same rules. Reopens the one-file-
       # per-exporter convention - see docs/adr/0002.
@@ -225,6 +235,9 @@ services:
       - 9.9.9.9
     volumes:
       - ./scrapers/aemo_battery_exporter.py:/app/aemo_battery_exporter.py:ro
+      # The shared exposition formatter (`escape_label`/`fmt`), same
+      # arrangement as the fleet module below. See docs/adr/0007.
+      - ./scrapers/exposition.py:/app/exposition.py:ro
       # Shared fleet module, mounted beside the exporter so `import fleet`
       # resolves with no PYTHONPATH. See docs/adr/0002.
       - ./scrapers/fleet.py:/app/fleet.py:ro

@@ -809,10 +809,12 @@ markers fill with travels the same way: stated once in `scrapers/soc_policy.py`
 in the browser — the dashboard's bar gauge reads the same module. The payload's
 per-unit capacity (the SoC denominator) comes from the fleet module alone;
 there is deliberately no Prometheus capacity series beside it. `./webmap/static/app.js` polls
-`/data/live` every 30s, which the server builds from one Prometheus instant
-query per field — 27 of them, for the interconnector flow/limits/nominal and region
-stored/fossil/curtailment series above, plus the top dozen `oe_battery_*`
-units — and it ships so the map is not left depending on the point-in-time
+`/data/live` every 30s, which the server assembles behind a snapshot seam: one
+batched instant query per metric group (a regex `__name__` selector covering the
+interconnector flow/limits/nominal, region stored/fossil/curtailment, battery
+and unit series, and the reservoir levels) — five round trips, an in-memory
+adapter covers the assembly in tests — and a failed batch degrades its group
+without sinking the rest, so the map is not left depending on the point-in-time
 state of any one poll.
 
 Two properties matter for the sign convention this README insists on: the map

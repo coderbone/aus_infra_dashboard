@@ -1,10 +1,15 @@
 """Tests for the web map's live payload builder.
 
-The seam is `server.build_live()` with `_query_prometheus` stubbed: it is the
-public boundary the front end consumes, so it is where the payload's contract
-is observable without a running Prometheus. What it cannot see - whether
-Prometheus serves the metrics at all, and how the front end turns a number into
-a colour - is verified against the live stack instead.
+The seam is `server.build_live()` fed by a snapshot source. Two adapters sit
+behind it: `server.MemorySource`, an in-memory one carrying canned series in
+Prometheus wire shape, which every assembly test below uses; and
+`server.PrometheusSource`, the production one, pinned through the
+`_query_prometheus` HTTP boundary - one batched instant query per group, no
+capacity metric, and a failed batch that degrades without sinking the rest.
+
+What these tests cannot see - whether Prometheus serves the metrics at all,
+and how the front end turns a number into a colour - is verified against the
+live stack instead.
 
 Run with the second discovery root, from the repo root:
 
@@ -44,11 +49,11 @@ MISSING = "MISSING"  # the exporter writes NaN for a reading it does not have
 # the exporter publishes exactly those numbers.
 RATED_IDS = (VICTORIA_NSW, BASSLINK)
 
-# query -> {interconnector: value}. Queries absent here return no series, which
-# is what an exporter that has not published them would look like. The nominal
-# series are built from the registry - the exporter publishes exactly those
-# numbers - so the ratings exist in one place; the other values are synthetic
-# Prometheus output, not link facts.
+# metric -> {key: value}, the in-memory adapter's canned series. Queries absent
+# here return no series, which is what an exporter that has not published them
+# would look like. The nominal series are built from the registry - the
+# exporter publishes exactly those numbers - so the ratings exist in one place;
+# the other values are synthetic Prometheus output, not link facts.
 SERIES = {
     "aemo_interconnector_flow_mw": {
         VICTORIA_NSW: 690.8, BASSLINK: -33.1, UNRATED: 100.0, MISSING: "NaN",
@@ -70,17 +75,13 @@ SERIES = {
 }
 
 
-def fake_query(query: str, timeout: float = 10.0, at=None):
-    return [
-        {"metric": {"interconnector": ic}, "value": [1700000000.0, str(value)]}
-        for ic, value in SERIES.get(query, {}).items()
-    ]
+def memory(series=None, fail=()) -> server.MemorySource:
+    return server.MemorySource(series if series is not None else SERIES, fail=fail)
 
 
 class BuildLiveTest(unittest.TestCase):
-    def build(self) -> dict:
-        with mock.patch.object(server, "_query_prometheus", fake_query):
-            return server.build_live()
+    def build(self, source=None) -> dict:
+        return server.build_live(source=source or memory())
 
     def test_nominal_ratings_reach_the_front_end(self):
         """The front end must get the ratings through the live feed, so that
@@ -136,6 +137,112 @@ class BuildLiveTest(unittest.TestCase):
         self.assertIsNone(live["interconnectors"][MISSING]["utilisation"])
 
 
+class SnapshotSeamTest(unittest.TestCase):
+    """The assembly must not care where its readings come from, and the
+    production adapter must not go back to one Prometheus round trip per
+    field."""
+
+    @staticmethod
+    def _record_queries(raise_for=None):
+        """Patch the HTTP boundary with a recorder of every batch expr issued.
+
+        Returns the list `build_live` will have appended to. `raise_for` is a
+        substring that makes the matching batch raise, as a dead Prometheus
+        call would.
+        """
+        queried = []
+
+        def recording(query, timeout=10.0, at=None):
+            queried.append(query)
+            if raise_for is not None and raise_for in query:
+                raise RuntimeError("connection refused")
+            return []
+
+        return mock.patch.object(server, "_query_prometheus", recording), queried
+
+    def test_the_payload_carries_every_group_the_front_end_reads(self):
+        """Shape pin: whatever the source, the payload answers with every
+        group `applySnapshot` copies into state - an assembly that drops one
+        would blank a whole layer of the map."""
+        live = server.build_live(source=memory({}))
+        for key in (
+            "fetched_at", "prometheus", "errors", "interconnectors", "regions",
+            "batteries", "units", "reservoirs", "soc_ramp",
+            "fleet", "renewables", "hydro", "coal", "gas", "distillate",
+        ):
+            self.assertIn(key, live, key)
+        self.assertEqual(live["prometheus"], "ok")
+        self.assertEqual(live["errors"], [])
+
+    def test_one_prometheus_round_trip_per_group(self):
+        """The payload used to cost one instant query per field - 27 in
+        total, repeated per historical frame during 24h playback. The batch
+        is one regex __name__ selector per group, so a full payload is
+        `len(LIVE_QUERIES)` round trips."""
+        patch, queried = self._record_queries()
+        with patch:
+            server.build_live()
+        self.assertEqual(len(queried), len(server.LIVE_QUERIES))
+
+    def test_the_reservoir_batch_keeps_its_lookback_window(self):
+        """The reservoir job scrapes hourly, outside Prometheus's 5m default
+        lookback, so its batch must stay wrapped in last_over_time - a bare
+        selector would blank the card for most of every hour."""
+        patch, queried = self._record_queries()
+        with patch:
+            server.build_live()
+        reservoir_batches = [
+            q for q in queried if "snowy_tantangara" in q
+        ]
+        self.assertEqual(len(reservoir_batches), 1)
+        self.assertTrue(reservoir_batches[0].startswith("last_over_time("), reservoir_batches[0])
+        self.assertIn("[2h]", reservoir_batches[0])
+
+    def test_no_batch_queries_for_capacity(self):
+        """The SoC denominator is the fleet module's, and the only one.
+
+        The payload used to carry a second cache-derived capacity - the
+        `oe_battery_capacity_storage_mwh` series the OE exporter publishes
+        from the same fleet.json - beside the fleet module's `capacity_mwh`.
+        The front end never divided by it; it existed only as a second reading
+        of the cache that a future change could pick up by mistake. Pinned at
+        the query level here; SoCPolicyTest pins the payload level.
+        """
+        patch, queried = self._record_queries()
+        with patch:
+            server.build_live()
+        self.assertFalse(
+            [q for q in queried if "capacity" in q],
+            "capacity must not be queried from Prometheus; the fleet module "
+            "supplies it",
+        )
+
+    def test_a_failed_group_degrades_the_payload_without_dropping_the_rest(self):
+        """One bad metric family must not sink the page: the failed group
+        reads as degraded, every other group still reaches the front end."""
+        series = {
+            **SERIES,
+            "aemo_unit_power_mw": {"ERB01": 50.0},
+        }
+        live = server.build_live(source=memory(series, fail={"regions"}))
+        self.assertEqual(live["prometheus"], "degraded")
+        self.assertTrue(any("regions" in err for err in live["errors"]), live["errors"])
+        # The rest survives.
+        self.assertEqual(live["interconnectors"][VICTORIA_NSW]["flow"], 690.8)
+        self.assertEqual(live["units"]["ERB01"]["power_mw"], 50.0)
+        self.assertEqual(live["regions"], {})
+
+    def test_a_failed_prometheus_batch_is_caught_by_the_adapter(self):
+        """The production adapter turns a raised batch into a group error
+        instead of an exception escaping build_live - the HTTP route's 500
+        path is for whole-build failures only."""
+        patch, _ = self._record_queries(raise_for="aemo_battery_region")
+        with patch:
+            live = server.build_live()
+        self.assertEqual(live["prometheus"], "degraded")
+        self.assertTrue(any("regions" in err for err in live["errors"]), live["errors"])
+
+
 class SoCPolicyTest(unittest.TestCase):
     """The SoC policy travels to the consumers that cannot import it.
 
@@ -146,8 +253,7 @@ class SoCPolicyTest(unittest.TestCase):
     """
 
     def build(self) -> dict:
-        with mock.patch.object(server, "_query_prometheus", fake_query):
-            return server.build_live()
+        return server.build_live(source=memory())
 
     def test_the_soc_ramp_reaches_the_front_end_from_the_policy_module(self):
         live = self.build()
@@ -165,27 +271,9 @@ class SoCPolicyTest(unittest.TestCase):
         self.assertEqual(ramp[-1]["v"], 1.0)
 
     def test_no_prometheus_capacity_series_reaches_the_payload(self):
-        """The SoC denominator is the fleet module's, and the only one.
-
-        The payload used to carry a second cache-derived capacity - the
-        `oe_battery_capacity_storage_mwh` series the OE exporter publishes
-        from the same fleet.json - beside the fleet module's `capacity_mwh`.
-        The front end never divided by it; it existed only as a second reading
-        of the cache that a future change could pick up by mistake.
-        """
-        queried = []
-
-        def recording_query(query, timeout=10.0, at=None):
-            queried.append(query)
-            return fake_query(query, timeout, at)
-
-        with mock.patch.object(server, "_query_prometheus", recording_query):
-            live = server.build_live()
-        self.assertFalse(
-            [q for q in queried if "capacity" in q],
-            "capacity must not be queried from Prometheus; the fleet module "
-            "supplies it",
-        )
+        """The SoC denominator is the fleet module's, and the only one - and
+        nothing named capacity may ride along in any battery's metrics."""
+        live = self.build()
         for unit_metrics in live.get("batteries", {}).values():
             self.assertNotIn("capacity_mwh", unit_metrics)
 
@@ -225,8 +313,7 @@ class SoCPolicyTest(unittest.TestCase):
             os.environ["FLEET_CACHE"] = cache
             server._fleet_cache.update(mtime=None, data=None)
             try:
-                with mock.patch.object(server, "_query_prometheus", fake_query):
-                    live = server.build_live()
+                live = server.build_live(source=memory())
             finally:
                 server._fleet_cache.update(old_memo)
                 if old_cache is None:

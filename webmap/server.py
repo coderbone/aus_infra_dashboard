@@ -5,6 +5,12 @@ Serves the static web map, proxies live metric queries to Prometheus, and
 aggregates them with the scraper fleet cache into one /data/live JSON blob the
 frontend polls.
 
+The live readings arrive through a snapshot seam: `build_live()` asks a source
+for per-group series and never talks to Prometheus itself. Two adapters sit
+behind the seam - `PrometheusSource`, one batched instant query per group for
+production, and `MemorySource`, canned wire-shape series for tests - so the
+assembly is covered without a running Prometheus.
+
 Routes:
   /                       html app
   /data/live              merged {interconnectors, regions, batteries, fleet,
@@ -44,29 +50,31 @@ STATIC_DIR = os.environ.get("WEBMAP_STATIC", os.path.join(os.path.dirname(__file
 DATA_DIR = os.environ.get("WEBMAP_DATA", os.path.join(os.path.dirname(__file__), "data"))
 PROMETHEUS_URL = os.environ.get("PROM_URL", "http://prometheus:9090")
 
-# PromQL -> merge spec. Each field carries the label whose value identifies the
-# series (key) and, for multi-valued series (e.g. curtailment per fuel), an
-# extra label the value is filed under.
+# Metric -> merge spec. Each field carries the metric family it reads (metric),
+# the label whose value identifies the series (key) and, for multi-valued series
+# (e.g. curtailment per fuel), an extra label the value is filed under. The
+# Prometheus adapter batches a whole group into one regex __name__ selector, so
+# a field names its metric rather than its own ready-made query.
 LIVE_QUERIES = {
     "interconnectors": {
-        "flow": {"expr": "aemo_interconnector_flow_mw", "key": "interconnector"},
-        "metered": {"expr": "aemo_interconnector_metered_flow_mw", "key": "interconnector"},
+        "flow": {"metric": "aemo_interconnector_flow_mw", "key": "interconnector"},
+        "metered": {"metric": "aemo_interconnector_metered_flow_mw", "key": "interconnector"},
         # Dynamic dispatch limits, carried for display only - never a
         # denominator. `_utilisation` below says why they cannot be one.
-        "export_limit": {"expr": "aemo_interconnector_export_limit_mw", "key": "interconnector"},
-        "import_limit": {"expr": "aemo_interconnector_import_limit_mw", "key": "interconnector"},
-        "nominal_forward": {"expr": "aemo_interconnector_nominal_forward_mw", "key": "interconnector"},
-        "nominal_reverse": {"expr": "aemo_interconnector_nominal_reverse_mw", "key": "interconnector"},
-        "timestamp": {"expr": "aemo_interconnector_timestamp_seconds", "key": "interconnector"},
-        "age": {"expr": "aemo_interconnector_age_seconds", "key": "interconnector"},
+        "export_limit": {"metric": "aemo_interconnector_export_limit_mw", "key": "interconnector"},
+        "import_limit": {"metric": "aemo_interconnector_import_limit_mw", "key": "interconnector"},
+        "nominal_forward": {"metric": "aemo_interconnector_nominal_forward_mw", "key": "interconnector"},
+        "nominal_reverse": {"metric": "aemo_interconnector_nominal_reverse_mw", "key": "interconnector"},
+        "timestamp": {"metric": "aemo_interconnector_timestamp_seconds", "key": "interconnector"},
+        "age": {"metric": "aemo_interconnector_age_seconds", "key": "interconnector"},
     },
     "regions": {
-        "stored_mwh": {"expr": "aemo_battery_region_stored_mwh", "key": "region"},
-        "fossil_mw": {"expr": "aemo_battery_region_fossil_generation_mw", "key": "region"},
-        "rooftop_mw": {"expr": "aemo_battery_region_rooftop_solar_mw", "key": "region"},
-        "import_mw": {"expr": "aemo_battery_region_import_mw", "key": "region"},
-        "export_mw": {"expr": "aemo_battery_region_export_mw", "key": "region"},
-        "curtail": {"expr": "aemo_battery_region_curtailment_mw", "key": "region", "extra": "fuel"},
+        "stored_mwh": {"metric": "aemo_battery_region_stored_mwh", "key": "region"},
+        "fossil_mw": {"metric": "aemo_battery_region_fossil_generation_mw", "key": "region"},
+        "rooftop_mw": {"metric": "aemo_battery_region_rooftop_solar_mw", "key": "region"},
+        "import_mw": {"metric": "aemo_battery_region_import_mw", "key": "region"},
+        "export_mw": {"metric": "aemo_battery_region_export_mw", "key": "region"},
+        "curtail": {"metric": "aemo_battery_region_curtailment_mw", "key": "region", "extra": "fuel"},
     },
     "batteries": {
         # OE keeps exporting only fleet metadata; the per-unit SOC/power/stored
@@ -76,16 +84,16 @@ LIVE_QUERIES = {
         # build_fleet), and a Prometheus capacity would be a second reading of
         # the same fleet.json. See docs/adr/0005.
         # whole-fleet live coverage from the AEMO exporter's per-unit estimates
-        "inf_stored_mwh": {"expr": "aemo_battery_inferred_stored_mwh", "key": "unit"},
-        "inf_age_s": {"expr": "aemo_battery_inferred_age_seconds", "key": "unit"},
-        "inf_timestamp": {"expr": "aemo_battery_inferred_timestamp_seconds", "key": "unit"},
+        "inf_stored_mwh": {"metric": "aemo_battery_inferred_stored_mwh", "key": "unit"},
+        "inf_age_s": {"metric": "aemo_battery_inferred_age_seconds", "key": "unit"},
+        "inf_timestamp": {"metric": "aemo_battery_inferred_timestamp_seconds", "key": "unit"},
         # peak stored energy over the commissioning window (recording rule), used
         # to shade a commissioning facility's progress arc
-        "peak_stored_mwh": {"expr": "aemo_battery_peak_stored_mwh", "key": "unit"},
+        "peak_stored_mwh": {"metric": "aemo_battery_peak_stored_mwh", "key": "unit"},
         # fresh 5-min SCADA power from AEMO
-        "aemo_power_mw": {"expr": "aemo_battery_power_mw", "key": "unit"},
-        "aemo_power_age_s": {"expr": "aemo_battery_power_age_seconds", "key": "unit"},
-        "aemo_power_ts": {"expr": "aemo_battery_power_timestamp_seconds", "key": "unit"},
+        "aemo_power_mw": {"metric": "aemo_battery_power_mw", "key": "unit"},
+        "aemo_power_age_s": {"metric": "aemo_battery_power_age_seconds", "key": "unit"},
+        "aemo_power_ts": {"metric": "aemo_battery_power_timestamp_seconds", "key": "unit"},
     },
     # Every dispatch unit (generators, loads, storage) with its live measured MW
     # and fueltech/region labels. This is what lets the map shade
@@ -100,24 +108,34 @@ LIVE_QUERIES = {
     # two label namespaces into one. Units with no fleet row carry an empty
     # `unit` and so never match a lookup. See docs/adr/0001.
     "units": {
-        "power_mw": {"expr": "aemo_unit_power_mw", "key": "unit"},
-        "age_s": {"expr": "aemo_unit_power_age_seconds", "key": "unit"},
-        "timestamp": {"expr": "aemo_unit_power_timestamp_seconds", "key": "unit"},
+        "power_mw": {"metric": "aemo_unit_power_mw", "key": "unit"},
+        "age_s": {"metric": "aemo_unit_power_age_seconds", "key": "unit"},
+        "timestamp": {"metric": "aemo_unit_power_timestamp_seconds", "key": "unit"},
     },
     # Snowy Hydro reservoir levels, reported per reservoir label by the
-    # reservoir-exporter (compose runs it with --all-reservoirs). Wrapped in
-    # last_over_time because this job is scraped hourly while Prometheus's
-    # default lookback delta is 5m: a bare selector is only answerable for the
-    # five minutes after each scrape and would blank the card for most of the
-    # hour. A 2h window survives a skipped scrape and still clears the card
-    # within 2h if the exporter dies - generous is safe here because the
-    # upstream publishes these levels once a day. An absent exporter yields an
-    # empty result, not an error, so it never degrades the whole page.
+    # reservoir-exporter (compose runs it with --all-reservoirs). The whole
+    # group is wrapped in last_over_time because this job is scraped hourly
+    # while Prometheus's default lookback delta is 5m: a bare selector is only
+    # answerable for the five minutes after each scrape and would blank the
+    # card for most of the hour. A 2h window survives a skipped scrape and
+    # still clears the card within 2h if the exporter dies - generous is safe
+    # here because the upstream publishes these levels once a day. An absent
+    # exporter yields an empty result, not an error, so it never degrades the
+    # whole page.
     "reservoirs": {
-        "level": {"expr": "last_over_time(snowy_tantangara_level_percent[2h])", "key": "reservoir"},
-        "change_7d": {"expr": "last_over_time(snowy_tantangara_level_change_7d_percentage_points[2h])", "key": "reservoir"},
-        "last_sample": {"expr": "last_over_time(snowy_tantangara_last_sample_timestamp_seconds[2h])", "key": "reservoir"},
+        "level": {"metric": "snowy_tantangara_level_percent", "key": "reservoir", "window": "2h"},
+        "change_7d": {"metric": "snowy_tantangara_level_change_7d_percentage_points", "key": "reservoir", "window": "2h"},
+        "last_sample": {"metric": "snowy_tantangara_last_sample_timestamp_seconds", "key": "reservoir", "window": "2h"},
     },
+}
+
+# metric name -> (group, field, spec). Metric names are unique across the
+# table, which is what lets a batched result set - every series the group's
+# regex selector returned, tagged with __name__ - be filed back onto fields.
+_FIELD_BY_METRIC = {
+    spec["metric"]: (group, field, spec)
+    for group, fields in LIVE_QUERIES.items()
+    for field, spec in fields.items()
 }
 
 STATIC_TYPES = {
@@ -196,7 +214,96 @@ def _utilisation(link):
     return abs(flow) / nominal
 
 
-def build_live(at: float | None = None):
+def _batch_expr(fields: dict) -> str:
+    """One instant query for every metric a group needs.
+
+    A regex __name__ selector returns each metric family in one result set,
+    tagged with __name__, which is what build_live keys the merge by.
+    Prometheus anchors regex matchers fully, so the alternation cannot
+    over-match a metric outside the group. A group is either wholly windowed
+    (the reservoirs' last_over_time) or not; a mixed group is a table bug.
+    """
+    names = "|".join(sorted(spec["metric"] for spec in fields.values()))
+    selector = '{__name__=~"%s"}' % names
+    windows = {spec.get("window") for spec in fields.values() if spec.get("window")}
+    if len(windows) > 1:
+        raise ValueError("one lookback window per group")
+    if windows:
+        return "last_over_time(%s[%s])" % (selector, next(iter(windows)))
+    return selector
+
+
+class PrometheusSource:
+    """Production snapshot adapter: one batched instant query per group.
+
+    This used to be one query per field - 27 round trips per payload, and per
+    historical frame during the front end's 24h playback. A failed batch is
+    caught here and returned as a group error, so one dead metric family
+    degrades its group without sinking the others; build_live turns the
+    errors into the payload's degraded status.
+    """
+
+    def fetch(self, at: float | None = None):
+        groups, errors = {}, []
+        for group, fields in LIVE_QUERIES.items():
+            try:
+                groups[group] = _query_prometheus(_batch_expr(fields), at=at)
+            except Exception as exc:  # noqa: BLE001 - one bad batch must not sink the page
+                groups[group] = []
+                errors.append(f"{group}: {exc}")
+        return groups, errors
+
+
+class MemorySource:
+    """In-memory snapshot adapter: canned series in Prometheus wire shape.
+
+    The test double for the Prometheus path - same `fetch` contract, no
+    network - so the assembly is exercised exactly as production runs it.
+    `series` maps a metric name to {key: value}; a value that is a dict is
+    expanded per key of the field's `extra` label (curtailment per fuel).
+    `fail` names groups whose batch reports an error, mirroring a Prometheus
+    batch that failed and was caught by the adapter.
+    """
+
+    def __init__(self, series: dict | None = None, fail=()):
+        self.series = series or {}
+        self.fail = set(fail)
+
+    def fetch(self, at: float | None = None):
+        groups, errors = {}, []
+        for group, fields in LIVE_QUERIES.items():
+            groups[group] = []
+            if group in self.fail:
+                errors.append(f"{group}: canned failure")
+                continue
+            for field, spec in fields.items():
+                metric = spec["metric"]
+                for key, value in self.series.get(metric, {}).items():
+                    if spec.get("extra") and isinstance(value, dict):
+                        for extra_key, nested in value.items():
+                            groups[group].append({
+                                "metric": {"__name__": metric, spec["key"]: key,
+                                           spec["extra"]: extra_key},
+                                "value": [1700000000.0, str(nested)],
+                            })
+                    else:
+                        groups[group].append({
+                            "metric": {"__name__": metric, spec["key"]: key},
+                            "value": [1700000000.0, str(value)],
+                        })
+        return groups, errors
+
+
+def build_live(at: float | None = None, source=None):
+    """The /data/live payload: readings from the snapshot source, shaped for
+    the front end and merged with the fleet cache.
+
+    The source defaults to the production Prometheus adapter; tests pass a
+    MemorySource. Errors the source reports (a failed group batch) mark the
+    payload degraded without dropping the groups that did answer.
+    """
+    if source is None:
+        source = PrometheusSource()
     out = {"fetched_at": time.time(), "prometheus": "ok", "errors": [],
            "interconnectors": {}, "regions": {}, "batteries": {}, "units": {},
            "reservoirs": {}}
@@ -212,14 +319,18 @@ def build_live(at: float | None = None):
         {"v": value / 100.0, "c": list(rgb)}
         for value, rgb in soc_policy.SOC_RAMP
     ]
-    for group, fields in LIVE_QUERIES.items():
-        for field, spec in fields.items():
-            try:
-                for series in _query_prometheus(spec["expr"], at=at):
-                    _merge(out[group], field, spec, series.get("metric", {}), series.get("value", [None, None])[1])
-            except Exception as exc:  # noqa: BLE001 - one bad metric must not sink the page
-                out["prometheus"] = "degraded"
-                out["errors"].append(f"{spec['expr']}: {exc}")
+    groups, errors = source.fetch(at)
+    out["errors"] = list(errors)
+    if errors:
+        out["prometheus"] = "degraded"
+    for group, series_list in groups.items():
+        for series in series_list:
+            labels = series.get("metric", {})
+            located = _FIELD_BY_METRIC.get(labels.get("__name__"))
+            if located is None or located[0] != group:
+                continue  # a series the table does not field (or the wrong batch)
+            _, field, spec = located
+            _merge(out[group], field, spec, labels, series.get("value", [None, None])[1])
     # Derived here rather than in the browser: the front end styles from a
     # number instead of recomputing a rule it has no way to test.
     for link in out["interconnectors"].values():

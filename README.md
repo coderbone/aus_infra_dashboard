@@ -211,7 +211,8 @@ Two roots, because `unittest discover` takes a single start directory and the
 importable top-level directory has to match it (`-t`), and the map's server is
 not an exporter. Both run from the repo root, offline: the
 exporters replay captured upstream responses from `scrapers/fixtures/`, and the
-map's payload builder is tested with Prometheus stubbed.
+map's payload builder is tested against an in-memory snapshot source, with the
+Prometheus adapter's batched queries stubbed at the HTTP boundary.
 
 ## Verify
 

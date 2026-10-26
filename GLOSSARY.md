@@ -113,7 +113,7 @@ estimator call)
 
 **Exposition formatter**:
 The single definition of how a value is written into the Prometheus text
-format - label-value escaping and sample-value formatting at four decimal
+format — label-value escaping and sample-value formatting at four decimal
 places (`scrapers/exposition.py`). All four exporters write through it;
 none carries a private copy.
 _Avoid_: fmt (that is one function; this is the contract)

@@ -349,24 +349,24 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "dark-red",
-                "value": 0
+                "color": "#D93046",
+                "value": 0.0
               },
               {
-                "color": "orange",
-                "value": 25
+                "color": "#E5773C",
+                "value": 25.0
               },
               {
-                "color": "yellow",
-                "value": 50
+                "color": "#E0B343",
+                "value": 50.0
               },
               {
-                "color": "green",
-                "value": 75
+                "color": "#9CC84F",
+                "value": 75.0
               },
               {
-                "color": "green",
-                "value": 100
+                "color": "#5EC16B",
+                "value": 100.0
               }
             ]
           },
@@ -1153,7 +1153,7 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
-      "description": "Per-unit state of charge dead-reckoned from the daily `Next_Day_Dispatch` ENERGY_STORAGE anchor and integrated 5-minute `Dispatch_SCADA` MW, using the same charging-leg convention as the OE exporter's inference (`charge_efficiency \u00d7 |MW|\u00d7dt` when charging, `MW\u00d7dt` when discharging). Only units present in the daily anchor and within `MAX_INFER_GAP_HOURS` of their last SCADA reading are shown (`aemo_battery_infer_success == 1` when the feed is live). Join to capacity is by DUID against the **whole-fleet** capacity gauge, so this is every unit AEMO knows. This is a complement to the region-reported aggregate, not a replacement.",
+      "description": "Per-unit state of charge dead-reckoned from the daily `Next_Day_Dispatch` ENERGY_STORAGE anchor and integrated 5-minute `Dispatch_SCADA` MW, using the same charging-leg convention as the OE exporter's inference (`charge_efficiency \u00d7 |MW|\u00d7dt` when charging, `MW\u00d7dt` when discharging). Only units present in the daily anchor and within 6h of their last SCADA reading are shown (`aemo_battery_infer_success == 1` when the feed is live). Join to capacity is by DUID against the **whole-fleet** capacity gauge, so this is every unit AEMO knows. This is a complement to the region-reported aggregate, not a replacement.",
       "fieldConfig": {
         "defaults": {
           "color": {

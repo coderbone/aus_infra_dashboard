@@ -100,3 +100,11 @@ _Avoid_: state of charge (a ratio, not an energy)
 The daily report's per-unit starting energy reading, which the inference
 advances from. Never stamped forward — a gap is rebuilt from the archive, or
 the series stays absent until the next daily report.
+
+**SoC policy**:
+The single definition of how state of charge is modelled and shown: the
+bridge-gap limit, the fitted charging share, and the colour ramp the
+dashboard's bar gauge and the map's battery markers both interpolate across.
+Consumers read it (`scrapers/soc_policy.py`); none restates it beside them.
+_Avoid_: policy (that is `inference.Policy`, the explicit input to one
+estimator call)

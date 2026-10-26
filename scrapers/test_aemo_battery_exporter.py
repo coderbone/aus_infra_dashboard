@@ -2125,7 +2125,12 @@ class InferenceTest(unittest.TestCase):
             path = self.write_fleet_cache(
                 tmp, [{"code": "ERB01", "capacity_storage": 200.0}]
             )
-            poller = make_intraday(battery_duids={"ERB01"}, fleet_cache_file=path)
+            poller = make_intraday(
+                battery_duids={"ERB01"},
+                fleet_cache_file=path,
+                # As above: the worked arithmetic is full-value charging.
+                charge_efficiency=1.0,
+            )
         self.assertEqual(poller._fleet_capacity, {"ERB01": 200.0})
         poller._daily_report_fn = lambda: self.daily
         # Anchor 130 MWh, then charge 100 MW for 1h (efficiency 1.0) = +100,
@@ -2142,7 +2147,12 @@ class InferenceTest(unittest.TestCase):
             path = self.write_fleet_cache(
                 tmp, [{"code": "LIMBESS1", "capacity_storage": 200.0}]
             )
-            poller = make_intraday(battery_duids={"ERB01"}, fleet_cache_file=path)
+            # charge_efficiency=1.0: this example is about the clamp, not the
+            # fitted share (soc_policy owns that; the default would charge
+            # 100 * 0.91 and the worked arithmetic below would not hold).
+            poller = make_intraday(
+                battery_duids={"ERB01"}, fleet_cache_file=path, charge_efficiency=1.0
+            )
         poller._daily_report_fn = lambda: self.daily
         poller._advance_inference(
             self.scada_at("ERB01", -100.0, 1791396000.0 + 3600.0)["units"], NOW
@@ -2159,7 +2169,11 @@ class InferenceTest(unittest.TestCase):
                 tmp, [{"code": "ERB01", "capacity_storage": 200.0}]
             )
             poller = make_intraday(
-                battery_duids={"ERB01"}, fleet_cache_file=path, infer_clamp=False
+                battery_duids={"ERB01"},
+                fleet_cache_file=path,
+                infer_clamp=False,
+                # As above: the raw 230 is 130 + 100 at full efficiency.
+                charge_efficiency=1.0,
             )
         poller._daily_report_fn = lambda: self.daily
         poller._advance_inference(
@@ -2366,6 +2380,10 @@ class InferenceBackfillTest(unittest.TestCase):
                 battery_duids={"ERB01"},
                 daily_report_fn=lambda: self.daily,
                 now=self.ts_1200 + 300.0,
+                # The reconstruction arithmetic below is full-value both ways;
+                # the fitted share (soc_policy) would make the charging leg
+                # 20 * 0.91 instead of 20.
+                charge_efficiency=1.0,
             )
             body, ok = poller.poll_once()
         self.assertTrue(ok)

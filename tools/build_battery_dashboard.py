@@ -14,12 +14,25 @@ from __future__ import annotations
 import json
 import re
 import os
+import sys
 
 DS = {"type": "prometheus", "uid": "PBFA97CFB590B2093"}
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(
     REPO, "grafana", "provisioning", "dashboards", "battery-state-of-charge.json"
 )
+
+# The SoC policy: the bridge-gap limit and fitted charge efficiency the panel
+# descriptions quote, and the colour ramp the bar gauge draws. Imported, never
+# restated - re-run this script after changing scrapers/soc_policy.py and the
+# prose changes with it. See docs/adr/0005.
+sys.path.insert(0, os.path.join(REPO, "scrapers"))
+import soc_policy  # noqa: E402
+
+# Formatted once, %g, so 6.0 reads "6" and 0.91 reads "0.91" in prose; a
+# future fit of 0.908 would read "0.908" without a hand edit here.
+GAP_H = "%g" % soc_policy.MAX_GAP_HOURS
+CHARGE_EFF = "%g" % soc_policy.CHARGE_EFFICIENCY
 
 # `last_over_time` wraps the instant panels' selectors, and a plain selector
 # serves the range panels. The exporter holds a reading between polls, so both
@@ -590,7 +603,7 @@ def badge(column, options, mode="color-background-solid"):
 # Panels
 # --------------------------------------------------------------------------- #
 
-ABOUT = """\
+ABOUT = f"""\
 ### NEM battery state of charge
 
 **State of charge, power and stored energy come from AEMO; OpenElectricity \
@@ -598,7 +611,7 @@ supplies the fleet's identity.** AEMO's daily `Next_Day_Dispatch` report gives \
 each unit's registered `ENERGY_STORAGE` anchor once a day (~04:11 AEST), and \
 the 5-minute `Dispatch_SCADA` feed gives measured charge/discharge MW. The \
 exporter anchors on the daily report and integrates the 5-minute MW between \
-anchors (charging discounted by a fitted ~0.91 conversion efficiency), which is \
+anchors (charging discounted by a fitted ~{CHARGE_EFF} conversion efficiency), which is \
 what makes a *live* per-unit SOC possible at all - AEMO publishes no live \
 per-unit SOC of its own. OE never published SOC either (its ratio was derived \
 the same way from its own stored-energy feed); what OE has that AEMO does not \
@@ -623,7 +636,7 @@ drift between anchors *is* the integration error. A bar pinned at 0% or 100% \
 is the estimate hitting its capacity bound (or the zero floor), not a battery \
 that is empty or full. \
 `aemo_battery_infer_success == 0` or a missing series means the exporter has \
-no fresh anchor or the SCADA gap exceeded its 6h bridge limit, not that the \
+no fresh anchor or the SCADA gap exceeded its {GAP_H}h bridge limit, not that the \
 battery went dark.
 
 **Sample age is the honest companion.** Both age lines - SOC's integration \
@@ -670,7 +683,7 @@ panels.append(
         "How many batteries AEMO is currently serving a live inferred SOC for "
         "- the units with both a daily anchor and a fresh-enough SCADA stream. "
         "This is **AEMO feed health**: a drop means the daily report is stale "
-        "or the intraday feed has a gap wider than the exporter's 6h bridge "
+        f"or the intraday feed has a gap wider than the exporter's {GAP_H}h bridge "
         "limit, not that batteries have gone dark. Every AEMO unit is included.",
         unit="short",
         steps=[
@@ -757,7 +770,7 @@ panels.append(
         "State of charge for every battery AEMO publishes a series for, as a "
         "percentage. Each bar is AEMO's live inferred SOC: the daily "
         "`Next_Day_Dispatch` `ENERGY_STORAGE` anchor integrated forward with "
-        "5-minute `Dispatch_SCADA` MW (charging discounted by the fitted ~0.91 "
+        f"5-minute `Dispatch_SCADA` MW (charging discounted by the fitted ~{CHARGE_EFF} "
         "conversion efficiency). AEMO publishes no live per-unit SOC of its "
         "own, so this is an estimate and it drifts between anchors - a bar "
         "pinned flat at 0% or 100% is the estimate hitting its capacity bound "
@@ -772,19 +785,17 @@ panels.append(
         "glance instead of having to check the number.\n\n"
         "Batteries with no AEMO series have **no bar at all** rather than a "
         "zero-length one - a WEM unit (NEMWEB covers the NEM only) or a unit "
-        "whose SCADA gap passed the exporter's 6h bridge limit simply omits "
+        f"whose SCADA gap passed the exporter's {GAP_H}h bridge limit simply omits "
         "the series, because an empty bar here would read as a flat battery, "
         "which is a completely different claim. Capacity comes from the "
         "whole-fleet OE metadata, so every AEMO NEM "
         "unit is eligible for a bar.",
+        # The SoC ramp itself: soc_policy's percent stops rendered as Grafana
+        # threshold steps, so the bar gauge and the map's battery markers draw
+        # the same colours from the same list. See docs/adr/0005.
         steps=[
-            {"color": "dark-red", "value": 0},
-            {"color": "orange", "value": 25},
-            {"color": "yellow", "value": 50},
-            {"color": "green", "value": 75},
-            # Held flat rather than ramping further, so full reads as solidly
-            # full instead of running into a different hue at the very top.
-            {"color": "green", "value": 100},
+            {"color": "#%02X%02X%02X" % rgb, "value": value}
+            for value, rgb in soc_policy.SOC_RAMP
         ],
     )
 )
@@ -873,7 +884,7 @@ panels.append(
         "**Not an upstream reading.** Stored energy divided by 1000 so the axis "
         "reads in GWh, but the energy is AEMO's live inference: the daily "
         "`Next_Day_Dispatch` anchor integrated forward with 5-minute "
-        "`Dispatch_SCADA` MW (charging discounted by the fitted ~0.91 "
+        f"`Dispatch_SCADA` MW (charging discounted by the fitted ~{CHARGE_EFF} "
         "conversion efficiency). The value is clamped "
         "to the battery's registered capacity, so a segment sitting flat at "
         "its capacity is the estimate hitting that bound, not a battery that "
@@ -884,7 +895,7 @@ panels.append(
         "Two decimals rather than one: the segments "
         "span hundredths of a GWh, and at one decimal many would read 0.0.\n\n"
         "A gap here means the inference was unavailable - no fresh anchor, or "
-        "a SCADA gap wider than the exporter's 6h bridge limit - so the bars "
+        f"a SCADA gap wider than the exporter's {GAP_H}h bridge limit - so the bars "
         "simply stop, which is a feed problem rather than a fleet holding no "
         "charge.",
         axis="GWh",
@@ -1013,7 +1024,7 @@ panels.append(
         "`Dispatch_SCADA` MW, using the same charging-leg convention as the OE "
         "exporter's inference (`charge_efficiency × |MW|×dt` when charging, "
         "`MW×dt` when discharging). Only units present in the daily anchor and "
-        "within `MAX_INFER_GAP_HOURS` of their last SCADA reading are shown "
+        f"within {GAP_H}h of their last SCADA reading are shown "
         "(`aemo_battery_infer_success == 1` when the feed is live). "
         "Join to capacity is by DUID against the **whole-fleet** capacity gauge, "
         "so this is every unit AEMO knows. This is a complement to the "

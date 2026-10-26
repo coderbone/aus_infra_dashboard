@@ -293,6 +293,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import fleet
 import inference
 import links
+import soc_policy
 
 DEFAULT_DATA_URL = "https://nemweb.com.au/Reports/Current/Next_Day_Dispatch/"
 SCADA_DATA_URL = "https://nemweb.com.au/Reports/Current/Dispatch_SCADA/"
@@ -316,17 +317,19 @@ DEFAULT_INTRADAY_POLL_INTERVAL = 300.0
 # the 5-minute Dispatch_SCADA output. `charge_efficiency` is the share of
 # charging energy that is actually stored (discharging is deducted in full),
 # the exact convention the retired OE exporter used for its
-# --infer-charge-efficiency. The
-# default 1.0 assumes nothing about the hardware; the deployed value is fitted
-# against AEMO's own reported regional storage and set in docker-compose.yml
-# (0.91 since 2026-10-19; see NOTES.md for the fit).
-DEFAULT_INFER_CHARGE_EFFICIENCY = 1.0
+# --infer-charge-efficiency. The value is the fitted one the SoC policy owns
+# (soc_policy.CHARGE_EFFICIENCY, where the fit itself is recorded); taking it
+# by identity is what keeps the dashboard's "fitted ~0.91" descriptions and the
+# deployed model the same fact. See docs/adr/0005.
+DEFAULT_INFER_CHARGE_EFFICIENCY = soc_policy.CHARGE_EFFICIENCY
 
 # A unit that stops appearing in Dispatch_SCADA is unscheduled (idle), so a short
 # absence is held frozen at its last value - but beyond this long a frozen number
 # is a guess (a retag, a maintenance cycle, a feed regression), and the inferred
-# line is dropped until the next daily report re-anchors it.
-MAX_INFER_GAP_HOURS = 6.0
+# line is dropped until the next daily report re-anchors it. The number is the
+# SoC policy's to state (soc_policy.MAX_GAP_HOURS) - the dashboard descriptions
+# quote it from there - and this name is the exporter's view of it.
+MAX_INFER_GAP_HOURS = soc_policy.MAX_GAP_HOURS
 
 # A step of up to an hour is treated as a brief poll hiccup and integrated at
 # the one measured sample we have - the historical behaviour, and roughly what a
@@ -3006,10 +3009,10 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=DEFAULT_INFER_CHARGE_EFFICIENCY,
         help="share of charging energy counted as stored when integrating SCADA "
-        "into the inferred stored MWh (default %g, which assumes nothing; "
-        "deployment sets the value fitted against AEMO's reported regional "
-        "storage - see docker-compose.yml and NOTES.md. NEMPulse applies ~0.85 "
-        "round-trip, here on the charging leg)." % DEFAULT_INFER_CHARGE_EFFICIENCY,
+        "into the inferred stored MWh (default %g, the value fitted against "
+        "AEMO's reported regional storage and stated once in soc_policy.py - "
+        "see NOTES.md for the fit. NEMPulse applies ~0.85 round-trip, here on "
+        "the charging leg)." % DEFAULT_INFER_CHARGE_EFFICIENCY,
     )
     parser.add_argument(
         "--infer-clamp",

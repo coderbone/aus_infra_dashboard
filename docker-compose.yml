@@ -205,20 +205,13 @@ services:
       # region-stored-MWh panels.
       - --intraday-poll-interval=300
       - --infer-state-file=/cache/intraday-state.json
-      # Share of grid-facing charging energy that reaches the cells; the rest
-      # is conversion loss and never comes back out. Charging only - discharge
-      # is already metered at the terminals. At 1.0 (the exporter default) the
-      # inferred fleet sum sat permanently above AEMO's own reported regional
-      # storage, because every watt-hour of loss was being counted as stored.
-      # Fitted 2026-10-19 over the eight complete days since the feed went live:
-      # at 18:00 AEST, sum(aemo_battery_inferred_stored_mwh) ran 1-21% (median
-      # ~11%) above sum(aemo_battery_region_stored_mwh), and the gap scaled
-      # with the day's charging energy. Solving gap = (1 - e) x charged per day
-      # gives 0.83-0.99, median 0.90, pooled 0.908 - so 0.91, within a rounding
-      # of the OE exporter's deployed 0.9 (same fleet, same conversion losses).
-      # At 1.0 that phantom charge also pushed up to 12 units/day onto the
-      # capacity ceiling and made the next morning's re-anchor a ~1.5 GWh drop.
-      - --infer-charge-efficiency=0.91
+      # The charging efficiency (the share of grid-facing charging energy that
+      # reaches the cells) is the fitted default in scrapers/soc_policy.py,
+      # where the fit itself is recorded; this stack deploys it by not
+      # overriding it. A deployment that fits its own value can still pass
+      # --infer-charge-efficiency here - it just must not be the only place the
+      # number exists, or the dashboard's descriptions cannot read it.
+
       # Read-only from the OE exporter's fleet cache. Supplies each unit's
       # registered storage capacity (so inference clamps at 100% as well as at
       # the zero floor) and its fueltech + region (so Dispatch_SCADA MW can be
@@ -241,6 +234,9 @@ services:
       # The pure inferred stored-MWh estimator the intraday thread drives,
       # same arrangement as the fleet and link modules. See docs/adr/0004.
       - ./scrapers/inference.py:/app/inference.py:ro
+      # The SoC policy: the gap limit and charging efficiency this exporter's
+      # defaults take, same arrangement as the modules above. See docs/adr/0005.
+      - ./scrapers/soc_policy.py:/app/soc_policy.py:ro
       # aemo-state holds this exporter's own files only. The OE fleet cache is
       # mounted read-only at a separate path (/oefleet) so it can supply the
       # per-DUID capacity and fueltech without either exporter clobbering the
@@ -387,6 +383,9 @@ services:
       # The link registry, for the display names this server attaches to the
       # line geometry. See docs/adr/0003.
       - ./scrapers/links.py:/app/links.py:ro
+      # The SoC policy: this server hands its colour ramp to the front end,
+      # which cannot import it. See docs/adr/0005.
+      - ./scrapers/soc_policy.py:/app/soc_policy.py:ro
       - ./webmap/static:/app/static:ro
       - ./webmap/data:/app/data:ro
       - battery-fleet-cache:/cache:ro

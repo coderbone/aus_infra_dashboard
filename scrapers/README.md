@@ -675,7 +675,11 @@ storage unit is anchored at the daily report's `ENERGY_STORAGE` and the measured
 arithmetic and its policy live in the pure `inference` module
 (`scrapers/inference.py`, see `docs/adr/0004`); the poller supplies the anchor,
 the measured steps and the impure parts (archive backfill, state file, the
-live-step guard). The raw
+live-step guard). The SoC policy's values — the bridge-gap limit and the fitted
+charging share — are stated once in `scrapers/soc_policy.py` (see
+`docs/adr/0005`), which the exporter's defaults take and the dashboard's panel
+descriptions quote; `--infer-charge-efficiency` still overrides the share for a
+deployment that fits its own. The raw
 integral is clamped into `[0, capacity]`: the zero floor always applies, and the
 100% ceiling applies wherever `--fleet-cache-file` supplies the unit's
 registered storage capacity (the OE exporter's cache). `--no-infer-clamp` serves
@@ -799,9 +803,14 @@ interconnectors/MNSP links plus the Snowy link, and intra-regional corridors
 AEMO does not publish numbers for): the line files carry only `kind` and `id`
 for links — display names are attached by the server from the link registry
 (`scrapers/links.py`, see `docs/adr/0003`), and the coordinate order encodes
-each link's FROM→TO direction. `./webmap/static/app.js` polls
+each link's FROM→TO direction. The state-of-charge colour ramp the battery
+markers fill with travels the same way: stated once in `scrapers/soc_policy.py`
+(see `docs/adr/0005`), adapted by the server into `/data/live`, never restated
+in the browser — the dashboard's bar gauge reads the same module. The payload's
+per-unit capacity (the SoC denominator) comes from the fleet module alone;
+there is deliberately no Prometheus capacity series beside it. `./webmap/static/app.js` polls
 `/data/live` every 30s, which the server builds from one Prometheus instant
-query per field — 28 of them, for the interconnector flow/limits/nominal and region
+query per field — 27 of them, for the interconnector flow/limits/nominal and region
 stored/fossil/curtailment series above, plus the top dozen `oe_battery_*`
 units — and it ships so the map is not left depending on the point-in-time
 state of any one poll.

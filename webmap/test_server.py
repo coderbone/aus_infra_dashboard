@@ -13,9 +13,11 @@ Run with the second discovery root, from the repo root:
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -26,6 +28,7 @@ sys.path.insert(0, HERE)
 
 import links  # noqa: E402
 import server  # noqa: E402
+import soc_policy  # noqa: E402
 
 
 # Two links chosen because their fixtures are the ticket's own worked example:
@@ -131,6 +134,114 @@ class BuildLiveTest(unittest.TestCase):
         live = self.build()
         self.assertTrue(math.isnan(live["interconnectors"][MISSING]["flow"]))
         self.assertIsNone(live["interconnectors"][MISSING]["utilisation"])
+
+
+class SoCPolicyTest(unittest.TestCase):
+    """The SoC policy travels to the consumers that cannot import it.
+
+    The front end is JavaScript: it cannot read `scrapers/soc_policy.py`, so
+    the ramp has to arrive with the live payload - the same plumbing the
+    nominal ratings take (registry -> Prometheus -> payload), minus the
+    Prometheus hop. Nothing in the browser may hard-code a stop.
+    """
+
+    def build(self) -> dict:
+        with mock.patch.object(server, "_query_prometheus", fake_query):
+            return server.build_live()
+
+    def test_the_soc_ramp_reaches_the_front_end_from_the_policy_module(self):
+        live = self.build()
+        ramp = live.get("soc_ramp")
+        self.assertIsNotNone(ramp, "the live payload must carry the SoC ramp")
+        # The server adapts the module's percent stops to the front end's
+        # 0..1 scale; the colours must be the module's own values, and the
+        # scale must be what `ramp(soc, stops)` interpolates.
+        expected = [
+            {"v": value / 100.0, "c": list(rgb)}
+            for value, rgb in soc_policy.SOC_RAMP
+        ]
+        self.assertEqual(ramp, expected)
+        self.assertEqual(ramp[0]["v"], 0.0)
+        self.assertEqual(ramp[-1]["v"], 1.0)
+
+    def test_no_prometheus_capacity_series_reaches_the_payload(self):
+        """The SoC denominator is the fleet module's, and the only one.
+
+        The payload used to carry a second cache-derived capacity - the
+        `oe_battery_capacity_storage_mwh` series the OE exporter publishes
+        from the same fleet.json - beside the fleet module's `capacity_mwh`.
+        The front end never divided by it; it existed only as a second reading
+        of the cache that a future change could pick up by mistake.
+        """
+        queried = []
+
+        def recording_query(query, timeout=10.0, at=None):
+            queried.append(query)
+            return fake_query(query, timeout, at)
+
+        with mock.patch.object(server, "_query_prometheus", recording_query):
+            live = server.build_live()
+        self.assertFalse(
+            [q for q in queried if "capacity" in q],
+            "capacity must not be queried from Prometheus; the fleet module "
+            "supplies it",
+        )
+        for unit_metrics in live.get("batteries", {}).values():
+            self.assertNotIn("capacity_mwh", unit_metrics)
+
+    def test_the_denominator_in_the_payload_is_the_fleet_modules(self):
+        """A fleet cache's registered storage capacity is what the map divides by.
+
+        Pinned end to end: the cache says 1997 MWh (ERB01's real registered
+        figure), the payload's fleet entry carries it, and no other capacity
+        for that unit exists in the payload to divide by instead.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = os.path.join(tmp, "fleet.json")
+            with open(cache, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "cached_at": 1.0,
+                        "data": [
+                            {
+                                "code": "ERB",
+                                "name": "Eraring BESS",
+                                "network_region": "NSW1",
+                                "units": [
+                                    {
+                                        "code": "ERB01",
+                                        "status_id": "operating",
+                                        "fueltech_id": "battery",
+                                        "capacity_storage": 1997.0,
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    handle,
+                )
+            old_cache = os.environ.get("FLEET_CACHE")
+            old_memo = dict(server._fleet_cache)
+            os.environ["FLEET_CACHE"] = cache
+            server._fleet_cache.update(mtime=None, data=None)
+            try:
+                with mock.patch.object(server, "_query_prometheus", fake_query):
+                    live = server.build_live()
+            finally:
+                server._fleet_cache.update(old_memo)
+                if old_cache is None:
+                    os.environ.pop("FLEET_CACHE", None)
+                else:
+                    os.environ["FLEET_CACHE"] = old_cache
+
+        batteries = [
+            unit
+            for fac in live["fleet"]
+            for unit in fac["units"]
+            if unit["code"] == "ERB01"
+        ]
+        self.assertEqual(len(batteries), 1)
+        self.assertEqual(batteries[0]["capacity_mwh"], 1997.0)
 
 
 if __name__ == "__main__":

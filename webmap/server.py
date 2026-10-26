@@ -7,7 +7,8 @@ frontend polls.
 
 Routes:
   /                       html app
-  /data/live              merged {interconnectors, regions, batteries, fleet}
+  /data/live              merged {interconnectors, regions, batteries, fleet,
+                           soc_ramp}
   /data/fleet.json        raw scraper fleet cache (if the volume is mounted)
   /data/*.geojson         static region/line geometry (the lines' link names
                           come from the link registry, not the file)
@@ -34,6 +35,10 @@ import fleet
 # link names to the geometry the exporter's nominal series are keyed by.
 # See docs/adr/0003.
 import links
+# Mounted from ../scrapers/soc_policy.py for the same reason again: the SoC
+# colour ramp is stated once and this server hands it to the front end, which
+# cannot import a Python module. See docs/adr/0005.
+import soc_policy
 
 STATIC_DIR = os.environ.get("WEBMAP_STATIC", os.path.join(os.path.dirname(__file__), "static"))
 DATA_DIR = os.environ.get("WEBMAP_DATA", os.path.join(os.path.dirname(__file__), "data"))
@@ -66,8 +71,10 @@ LIVE_QUERIES = {
     "batteries": {
         # OE keeps exporting only fleet metadata; the per-unit SOC/power/stored
         # families it used to export were retired 2026-10-20 once AEMO coverage
-        # (below) was verified a superset, so capacity is the only OE series here.
-        "capacity_mwh": {"expr": "oe_battery_capacity_storage_mwh", "key": "unit"},
+        # (below) was verified a superset. No capacity series here either: the
+        # map's SoC denominator is the fleet module's `capacity_mwh` (see
+        # build_fleet), and a Prometheus capacity would be a second reading of
+        # the same fleet.json. See docs/adr/0005.
         # whole-fleet live coverage from the AEMO exporter's per-unit estimates
         "inf_stored_mwh": {"expr": "aemo_battery_inferred_stored_mwh", "key": "unit"},
         "inf_age_s": {"expr": "aemo_battery_inferred_age_seconds", "key": "unit"},
@@ -195,6 +202,16 @@ def build_live(at: float | None = None):
            "reservoirs": {}}
     if at is not None:
         out["at"] = at
+    # The SoC ramp, adapted from the policy module's percent stops to the
+    # front end's 0..1 scale. Static policy, not a reading - but it travels
+    # with the payload because the browser cannot import the module, and
+    # because the front end styles from what it is given rather than
+    # restating a rule it has no way to test (same reasoning as utilisation
+    # being derived here).
+    out["soc_ramp"] = [
+        {"v": value / 100.0, "c": list(rgb)}
+        for value, rgb in soc_policy.SOC_RAMP
+    ]
     for group, fields in LIVE_QUERIES.items():
         for field, spec in fields.items():
             try:

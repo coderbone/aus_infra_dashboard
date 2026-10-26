@@ -1718,8 +1718,10 @@ real day-to-day variation plus the noise of comparing two different feeds.
 2026-10-09 is excluded: the feed's first partial day, whose 6pm ratio was 46%.
 Deployed **0.91** — the pooled fit, and within a rounding of the OE exporter's
 0.9, which is the right neighbourhood for the same fleet and the same
-conversion losses (NEMPulse quotes ~0.85 round-trip). Both exporters keep the
-code default at 1.0; only docker-compose.yml carries a fitted coefficient.
+conversion losses (NEMPulse quotes ~0.85 round-trip). Since 2026-10-26 the
+fitted coefficient has one home, `scrapers/soc_policy.py` (docs/adr/0005): the
+AEMO exporter's default takes it from there and docker-compose.yml no longer
+passes a flag; the retired OE exporter no longer infers at all.
 
 **What it fixes.** At 1.0 the phantom charge was the day's entire loss term:
 the next morning's re-anchor dropped the fleet by ~1.5 GWh, and up to 12 units

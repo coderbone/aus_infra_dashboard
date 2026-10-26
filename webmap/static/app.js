@@ -99,11 +99,11 @@ const STOPS_CURTAIL = [
 const STOPS_GEN = [
   { v: 0, c: [217, 48, 70] }, { v: 0.5, c: [224, 179, 67] }, { v: 1, c: [94, 193, 107] },
 ];
-const STOPS_SOC = [
-  { v: 0, c: [217, 48, 70] }, { v: 0.25, c: [229, 119, 60] },
-  { v: 0.5, c: [224, 179, 67] }, { v: 0.75, c: [156, 200, 79] },
-  { v: 1, c: [94, 193, 107] },
-];
+// The SoC ramp is not stated here: it arrives with every live payload, from
+// scrapers/soc_policy.py via the server, so the map and the dashboard's bar
+// gauge interpolate across one list and neither can drift from the other.
+// Populated in applySnapshot; battery drawing only happens after a payload.
+let STOPS_SOC = [];
 const STATUS_COLOR = {
   operating: "#8ca3ba",
   operational: "#8ca3ba",
@@ -796,7 +796,7 @@ function applyBatteries() {
       radius: radiusFor(total),
       weight: ring ? ringWeight : (fsoc ? 1.5 : (monitored ? 1.5 : 1)),
       color: ring ? ringColor : (fsoc ? "#101a2b" : (monitored ? "#101a2b" : "#3a4c63")),
-      fillColor: soc != null
+      fillColor: soc != null && STOPS_SOC.length
         ? ramp(soc, STOPS_SOC)
         : (STATUS_COLOR[fac.units[0].status] || "#54657a"),
       fillOpacity: soc != null ? 0.85 : 0.45,
@@ -1115,6 +1115,7 @@ function applySnapshot(data, isHistorical) {
   state.fetchedAt = data.fetched_at;
   state.historicalAt = isHistorical ? (data.at || null) : null;
   state.prom = data.prometheus || "ok";
+  if (data.soc_ramp) STOPS_SOC = data.soc_ramp;
   applyRegions();
   applyLines();
   // Draw the broad shapes (hydro, then thermal) before the narrower solar/wind/

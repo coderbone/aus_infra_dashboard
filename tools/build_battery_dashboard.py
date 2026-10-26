@@ -7,6 +7,10 @@ and the diff shows only what actually changed. Output uses indent=2,
 sort_keys=True to match the other committed dashboards.
 
     python3 tools/build_battery_dashboard.py
+
+Importing is safe: the write happens only under `__main__`, so the test suite
+imports the module, rebuilds the dashboard in memory and compares it with the
+committed file. See tools/test_build_battery_dashboard.py.
 """
 
 from __future__ import annotations
@@ -1247,137 +1251,176 @@ panels.append(
 )
 
 
-# Panel ids and y offsets have to be unique and monotonic; the gridPos values
-# above are authored by hand, so assert the invariants rather than trusting them.
-for index, panel in enumerate(panels, start=1):
-    panel["id"] = index
-ids = [p["id"] for p in panels]
-assert len(set(ids)) == len(ids), "duplicate panel id: %s" % ids
-positions = [(p["gridPos"]["x"], p["gridPos"]["y"], p["gridPos"]["w"]) for p in panels]
-for i in range(1, len(positions)):
-    assert positions[i][1] > positions[i - 1][1] or positions[i][0] > positions[i - 1][0], (
-        "panels %d and %d overlap" % (ids[i - 1], ids[i])
-    )
-    assert positions[i][0] + positions[i][2] <= 24, "panel %d runs off the grid" % ids[i]
+def check_invariants(panels):
+    """Enforce the board's structural rules on an ordered panel list.
 
-dashboard = {
-    "annotations": {
-        "list": [
-            {
-                "builtIn": 1,
-                "datasource": {"type": "grafana", "uid": "-- Grafana --"},
-                "enable": True,
-                "hide": True,
-                "iconColor": "rgba(0, 211, 255, 1)",
-                "name": "Annotations & Alerts",
-                "type": "dashboard",
-            }
-        ]
-    },
-    "description": (
-        "State of charge, power and stored energy for the NEM battery fleet, "
-        "driven by AEMO: the daily Next_Day_Dispatch "
-        "ENERGY_STORAGE anchor integrated with 5-minute Dispatch_SCADA MW for "
-        "the live per-unit inference, plus AEMO's own measured MW and "
-        "region-level reported storage. OpenElectricity supplies the fleet's "
-        "registered capacity, names and status (metadata only) plus its own "
-        "API-budget metrics - its "
-        "per-unit SOC/power families were retired when AEMO coverage proved a "
-        "superset. The board is the whole AEMO fleet as NEMWEB reports "
-        "it (every unit AEMO publishes, NEM only, no WEM)."
-    ),
-    "editable": True,
-    "fiscalYearStartMonth": 0,
-    "graphTooltip": 1,
-    "id": None,
-    "links": [],
-    "liveNow": False,
-    "preload": False,
-    "refresh": "5m",
-    "schemaVersion": 42,
-    "tags": ["battery", "storage", "openelectricity", "nem", "aemo"],
-    "templating": {
-        "list": [
-            {
-                "allowCustomValue": True,
-                "current": {"selected": True, "text": ["All"], "value": ["$__all"]},
-                "datasource": ds_(),
-                "definition": 'label_values(oe_battery_fleet_capacity_storage_mwh{'
-                              'status=~"operating|commissioning"}, name)',
-                "hide": 0,
-                "includeAll": True,
-                "label": "Battery",
-                "multi": True,
-                "name": "battery",
-                "options": [],
-                "query": {
-                    "query": 'label_values(oe_battery_fleet_capacity_storage_mwh{'
-                             'status=~"operating|commissioning"}, name)',
-                    "refId": "PrometheusVariableQueryEditor-VariableQuery",
-                },
-                # 2 = on time range change. The fleet list changes only when a
-                # unit is commissioned, but the value has to refresh once a poll
-                # has landed, and this is the cheapest hook for that. Kept to
-                # operating/commissioning rather than every capacity row so
-                # committed (never-built) units do not clutter the picker; the
-                # panels themselves still join to AEMO, so a selected battery
-                # with no dispatch series simply has no data.
-                "refresh": 2,
-                "regex": "",
-                "regexApplyTo": "value",
-                "skipUrlSync": False,
-                "sort": 3,
-                "type": "query",
-                "allValue": ".*",
-            },
-            # The Region filter. A multi-select over the union of every source
-            # that carries a `region` label, because no single metric spans them
-            # all: `oe_battery_fleet_info` has the WEM batteries but no TAS1 (no
-            # OE battery there), while the AEMO region metrics have TAS1 but no
-            # WEM. The union selector lists all six. `allValue: ".*"` makes the
-            # All default a match-everything regex, so `region=~"$region"` is a
-            # no-op under All and scopes the panel once a region is picked.
-            {
-                "allowCustomValue": True,
-                "current": {"selected": True, "text": ["All"], "value": ["$__all"]},
-                "datasource": ds_(),
-                "definition": 'label_values({__name__=~"oe_battery_fleet_info|'
-                              'aemo_battery_region_fossil_generation_mw"}, region)',
-                "hide": 0,
-                "includeAll": True,
-                "label": "Region",
-                "multi": True,
-                "name": "region",
-                "options": [],
-                "query": {
-                    "query": 'label_values({__name__=~"oe_battery_fleet_info|'
-                             'aemo_battery_region_fossil_generation_mw"}, region)',
-                    "refId": "PrometheusVariableQueryEditor-VariableQuery",
-                },
-                # 2 = on time range change, matching the battery variable.
-                "refresh": 2,
-                "regex": "",
-                "regexApplyTo": "value",
-                "skipUrlSync": False,
-                # Alphabetical so the codes read NSW1, QLD1, SA1, TAS1, VIC1, WEM.
-                "sort": 1,
-                "type": "query",
-                "allValue": ".*",
-            },
-        ]
-    },
-    "time": {"from": "now-7d", "to": "now"},
-    "timepicker": {
-        "refresh_intervals": ["30s", "1m", "5m", "15m", "30m", "1h", "2h", "1d"]
-    },
-    "timezone": "browser",
-    "title": "NEM battery state of charge",
-    "uid": "nembattery-soc",
-    "version": 1,
-    "panels": panels,
-}
+    Panel ids must be unique, and the hand-authored gridPos values must keep
+    every panel inside the 24-column grid with no panel sitting on top of its
+    neighbour. Panels are authored top-to-bottom, so "overlap" is the pairwise
+    rule the script always used: the next panel starts strictly lower, or
+    strictly to the right. Raises ValueError rather than asserting - the test
+    suite calls this on every run, and a bare assert vanishes under `-O`.
+    """
+    ids = [p["id"] for p in panels]
+    if len(set(ids)) != len(ids):
+        raise ValueError("duplicate panel id: %s" % ids)
+    for panel in panels:
+        pos = panel["gridPos"]
+        if pos["x"] + pos["w"] > 24:
+            raise ValueError("panel %d runs off the grid" % panel["id"])
+    positions = [
+        (p["gridPos"]["x"], p["gridPos"]["y"], p["gridPos"]["w"]) for p in panels
+    ]
+    for i in range(1, len(positions)):
+        below_or_right = (
+            positions[i][1] > positions[i - 1][1] or positions[i][0] > positions[i - 1][0]
+        )
+        if not below_or_right:
+            raise ValueError("panels %d and %d overlap" % (ids[i - 1], ids[i]))
 
-with open(OUT, "w", encoding="utf-8") as handle:
-    json.dump(dashboard, handle, indent=2, sort_keys=True)
-    handle.write("\n")
-print("wrote %s (%d panels)" % (OUT, len(panels)))
+
+def build_dashboard():
+    """Assemble the dashboard dict: assign panel ids, enforce the invariants.
+
+    No disk I/O - the only write in this module is `main()`. The ids are
+    stamped onto the panel dicts in place (the gridPos values are hand
+    authored; the ids are the enumeration order), so the returned dict aliases
+    the module's panel list. The test suite imports and calls this to compare
+    the builder with the committed JSON.
+    """
+    for index, panel in enumerate(panels, start=1):
+        panel["id"] = index
+    check_invariants(panels)
+    return {
+        "annotations": {
+            "list": [
+                {
+                    "builtIn": 1,
+                    "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+                    "enable": True,
+                    "hide": True,
+                    "iconColor": "rgba(0, 211, 255, 1)",
+                    "name": "Annotations & Alerts",
+                    "type": "dashboard",
+                }
+            ]
+        },
+        "description": (
+            "State of charge, power and stored energy for the NEM battery fleet, "
+            "driven by AEMO: the daily Next_Day_Dispatch "
+            "ENERGY_STORAGE anchor integrated with 5-minute Dispatch_SCADA MW for "
+            "the live per-unit inference, plus AEMO's own measured MW and "
+            "region-level reported storage. OpenElectricity supplies the fleet's "
+            "registered capacity, names and status (metadata only) plus its own "
+            "API-budget metrics - its "
+            "per-unit SOC/power families were retired when AEMO coverage proved a "
+            "superset. The board is the whole AEMO fleet as NEMWEB reports "
+            "it (every unit AEMO publishes, NEM only, no WEM)."
+        ),
+        "editable": True,
+        "fiscalYearStartMonth": 0,
+        "graphTooltip": 1,
+        "id": None,
+        "links": [],
+        "liveNow": False,
+        "preload": False,
+        "refresh": "5m",
+        "schemaVersion": 42,
+        "tags": ["battery", "storage", "openelectricity", "nem", "aemo"],
+        "templating": {
+            "list": [
+                {
+                    "allowCustomValue": True,
+                    "current": {"selected": True, "text": ["All"], "value": ["$__all"]},
+                    "datasource": ds_(),
+                    "definition": 'label_values(oe_battery_fleet_capacity_storage_mwh{'
+                                  'status=~"operating|commissioning"}, name)',
+                    "hide": 0,
+                    "includeAll": True,
+                    "label": "Battery",
+                    "multi": True,
+                    "name": "battery",
+                    "options": [],
+                    "query": {
+                        "query": 'label_values(oe_battery_fleet_capacity_storage_mwh{'
+                                 'status=~"operating|commissioning"}, name)',
+                        "refId": "PrometheusVariableQueryEditor-VariableQuery",
+                    },
+                    # 2 = on time range change. The fleet list changes only when a
+                    # unit is commissioned, but the value has to refresh once a poll
+                    # has landed, and this is the cheapest hook for that. Kept to
+                    # operating/commissioning rather than every capacity row so
+                    # committed (never-built) units do not clutter the picker; the
+                    # panels themselves still join to AEMO, so a selected battery
+                    # with no dispatch series simply has no data.
+                    "refresh": 2,
+                    "regex": "",
+                    "regexApplyTo": "value",
+                    "skipUrlSync": False,
+                    "sort": 3,
+                    "type": "query",
+                    "allValue": ".*",
+                },
+                # The Region filter. A multi-select over the union of every source
+                # that carries a `region` label, because no single metric spans them
+                # all: `oe_battery_fleet_info` has the WEM batteries but no TAS1 (no
+                # OE battery there), while the AEMO region metrics have TAS1 but no
+                # WEM. The union selector lists all six. `allValue: ".*"` makes the
+                # All default a match-everything regex, so `region=~"$region"` is a
+                # no-op under All and scopes the panel once a region is picked.
+                {
+                    "allowCustomValue": True,
+                    "current": {"selected": True, "text": ["All"], "value": ["$__all"]},
+                    "datasource": ds_(),
+                    "definition": 'label_values({__name__=~"oe_battery_fleet_info|'
+                                  'aemo_battery_region_fossil_generation_mw"}, region)',
+                    "hide": 0,
+                    "includeAll": True,
+                    "label": "Region",
+                    "multi": True,
+                    "name": "region",
+                    "options": [],
+                    "query": {
+                        "query": 'label_values({__name__=~"oe_battery_fleet_info|'
+                                 'aemo_battery_region_fossil_generation_mw"}, region)',
+                        "refId": "PrometheusVariableQueryEditor-VariableQuery",
+                    },
+                    # 2 = on time range change, matching the battery variable.
+                    "refresh": 2,
+                    "regex": "",
+                    "regexApplyTo": "value",
+                    "skipUrlSync": False,
+                    # Alphabetical so the codes read NSW1, QLD1, SA1, TAS1, VIC1, WEM.
+                    "sort": 1,
+                    "type": "query",
+                    "allValue": ".*",
+                },
+            ]
+        },
+        "time": {"from": "now-7d", "to": "now"},
+        "timepicker": {
+            "refresh_intervals": ["30s", "1m", "5m", "15m", "30m", "1h", "2h", "1d"]
+        },
+        "timezone": "browser",
+        "title": "NEM battery state of charge",
+        "uid": "nembattery-soc",
+        "version": 1,
+        "panels": panels,
+    }
+
+
+def main():
+    """Write the dashboard to OUT. Importing this module never gets here.
+
+    See tools/test_build_battery_dashboard.py for the suite that rebuilds the
+    dashboard in memory and compares it with the committed file.
+    """
+    dashboard = build_dashboard()
+    with open(OUT, "w", encoding="utf-8") as handle:
+        json.dump(dashboard, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    print("wrote %s (%d panels)" % (OUT, len(dashboard["panels"])))
+
+
+if __name__ == "__main__":
+    main()

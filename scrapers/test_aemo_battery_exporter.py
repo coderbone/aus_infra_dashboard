@@ -376,6 +376,54 @@ def interconnector_sample_rows():
 IS_SAMPLE_ZIP = is_zip(rows=is_sample_rows())
 
 
+# --- ROOFTOP_PV_ACTUAL_MEASUREMENT synthetic upstream ----------------------- #
+#
+# No real file was to hand when this fixture was written, so only the shape the
+# parser declares it needs is pinned: an I row tagged ROOFTOP/ACTUAL carrying
+# INTERVAL_DATETIME, REGIONID and POWER, and matching D rows. The columns are
+# deliberately NOT at the other tables' positions - the parser indexes by name,
+# so a name-matched header is the contract, not a fixed layout.
+
+ROOFTOP_ZIP = (
+    "PUBLIC_ROOFTOP_PV_ACTUAL_MEASUREMENT_20261008152000_0000000541812609.zip"
+)
+ROOFTOP_CSV = (
+    "PUBLIC_ROOFTOP_PV_ACTUAL_MEASUREMENT_20261008152000_0000000541812609.CSV"
+)
+
+
+def rooftop_row(kind, timestamp="2026/10/08 15:20:00", region="NSW1", power="1842.5"):
+    cells = [""] * 7
+    cells[0] = kind
+    cells[1] = "ROOFTOP"
+    cells[2] = "ACTUAL"
+    cells[3] = "1"
+    cells[4] = timestamp
+    cells[5] = region
+    cells[6] = power
+    return cells
+
+
+def rooftop_header():
+    row = rooftop_row("I")
+    row[4] = "INTERVAL_DATETIME"
+    row[5] = "REGIONID"
+    row[6] = "POWER"
+    return row
+
+
+def rooftop_zip(name=ROOFTOP_CSV, rows=()):
+    return make_zip(name, [rooftop_header(), *rows])
+
+
+def rooftop_sample_rows():
+    return [
+        rooftop_row("D", region="NSW1", power="1842.5"),
+        rooftop_row("D", region="QLD1", power="1103.75"),
+        rooftop_row("D", region="VIC1", power="947.1"),
+    ]
+
+
 def listing_report():
     """The parsed report as the scraper's `_download` leaves it: the report
     returned by the parser, now stamped with the listing's zip filename."""
@@ -698,6 +746,44 @@ class ParseTest(unittest.TestCase):
         rows = [unit_solution_row("D", "2026/10/08 04:00:00", "GEN01", "", "")]
         with self.assertRaises(exporter.ScrapeError):
             parsed_report(rows)
+
+    def test_columns_are_matched_by_name_not_position(self):
+        """SETTLEMENTDATE and DUID are read by name, never by their verified
+        positions, so a column reorder upstream cannot mis-date or mis-key a
+        row. The header and the data cells move together - which is what a
+        reorder does - and only a name-indexed reader follows them.
+        """
+        layout = {  # column -> position, away from the real 4/6/14/69/70
+            "SETTLEMENTDATE": 8,
+            "DUID": 9,
+            "TOTALCLEARED": 20,
+            "INITIAL_ENERGY_STORAGE": 30,
+            "ENERGY_STORAGE": 31,
+        }
+
+        def solution_row(kind, timestamp, duid, initial, energy, cleared):
+            cells = [""] * NCOLS
+            cells[0] = kind
+            cells[1] = "DISPATCH"
+            cells[2] = "UNIT_SOLUTION"
+            cells[layout["SETTLEMENTDATE"]] = timestamp
+            cells[layout["DUID"]] = duid
+            cells[layout["TOTALCLEARED"]] = cleared
+            cells[layout["INITIAL_ENERGY_STORAGE"]] = initial
+            cells[layout["ENERGY_STORAGE"]] = energy
+            return cells
+
+        header = solution_row("I", *[""] * 5)
+        for name, position in layout.items():
+            header[position] = name
+        row = solution_row("D", "2026/10/08 04:00:00", "HPR1",
+                           HPR_INITIAL, HPR_ENERGY, HPR_CLEARED)
+        report = exporter.parse_next_day_dispatch(
+            make_zip(MEMBER_CSV, [header, CONTROL, row])
+        )
+        self.assertEqual(report["units"]["HPR1"]["ts"], HPR_TS)
+        self.assertAlmostEqual(report["units"]["HPR1"]["energy"], 21.8625, places=4)
+        self.assertEqual(report["units"]["HPR1"]["cleared"], 0)
 
 
 # --------------------------------------------------------------------------- #
@@ -1098,6 +1184,76 @@ class ParseScadaTest(unittest.TestCase):
     def test_no_scada_rows_is_a_scrape_error(self):
         with self.assertRaises(exporter.ScrapeError):
             exporter.parse_dispatch_scada(scada_zip(rows=[]))
+
+
+# --------------------------------------------------------------------------- #
+# parse_rooftop_pv
+# --------------------------------------------------------------------------- #
+
+
+class ParseRooftopTest(unittest.TestCase):
+    def parsed(self, rows=None):
+        return exporter.parse_rooftop_pv(
+            rooftop_zip(rows=rows or rooftop_sample_rows())
+        )
+
+    def test_power_per_region_is_carried(self):
+        regions = self.parsed()["regions"]
+        self.assertEqual(set(regions), {"NSW1", "QLD1", "VIC1"})
+        self.assertAlmostEqual(regions["NSW1"]["mw"], 1842.5, places=4)
+        self.assertAlmostEqual(regions["QLD1"]["mw"], 1103.75, places=4)
+
+    def test_the_interval_stamp_is_carried(self):
+        regions = self.parsed()["regions"]
+        self.assertEqual(regions["NSW1"]["ts"], SCADA_TS)
+        self.assertEqual(self.parsed()["newest_interval"], SCADA_TS)
+
+    def test_a_later_row_for_the_same_region_wins(self):
+        rows = rooftop_sample_rows()
+        rows.append(rooftop_row("D", "2026/10/08 15:25:00", "NSW1", "2000.0"))
+        parsed = self.parsed(rows)
+        self.assertEqual(parsed["regions"]["NSW1"]["mw"], 2000.0)
+        self.assertEqual(parsed["regions"]["NSW1"]["ts"], SCADA_TS + 300.0)
+        self.assertEqual(parsed["newest_interval"], SCADA_TS + 300.0)
+
+    def test_non_numeric_power_is_skipped_not_fatal(self):
+        rows = rooftop_sample_rows()
+        rows.append(rooftop_row("D", region="TAS1", power="oops"))
+        with self.assertLogs(exporter.log, level="WARNING"):
+            parsed = self.parsed(rows)
+        self.assertNotIn("TAS1", parsed["regions"])
+        self.assertIn("NSW1", parsed["regions"])
+
+    def test_columns_are_matched_by_name_not_position(self):
+        """A column reorder upstream must not silently read the wrong value.
+
+        The header names and the data cells move together (which is what a
+        reorder does); only a name-indexed reader follows them.
+        """
+        header = rooftop_row("I")
+        header[3], header[4], header[5], header[6] = (
+            "POWER", "REGIONID", "INTERVAL_DATETIME", "",
+        )
+        row = rooftop_row("D")
+        row[3], row[4], row[5], row[6] = ("1842.5", "NSW1", "2026/10/08 15:20:00", "")
+        parsed = exporter.parse_rooftop_pv(make_zip(ROOFTOP_CSV, [header, row]))
+        self.assertAlmostEqual(parsed["regions"]["NSW1"]["mw"], 1842.5, places=4)
+        self.assertEqual(parsed["regions"]["NSW1"]["ts"], SCADA_TS)
+
+    def test_bad_zip_is_a_scrape_error(self):
+        with self.assertRaises(exporter.ScrapeError):
+            exporter.parse_rooftop_pv(b"not a zip")
+
+    def test_zip_without_a_csv_member_is_a_scrape_error(self):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("README.txt", "hi")
+        with self.assertRaises(exporter.ScrapeError):
+            exporter.parse_rooftop_pv(buf.getvalue())
+
+    def test_no_rooftop_rows_is_a_scrape_error(self):
+        with self.assertRaises(exporter.ScrapeError):
+            exporter.parse_rooftop_pv(rooftop_zip(rows=[]))
 
 
 # --------------------------------------------------------------------------- #
@@ -1546,6 +1702,70 @@ class RenderIntradayTest(unittest.TestCase):
         text = exporter.render_intraday(self.scada, True, self.isr, False, 1.5, self.now)
         self.assertNotIn("aemo_interconnector_flow_mw", text)
         self.assertNotIn("aemo_interconnector_count", text)
+
+    # -- rooftop PV ---------------------------------------------------------- #
+
+    def rooftop_report(self):
+        report = exporter.parse_rooftop_pv(
+            rooftop_zip(rows=rooftop_sample_rows())
+        )
+        report["file"] = ROOFTOP_ZIP
+        return report
+
+    def test_rooftop_series_render_per_region(self):
+        text = exporter.render_intraday(
+            self.scada, True, self.isr, True, 1.5, self.now,
+            rooftop=self.rooftop_report(), rooftop_ok=True,
+        )
+        nsw = next(
+            l for l in lines_named(text, "aemo_battery_region_rooftop_solar_mw")
+            if 'region="NSW1"' in l
+        )
+        self.assertAlmostEqual(float(nsw.rsplit(" ", 1)[1]), 1842.5, places=4)
+        self.assertIn(
+            'aemo_battery_region_rooftop_solar_report_info{file="%s"} 1'
+            % ROOFTOP_ZIP,
+            text,
+        )
+
+    def test_a_failed_rooftop_read_omits_the_series(self):
+        text = exporter.render_intraday(
+            self.scada, True, self.isr, True, 1.5, self.now,
+            rooftop=self.rooftop_report(), rooftop_ok=False,
+        )
+        self.assertNotIn("aemo_battery_region_rooftop_solar_mw", text)
+        # The other feeds are untouched by a rooftop failure.
+        self.assertIn('aemo_battery_region_stored_mwh{region="NSW1"}', text)
+        self.assertIn('aemo_battery_power_mw{unit="",duid="ERB01"}', text)
+
+    def test_rooftop_series_are_absent_without_the_feed(self):
+        self.assertNotIn(
+            "aemo_battery_region_rooftop_solar_mw", self.text()
+        )
+
+    # -- the feed policy declaration ----------------------------------------- #
+
+    def test_the_feed_policy_names_feeds_and_order_in_one_table(self):
+        """INTRADAY_BLOCKS *is* the failure policy: which feed each block of
+        series rides on, in emission order. Pinning the whole table makes any
+        change to the policy a deliberate, reviewed edit rather than a
+        side-effect of moving code around.
+        """
+        self.assertEqual(
+            [(block, feed) for block, feed, _emit in exporter.INTRADAY_BLOCKS],
+            [
+                ("unit_power", "scada"),
+                ("battery_power", "scada"),
+                ("fleet_metadata_missing", None),
+                ("region_storage", "dispatchis"),
+                ("curtailment", "dispatchis"),
+                ("region_fossil", "scada"),
+                ("interconnectors", "dispatchis"),
+                ("region_interchange", "dispatchis"),
+                ("rooftop", "rooftop"),
+                ("inferred", "infer"),
+            ],
+        )
 
 
 # --------------------------------------------------------------------------- #

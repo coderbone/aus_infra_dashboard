@@ -287,6 +287,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -671,44 +672,51 @@ def parse_aest(text: object) -> float | None:
     return naive.replace(tzinfo=timezone(timedelta(seconds=AEST_UTC_OFFSET_SECONDS))).timestamp()
 
 
-def _unit_solution_indices(header_row: list[str]) -> tuple[int, int, int] | None:
-    """(initial, energy, cleared) column indices for a UNIT_SOLUTION header.
+def csv_row_reader(stream):
+    """Rows from a compressed member stream.
 
-    Indexed by *name*, not position, so a future column reorder upstream does
-    not silently read the wrong number. Returns None when the table header is
-    missing the storage or dispatch columns, in which case the file has changed
-    shape.
+    Kept as a thin wrapper so the test suite can feed plain in-memory bytes
+    through the same path without reaching for a temp file.
     """
-    wanted = (
-        "DUID",
-        "SETTLEMENTDATE",
-        "TOTALCLEARED",
-        "INITIAL_ENERGY_STORAGE",
-        "ENERGY_STORAGE",
-    )
-    positions = {}
-    for name in wanted:
-        try:
-            positions[name] = header_row.index(name)
-        except ValueError:
-            return None
-    return (
-        positions["INITIAL_ENERGY_STORAGE"],
-        positions["ENERGY_STORAGE"],
-        positions["TOTALCLEARED"],
-    )
+    return csv.reader(io.TextIOWrapper(stream, encoding="utf-8", errors="replace"))
 
 
-def parse_next_day_dispatch(data: bytes) -> dict:
-    """Reduce one Next_Day_Dispatch CSV into per-unit newest measurements.
+# One reading as a feed's projection deposits it: which result map it belongs
+# to, the interval stamp, the key within that map (DUID / region / link), and
+# the entry to keep when it is the newest for that key.
+PutReading = Callable[[str, float, str, dict], None]
 
-    Returns {"generated": float|None, "newest_interval": float|None,
-    "units": {duid: {"ts": float, "initial": float, "energy": float,
-    "cleared": float|None}}}.
 
-    The CSV is streamed from the zip one row at a time - the uncompressed file
-    is ~126 MB, so it must never be materialised in memory. The parser keeps
-    only the newest interval per storage unit that reported a value.
+def read_aemo_table(
+    data: bytes,
+    *,
+    table: tuple[str, str],
+    columns: Callable[[list[str]], dict[str, int] | None],
+    results: tuple[str, ...],
+    project: Callable[[list[str], dict[str, int], PutReading], None],
+    missing: str,
+    on_control: Callable[[list[str]], None] | None = None,
+) -> dict:
+    """Reduce one AEMO dispatch archive's `table` through `project`.
+
+    The skeleton every feed shares, implemented once: open the zip, find its
+    CSV member, stream the tagged rows, index the header's columns by name,
+    keep the newest stamp - per key and for the file - and fail when the file
+    yielded nothing at all.
+
+    An `I` row naming `table` builds the name -> position index through
+    `columns` (None = the table changed shape, so no data row parses); a `C`
+    row goes to `on_control`; a `D` row of `table` goes to
+    `project(row, indices, put)`, where `put(bucket, stamp, key, entry)` keeps
+    the newest entry per key. `results` names the maps the return always
+    carries - declared empty, filled as readings land. `missing` is the
+    `%s`/`%d` ScrapeError format (filename, handled rows) raised when every
+    map is still empty: a feed that read nothing publishes nothing.
+
+    Returns {"file": str, "newest_interval": float|None, <results>: {...}}.
+
+    The CSV is streamed one row at a time - the daily file is ~126 MB
+    uncompressed, so it must never be materialised in memory.
     """
     try:
         archive = zipfile.ZipFile(io.BytesIO(data))
@@ -723,102 +731,196 @@ def parse_next_day_dispatch(data: bytes) -> dict:
         raise ScrapeError("zip contained no .csv member (%s)" % archive.namelist())
     filename = members[0].rsplit(".", 1)[0]
 
-    units: dict[str, dict] = {}
-    generated: float | None = None
-    newest_interval: float | None = None
-    storage_indices: tuple[int, int, int] | None = None
+    buckets: dict[str, dict] = {name: {} for name in results}
+    newest: float | None = None
+    indices: dict[str, int] | None = None
     handled_rows = 0
 
+    def put(bucket: str, stamp: float, key: str, entry: dict) -> None:
+        nonlocal newest
+        readings = buckets.setdefault(bucket, {})
+        prev = readings.get(key)
+        if prev is None or stamp >= prev["ts"]:
+            readings[key] = entry
+        if newest is None or stamp > newest:
+            newest = stamp
+
     with archive.open(members[0]) as member:
-        reader = csv_row_reader(member)
-        for row in reader:
+        for row in csv_row_reader(member):
             if not row:
                 continue
             tag = row[0]
             if tag == "I":
-                if len(row) >= 3 and row[2] == "UNIT_SOLUTION":
-                    storage_indices = _unit_solution_indices(row)
+                if len(row) >= 3 and (row[1], row[2]) == table:
+                    indices = columns(row)
                 continue
             if tag == "C":
-                # The first control line is the publication stamp:
-                # C,NEMP.WORLD,NEXT_DAY_DISPATCH,AEMO,PUBLIC,2026/10/08,04:10:00,...
-                if len(row) >= 7 and row[1] == "NEMP.WORLD":
-                    generated = parse_aest(row[5] + " " + row[6])
+                if on_control is not None:
+                    on_control(row)
                 continue
-            if tag != "D" or storage_indices is None:
+            if tag != "D" or indices is None:
                 continue
-            if len(row) < 3 or row[2] != "UNIT_SOLUTION":
+            if len(row) < 3 or (row[1], row[2]) != table:
                 continue
-            if storage_indices is None:
-                continue
-            ini_idx, eng_idx, clr_idx = storage_indices
-            if len(row) <= max(eng_idx, clr_idx):
+            if len(row) <= max(indices.values()):
                 continue
             handled_rows += 1
-            initial = row[ini_idx]
-            if not initial:
-                # Units that never report storage (generators) have this empty;
-                # the presence of a value is what makes a unit a storage unit.
-                continue
-            stamp = parse_aest(row[4]) if len(row) > 4 else None
-            if stamp is None:
-                continue
-            duid = row[6] if len(row) > 6 else ""
-            if not duid:
-                continue
-            entry = units.get(duid)
-            if entry is None or stamp >= entry["ts"]:
-                energy = row[eng_idx]
-                cleared = row[clr_idx]
-                try:
-                    initial_value = float(initial)
-                    energy_value = float(energy) if energy else initial_value
-                    cleared_value = float(cleared) if cleared else None
-                except ValueError:
-                    log.warning("duid %s: non-numeric storage at %s", duid, stamp)
-                    continue
-                units[duid] = {
-                    "ts": stamp,
-                    "initial": initial_value,
-                    "energy": energy_value,
-                    "cleared": cleared_value,
-                }
-            if newest_interval is None or stamp > newest_interval:
-                newest_interval = stamp
+            project(row, indices, put)
 
-    if not units:
-        raise ScrapeError("no storage units found in %s (handled %d rows)" % (filename, handled_rows))
-    return {
-        "file": filename,
-        "generated": generated,
-        "newest_interval": newest_interval,
-        "units": units,
-    }
+    if not any(buckets.values()):
+        raise ScrapeError(missing % (filename, handled_rows))
+    return {"file": filename, "newest_interval": newest, **buckets}
 
 
-def csv_row_reader(stream):
-    """Rows from a compressed member stream.
+def _indices_by_name(
+    header_row: list[str],
+    required: tuple[str, ...],
+    optional: tuple[str, ...] = (),
+) -> dict[str, int] | None:
+    """name -> column position for `required` (+ `optional` when present).
 
-    Kept as a thin wrapper so the test suite can feed plain in-memory bytes
-    through the same path without reaching for a temp file.
+    Indexed by *name*, never position, so a future column reorder upstream
+    cannot silently read the wrong number. A missing `required` name means
+    the file changed shape and yields None; a missing `optional` name is
+    simply absent from the result, and the feed reads that series as None.
     """
-    return csv.reader(io.TextIOWrapper(stream, encoding="utf-8", errors="replace"))
+    positions = {}
+    for name in required:
+        try:
+            positions[name] = header_row.index(name)
+        except ValueError:
+            return None
+    for name in optional:
+        try:
+            positions[name] = header_row.index(name)
+        except ValueError:
+            pass
+    return positions
+
+
+def _unit_solution_indices(header_row: list[str]) -> dict[str, int] | None:
+    """Column indices for a UNIT_SOLUTION header, by name.
+
+    Returns None when the table header is missing the storage or dispatch
+    columns, in which case the file has changed shape. The provenance for the
+    column set is in the parse tests' docstring (verified positions in the
+    real 2026-10-08 file); the lookup itself is name-based per the reader's
+    contract.
+    """
+    return _indices_by_name(
+        header_row,
+        (
+            "DUID",
+            "SETTLEMENTDATE",
+            "TOTALCLEARED",
+            "INITIAL_ENERGY_STORAGE",
+            "ENERGY_STORAGE",
+        ),
+    )
+
+
+def _project_unit_solution(
+    row: list[str], indices: dict[str, int], put: PutReading
+) -> None:
+    """One UNIT_SOLUTION row -> the storage reading it carries, or nothing.
+
+    A non-empty INITIAL_ENERGY_STORAGE is what makes a unit a storage unit:
+    generators never report one and are skipped here, before anything is
+    deposited.
+    """
+    initial = row[indices["INITIAL_ENERGY_STORAGE"]]
+    if not initial:
+        return
+    stamp = parse_aest(row[indices["SETTLEMENTDATE"]])
+    if stamp is None:
+        return
+    duid = row[indices["DUID"]]
+    if not duid:
+        return
+    try:
+        initial_value = float(initial)
+        energy = row[indices["ENERGY_STORAGE"]]
+        cleared = row[indices["TOTALCLEARED"]]
+        energy_value = float(energy) if energy else initial_value
+        cleared_value = float(cleared) if cleared else None
+    except ValueError:
+        log.warning("duid %s: non-numeric storage at %s", duid, stamp)
+        return
+    put(
+        "units",
+        stamp,
+        duid,
+        {
+            "ts": stamp,
+            "initial": initial_value,
+            "energy": energy_value,
+            "cleared": cleared_value,
+        },
+    )
+
+
+def parse_next_day_dispatch(data: bytes) -> dict:
+    """Reduce one Next_Day_Dispatch CSV into per-unit newest measurements.
+
+    Returns {"generated": float|None, "newest_interval": float|None,
+    "units": {duid: {"ts": float, "initial": float, "energy": float,
+    "cleared": float|None}}}. The reader keeps only the newest interval per
+    storage unit that reported a value; `generated` is the publication stamp
+    from the archive's control line.
+    """
+    generated: float | None = None
+
+    def read_control(row: list[str]) -> None:
+        # The first control line is the publication stamp:
+        # C,NEMP.WORLD,NEXT_DAY_DISPATCH,AEMO,PUBLIC,2026/10/08,04:10:00,...
+        nonlocal generated
+        if len(row) >= 7 and row[1] == "NEMP.WORLD":
+            generated = parse_aest(row[5] + " " + row[6])
+
+    report = read_aemo_table(
+        data,
+        table=("DISPATCH", "UNIT_SOLUTION"),
+        columns=_unit_solution_indices,
+        results=("units",),
+        project=_project_unit_solution,
+        missing="no storage units found in %s (handled %d rows)",
+        on_control=read_control,
+    )
+    report["generated"] = generated
+    return report
 
 
 def _unit_scada_indices(header_row: list[str]) -> dict[str, int] | None:
     """Column indices for a UNIT_SCADA header, by name.
 
     Verified against the real file on 2026-10-08: SETTLEMENTDATE, DUID,
-    SCADAVALUE at indices 4, 5, 6. Indexed by name so a column reorder upstream
-    cannot silently read the wrong number.
+    SCADAVALUE at indices 4, 5, 6 - positions recorded for provenance only;
+    the lookup follows the names so a column reorder upstream cannot silently
+    read the wrong number. Returns None when one is missing (shape change).
     """
-    positions = {}
-    for name in ("SETTLEMENTDATE", "DUID", "SCADAVALUE"):
-        try:
-            positions[name] = header_row.index(name)
-        except ValueError:
-            return None
-    return positions
+    return _indices_by_name(
+        header_row, ("SETTLEMENTDATE", "DUID", "SCADAVALUE")
+    )
+
+
+def _project_unit_scada(
+    row: list[str], indices: dict[str, int], put: PutReading
+) -> None:
+    """One UNIT_SCADA row -> the measured output it carries, or nothing.
+
+    Every row is deposited; the caller filters to the storage units it cares
+    about. A re-sent row simply loses to the newer stamp inside the reader.
+    """
+    stamp = parse_aest(row[indices["SETTLEMENTDATE"]])
+    duid = row[indices["DUID"]]
+    if stamp is None or not duid:
+        return
+    try:
+        value = float(row[indices["SCADAVALUE"]])
+    except ValueError:
+        log.warning("duid %s: non-numeric SCADA at %s", duid, stamp)
+        return
+    put("units", stamp, duid, {"ts": stamp, "scada": value})
 
 
 def parse_dispatch_scada(data: bytes) -> dict:
@@ -830,56 +932,42 @@ def parse_dispatch_scada(data: bytes) -> dict:
     stamp wins. Every row is kept here; the caller filters to the storage units
     it cares about.
     """
+    return read_aemo_table(
+        data,
+        table=("DISPATCH", "UNIT_SCADA"),
+        columns=_unit_scada_indices,
+        results=("units",),
+        project=_project_unit_scada,
+        missing="no UNIT_SCADA rows in %s (handled %d)",
+    )
+
+
+def _rooftop_indices(header_row: list[str]) -> dict[str, int] | None:
+    """Column indices for a ROOFTOP/ACTUAL header, by name.
+
+    INTERVAL_DATETIME is this table's stamp column, the role SETTLEMENTDATE
+    plays in the dispatch tables. Returns None when one of the three is
+    missing and the file has changed shape.
+    """
+    return _indices_by_name(
+        header_row, ("INTERVAL_DATETIME", "REGIONID", "POWER")
+    )
+
+
+def _project_rooftop(
+    row: list[str], indices: dict[str, int], put: PutReading
+) -> None:
+    """One ROOFTOP/ACTUAL row -> the region's MW at that interval, or nothing."""
+    stamp = parse_aest(row[indices["INTERVAL_DATETIME"]])
+    region = row[indices["REGIONID"]]
+    if stamp is None or not region:
+        return
     try:
-        archive = zipfile.ZipFile(io.BytesIO(data))
-    except zipfile.BadZipFile as exc:
-        raise ScrapeError("zip corrupted or not a zip: %s" % exc) from exc
-    members = [
-        name
-        for name in archive.namelist()
-        if name.rpartition(".")[-1].lower() == "csv"
-    ]
-    if not members:
-        raise ScrapeError("zip contained no .csv member (%s)" % archive.namelist())
-    filename = members[0].rsplit(".", 1)[0]
-
-    units: dict[str, dict] = {}
-    newest: float | None = None
-    indices: dict[str, int] | None = None
-    handled_rows = 0
-    with archive.open(members[0]) as member:
-        for row in csv_row_reader(member):
-            if not row:
-                continue
-            if row[0] == "I":
-                if len(row) >= 3 and row[2] == "UNIT_SCADA":
-                    indices = _unit_scada_indices(row)
-                continue
-            if row[0] != "D" or indices is None:
-                continue
-            if len(row) < 3 or row[2] != "UNIT_SCADA":
-                continue
-            stamp = parse_aest(row[indices["SETTLEMENTDATE"]])
-            duid = row[indices["DUID"]]
-            if stamp is None or not duid:
-                continue
-            handled_rows += 1
-            try:
-                value = float(row[indices["SCADAVALUE"]])
-            except ValueError:
-                log.warning("duid %s: non-numeric SCADA at %s", duid, stamp)
-                continue
-            entry = units.get(duid)
-            if entry is None or stamp >= entry["ts"]:
-                units[duid] = {"ts": stamp, "scada": value}
-            if newest is None or stamp > newest:
-                newest = stamp
-
-    if not units:
-        raise ScrapeError(
-            "no UNIT_SCADA rows in %s (handled %d)" % (filename, handled_rows)
-        )
-    return {"file": filename, "newest_interval": newest, "units": units}
+        value = float(row[indices["POWER"]])
+    except ValueError:
+        log.warning("region %s: non-numeric rooftop PV at %s", region, stamp)
+        return
+    put("regions", stamp, region, {"ts": stamp, "mw": value})
 
 
 def parse_rooftop_pv(data: bytes) -> dict:
@@ -892,65 +980,14 @@ def parse_rooftop_pv(data: bytes) -> dict:
     keeps its later stamp. Columns are indexed by the header names, so a column
     reorder upstream cannot silently read the wrong number.
     """
-    try:
-        archive = zipfile.ZipFile(io.BytesIO(data))
-    except zipfile.BadZipFile as exc:
-        raise ScrapeError("zip corrupted or not a zip: %s" % exc) from exc
-    members = [
-        name
-        for name in archive.namelist()
-        if name.rpartition(".")[-1].lower() == "csv"
-    ]
-    if not members:
-        raise ScrapeError("zip contained no .csv member (%s)" % archive.namelist())
-    filename = members[0].rsplit(".", 1)[0]
-
-    regions: dict[str, dict] = {}
-    newest: float | None = None
-    indices: dict[str, int] | None = None
-    handled_rows = 0
-    with archive.open(members[0]) as member:
-        for row in csv_row_reader(member):
-            if not row:
-                continue
-            if row[0] == "I":
-                if len(row) >= 3 and row[1] == "ROOFTOP" and row[2] == "ACTUAL":
-                    try:
-                        indices = {
-                            "INTERVAL_DATETIME": row.index("INTERVAL_DATETIME"),
-                            "REGIONID": row.index("REGIONID"),
-                            "POWER": row.index("POWER"),
-                        }
-                    except ValueError:
-                        indices = None
-                continue
-            if row[0] != "D" or indices is None:
-                continue
-            if len(row) < 3 or row[1] != "ROOFTOP" or row[2] != "ACTUAL":
-                continue
-            if len(row) <= max(indices.values()):
-                continue
-            stamp = parse_aest(row[indices["INTERVAL_DATETIME"]])
-            region = row[indices["REGIONID"]]
-            if stamp is None or not region:
-                continue
-            handled_rows += 1
-            try:
-                value = float(row[indices["POWER"]])
-            except ValueError:
-                log.warning("region %s: non-numeric rooftop PV at %s", region, stamp)
-                continue
-            entry = regions.get(region)
-            if entry is None or stamp >= entry["ts"]:
-                regions[region] = {"ts": stamp, "mw": value}
-            if newest is None or stamp > newest:
-                newest = stamp
-
-    if not regions:
-        raise ScrapeError(
-            "no ROOFTOP PV rows in %s (handled %d)" % (filename, handled_rows)
-        )
-    return {"file": filename, "newest_interval": newest, "regions": regions}
+    return read_aemo_table(
+        data,
+        table=("ROOFTOP", "ACTUAL"),
+        columns=_rooftop_indices,
+        results=("regions",),
+        project=_project_rooftop,
+        missing="no ROOFTOP PV rows in %s (handled %d)",
+    )
 
 
 def _region_sum_indices(header_row: list[str]) -> dict[str, int] | None:
@@ -965,23 +1002,24 @@ def _region_sum_indices(header_row: list[str]) -> dict[str, int] | None:
 
     The SS_* curtailment columns are recorded when present but are not required:
     a REGIONSUM table without them still yields region storage, and any header a
-    synthetic test builds may omit them. Everything is indexed by name so a
-    column reorder upstream cannot silently read the wrong number.
+    synthetic test builds may omit them. Returns None when a required column is
+    missing (shape change).
     """
-    positions = {}
-    for name in ("SETTLEMENTDATE", "REGIONID", "BDU_INITIAL_ENERGY_STORAGE",
-                 "BDU_ENERGY_STORAGE"):
-        try:
-            positions[name] = header_row.index(name)
-        except ValueError:
-            return None
-    for name in ("SS_WIND_UIGF", "SS_WIND_CLEAREDMW",
-                 "SS_SOLAR_UIGF", "SS_SOLAR_CLEAREDMW"):
-        try:
-            positions[name] = header_row.index(name)
-        except ValueError:
-            pass
-    return positions
+    return _indices_by_name(
+        header_row,
+        (
+            "SETTLEMENTDATE",
+            "REGIONID",
+            "BDU_INITIAL_ENERGY_STORAGE",
+            "BDU_ENERGY_STORAGE",
+        ),
+        (
+            "SS_WIND_UIGF",
+            "SS_WIND_CLEAREDMW",
+            "SS_SOLAR_UIGF",
+            "SS_SOLAR_CLEAREDMW",
+        ),
+    )
 
 
 def _interconnector_indices(header_row: list[str]) -> dict[str, int] | None:
@@ -991,20 +1029,72 @@ def _interconnector_indices(header_row: list[str]) -> dict[str, int] | None:
     INTERCONNECTORID at 6, METEREDMWFLOW at 9, MWFLOW at 10, MWLOSSES at 11,
     MARGINALVALUE at 12, VIOLATIONDEGREE at 13, EXPORTLIMIT at 15, IMPORTLIMIT
     at 16, MARGINALLOSS at 17. The identification columns are required; any
-    optional column that is absent simply yields None series.
+    optional column that is absent simply yields None series. Returns None
+    when a required column is missing (shape change).
     """
-    positions = {}
-    for name in INTERCONNECTOR_REQUIRED:
+    return _indices_by_name(
+        header_row, INTERCONNECTOR_REQUIRED, INTERCONNECTOR_OPTIONAL
+    )
+
+
+def _project_region_sum(
+    row: list[str], indices: dict[str, int], put: PutReading
+) -> None:
+    """One DISPATCH,REGIONSUM row -> its storage and curtailment readings.
+
+    The two maps are independent, so a region with renewables but no batteries
+    still contributes curtailment and a region whose BDU columns are both blank
+    is simply absent from the storage map.
+    """
+    stamp = parse_aest(row[indices["SETTLEMENTDATE"]])
+    region = row[indices["REGIONID"]]
+    if stamp is None or not region:
+        return
+    initial_text = row[indices["BDU_INITIAL_ENERGY_STORAGE"]]
+    energy_text = row[indices["BDU_ENERGY_STORAGE"]]
+    if initial_text or energy_text:
         try:
-            positions[name] = header_row.index(name)
+            initial = float(initial_text) if initial_text else None
+            energy = float(energy_text) if energy_text else initial
         except ValueError:
-            return None
-    for name in INTERCONNECTOR_OPTIONAL:
+            log.warning("region %s: non-numeric BDU storage at %s", region, stamp)
+        else:
+            put(
+                "regions",
+                stamp,
+                region,
+                {"ts": stamp, "initial": initial, "energy": energy},
+            )
+    # Which (UIGF, CLEAREDMW, fuel) triples this header can supply; none when
+    # the file predates the SS_* columns.
+    curtail_fields = [
+        (indices[uigf], indices[cleared], fuel)
+        for uigf, cleared, fuel in CURTAILMENT_COLUMNS
+        if uigf in indices and cleared in indices
+    ]
+    if not curtail_fields:
+        return
+    readings: dict[str, float] | None = {}
+    for uigf_idx, cleared_idx, fuel in curtail_fields:
+        uigf_text = row[uigf_idx]
+        cleared_text = row[cleared_idx]
+        if not uigf_text and not cleared_text:
+            continue
         try:
-            positions[name] = header_row.index(name)
+            uigf = float(uigf_text) if uigf_text else 0.0
+            cleared = float(cleared_text) if cleared_text else 0.0
         except ValueError:
-            pass
-    return positions
+            log.warning(
+                "region %s: non-numeric %s curtailment at %s",
+                region, fuel, stamp,
+            )
+            readings = None
+            break
+        # Floored at zero: the gap is legitimately negative when a unit
+        # generates above its own self-forecast.
+        readings[fuel] = max(0.0, uigf - cleared)
+    if readings:
+        put("curtailment", stamp, region, {"ts": stamp, **readings})
 
 
 def parse_dispatchis_region_storage(data: bytes) -> dict:
@@ -1019,109 +1109,14 @@ def parse_dispatchis_region_storage(data: bytes) -> dict:
     the cleared MW floored at zero. The two maps are independent, so a region
     with renewables but no batteries still contributes curtailment.
     """
-    try:
-        archive = zipfile.ZipFile(io.BytesIO(data))
-    except zipfile.BadZipFile as exc:
-        raise ScrapeError("zip corrupted or not a zip: %s" % exc) from exc
-    members = [
-        name
-        for name in archive.namelist()
-        if name.rpartition(".")[-1].lower() == "csv"
-    ]
-    if not members:
-        raise ScrapeError("zip contained no .csv member (%s)" % archive.namelist())
-    filename = members[0].rsplit(".", 1)[0]
-
-    regions: dict[str, dict] = {}
-    curtailment: dict[str, dict] = {}
-    newest: float | None = None
-    indices: dict[str, int] | None = None
-    # Which (UIGF index, CLEAREDMW index, fuel) triples this header can supply;
-    # empty when the file predates the SS_* columns.
-    curtail_fields: list[tuple[int, int, str]] = []
-    handled_rows = 0
-    with archive.open(members[0]) as member:
-        for row in csv_row_reader(member):
-            if not row:
-                continue
-            if row[0] == "I":
-                if len(row) >= 3 and row[1] == "DISPATCH" and row[2] == "REGIONSUM":
-                    indices = _region_sum_indices(row)
-                    if indices is not None:
-                        curtail_fields = [
-                            (indices[uigf], indices[cleared], fuel)
-                            for uigf, cleared, fuel in CURTAILMENT_COLUMNS
-                            if uigf in indices and cleared in indices
-                        ]
-                continue
-            if row[0] != "D" or indices is None:
-                continue
-            if len(row) < 3 or row[1] != "DISPATCH" or row[2] != "REGIONSUM":
-                continue
-            stamp = parse_aest(row[indices["SETTLEMENTDATE"]])
-            region = row[indices["REGIONID"]]
-            if stamp is None or not region:
-                continue
-            handled_rows += 1
-            if len(row) > max(indices["BDU_ENERGY_STORAGE"],
-                              indices["BDU_INITIAL_ENERGY_STORAGE"]):
-                initial_text = row[indices["BDU_INITIAL_ENERGY_STORAGE"]]
-                energy_text = row[indices["BDU_ENERGY_STORAGE"]]
-                if initial_text or energy_text:
-                    try:
-                        initial = float(initial_text) if initial_text else None
-                        energy = float(energy_text) if energy_text else initial
-                    except ValueError:
-                        log.warning(
-                            "region %s: non-numeric BDU storage at %s", region, stamp
-                        )
-                    else:
-                        entry = regions.get(region)
-                        if entry is None or stamp >= entry["ts"]:
-                            regions[region] = {
-                                "ts": stamp, "initial": initial, "energy": energy,
-                            }
-                        if newest is None or stamp > newest:
-                            newest = stamp
-            if curtail_fields:
-                readings: dict[str, float] | None = {}
-                for uigf_idx, cleared_idx, fuel in curtail_fields:
-                    if uigf_idx >= len(row) or cleared_idx >= len(row):
-                        continue
-                    uigf_text = row[uigf_idx]
-                    cleared_text = row[cleared_idx]
-                    if not uigf_text and not cleared_text:
-                        continue
-                    try:
-                        uigf = float(uigf_text) if uigf_text else 0.0
-                        cleared = float(cleared_text) if cleared_text else 0.0
-                    except ValueError:
-                        log.warning(
-                            "region %s: non-numeric %s curtailment at %s",
-                            region, fuel, stamp,
-                        )
-                        readings = None
-                        break
-                    # Floored at zero: the gap is legitimately negative when a
-                    # unit generates above its own self-forecast.
-                    readings[fuel] = max(0.0, uigf - cleared)
-                if readings:
-                    entry = curtailment.get(region)
-                    if entry is None or stamp >= entry["ts"]:
-                        curtailment[region] = {"ts": stamp, **readings}
-                    if newest is None or stamp > newest:
-                        newest = stamp
-
-    if not regions and not curtailment:
-        raise ScrapeError(
-            "no REGIONSUM rows in %s (handled %d)" % (filename, handled_rows)
-        )
-    return {
-        "file": filename,
-        "newest_interval": newest,
-        "regions": regions,
-        "curtailment": curtailment,
-    }
+    return read_aemo_table(
+        data,
+        table=("DISPATCH", "REGIONSUM"),
+        columns=_region_sum_indices,
+        results=("regions", "curtailment"),
+        project=_project_region_sum,
+        missing="no REGIONSUM rows in %s (handled %d)",
+    )
 
 
 def _cell_float(row: list[str], idx: int | None, what: str, id_: str) -> float | None:
@@ -1133,6 +1128,45 @@ def _cell_float(row: list[str], idx: int | None, what: str, id_: str) -> float |
     except ValueError:
         log.warning("interconnector %s: non-numeric %s", id_, what)
         return None
+
+
+def _project_interconnector(
+    row: list[str], indices: dict[str, int], put: PutReading
+) -> None:
+    """One DISPATCH,INTERCONNECTORRES row -> its flow and limits, verbatim.
+
+    Every optional column is carried as AEMO publishes it, never re-derived:
+    limits can legitimately be negative (T-V-MNSP1 reports both negative), and
+    a blank cell reads as None rather than 0.
+    """
+    stamp = parse_aest(row[indices["SETTLEMENTDATE"]])
+    ic = row[indices["INTERCONNECTORID"]]
+    if stamp is None or not ic:
+        return
+    entry = {
+        "ts": stamp,
+        "mwflow": _cell_float(row, indices.get("MWFLOW"), "MWFLOW", ic),
+        "metered_mwflow": _cell_float(
+            row, indices.get("METEREDMWFLOW"), "METEREDMWFLOW", ic
+        ),
+        "export_limit": _cell_float(
+            row, indices.get("EXPORTLIMIT"), "EXPORTLIMIT", ic
+        ),
+        "import_limit": _cell_float(
+            row, indices.get("IMPORTLIMIT"), "IMPORTLIMIT", ic
+        ),
+        "losses": _cell_float(row, indices.get("MWLOSSES"), "MWLOSSES", ic),
+        "marginal_value": _cell_float(
+            row, indices.get("MARGINALVALUE"), "MARGINALVALUE", ic
+        ),
+        "marginal_loss": _cell_float(
+            row, indices.get("MARGINALLOSS"), "MARGINALLOSS", ic
+        ),
+        "violation_degree": _cell_float(
+            row, indices.get("VIOLATIONDEGREE"), "VIOLATIONDEGREE", ic
+        ),
+    }
+    put("interconnectors", stamp, ic, entry)
 
 
 def parse_dispatchis_interconnectors(data: bytes) -> dict:
@@ -1151,87 +1185,14 @@ def parse_dispatchis_interconnectors(data: bytes) -> dict:
     column is carried verbatim, never re-derived. Where a row is re-sent the
     newest stamp wins.
     """
-    try:
-        archive = zipfile.ZipFile(io.BytesIO(data))
-    except zipfile.BadZipFile as exc:
-        raise ScrapeError("zip corrupted or not a zip: %s" % exc) from exc
-    members = [
-        name
-        for name in archive.namelist()
-        if name.rpartition(".")[-1].lower() == "csv"
-    ]
-    if not members:
-        raise ScrapeError("zip contained no .csv member (%s)" % archive.namelist())
-    filename = members[0].rsplit(".", 1)[0]
-
-    interconnectors: dict[str, dict] = {}
-    newest: float | None = None
-    indices: dict[str, int] | None = None
-    handled_rows = 0
-    with archive.open(members[0]) as member:
-        for row in csv_row_reader(member):
-            if not row:
-                continue
-            if row[0] == "I":
-                if (
-                    len(row) >= 3
-                    and row[1] == "DISPATCH"
-                    and row[2] == "INTERCONNECTORRES"
-                ):
-                    indices = _interconnector_indices(row)
-                continue
-            if row[0] != "D" or indices is None:
-                continue
-            if (
-                len(row) < 3
-                or row[1] != "DISPATCH"
-                or row[2] != "INTERCONNECTORRES"
-            ):
-                continue
-            stamp = parse_aest(row[indices["SETTLEMENTDATE"]])
-            ic = row[indices["INTERCONNECTORID"]]
-            if stamp is None or not ic:
-                continue
-            handled_rows += 1
-            entry = {
-                "ts": stamp,
-                "mwflow": _cell_float(row, indices.get("MWFLOW"), "MWFLOW", ic),
-                "metered_mwflow": _cell_float(
-                    row, indices.get("METEREDMWFLOW"), "METEREDMWFLOW", ic
-                ),
-                "export_limit": _cell_float(
-                    row, indices.get("EXPORTLIMIT"), "EXPORTLIMIT", ic
-                ),
-                "import_limit": _cell_float(
-                    row, indices.get("IMPORTLIMIT"), "IMPORTLIMIT", ic
-                ),
-                "losses": _cell_float(row, indices.get("MWLOSSES"), "MWLOSSES", ic),
-                "marginal_value": _cell_float(
-                    row, indices.get("MARGINALVALUE"), "MARGINALVALUE", ic
-                ),
-                "marginal_loss": _cell_float(
-                    row, indices.get("MARGINALLOSS"), "MARGINALLOSS", ic
-                ),
-                "violation_degree": _cell_float(
-                    row, indices.get("VIOLATIONDEGREE"), "VIOLATIONDEGREE", ic
-                ),
-            }
-            prev = interconnectors.get(ic)
-            if prev is None or stamp >= prev["ts"]:
-                interconnectors[ic] = entry
-            if newest is None or stamp > newest:
-                newest = stamp
-
-    if not interconnectors:
-        raise ScrapeError(
-            "no INTERCONNECTORRES rows in %s (handled %d)"
-            % (filename, handled_rows)
-        )
-    return {
-        "file": filename,
-        "newest_interval": newest,
-        "interconnectors": interconnectors,
-    }
+    return read_aemo_table(
+        data,
+        table=("DISPATCH", "INTERCONNECTORRES"),
+        columns=_interconnector_indices,
+        results=("interconnectors",),
+        project=_project_interconnector,
+        missing="no INTERCONNECTORRES rows in %s (handled %d)",
+    )
 
 
 def region_interchange(interconnectors: dict) -> dict:
@@ -1397,242 +1358,277 @@ def render(
     return "\n".join(lines) + "\n"
 
 
-def render_intraday(
-        scada: dict,
-        scada_ok: bool,
-        region_storage: dict,
-        region_ok: bool,
-        duration: float,
-        now: float,
-        infer: dict | None = None,
-        infer_ok: bool = False,
-        unit_meta: dict | None = None,
-        rooftop: dict | None = None,
-        rooftop_ok: bool = False,
-    ) -> str:
-    """Exposition for the intraday cycle's last readings.
+# --------------------------------------------------------------------------- #
+# Intraday feed policy
+# --------------------------------------------------------------------------- #
+#
+# Each block of intraday series is emitted by one function that owns its data
+# gate (an empty map publishes nothing) and nothing else - never a feed flag.
+# Which feed a block rides on lives in INTRADAY_BLOCKS below, so the failure
+# policy is one table rather than flags threaded through the render.
 
-    Each side is independent: a failed SCADA read omits the per-unit power and
-    per-region fossil series while a healthy DispatchIS read still publishes the
-    region storage and curtailment (and vice versa); each has its own success
-    gauge, and neither repeats a measurement it did not verify this cycle. The
-    per-unit *inferred* stored MWh is a coupled side: it is served only when a
-    daily anchor exists AND the SCADA feed is live this cycle, since it is built
-    from SCADA.
 
-    The `aemo_unit_power_mw` series carries every dispatch unit in the SCADA
-    file - generators, loads and storage alike - labelled with its fueltech and
-    region from the OE fleet cache (`unit_meta`). It is the superset of the
-    legacy `aemo_battery_power_mw` series, which stays filtered to storage units
-    so existing dashboards keep their exact semantics while consumers migrate.
+def _emit_unit_power(src: dict) -> list[str]:
+    """`aemo_unit_power_mw` and its per-unit timestamps/ages, for every
+    dispatch unit in the SCADA file.
+
+    The series carries every dispatch unit - generators, loads and storage
+    alike - labelled with its fueltech and region from the OE fleet cache
+    (`unit_meta`). It is the superset of the legacy `aemo_battery_power_mw`
+    series, which stays filtered to storage units so existing dashboards keep
+    their exact semantics while consumers migrate.
     """
-    lines: list[str] = []
-    # `unit` is the fleet unit code for this DUID, empty when the fleet does not
-    # name it. It rides on every per-unit series so consumers can join on the
-    # fleet's own identifier rather than on AEMO's spelling of it - see
-    # docs/adr/0001 and fleet.UNIT_ALIASES.
-    meta = unit_meta or {}
+    scada = src["scada"]
+    now = src["now"]
+    meta = src["meta"]
     all_units = scada.get("all_units") or {}
-    if all_units and scada_ok:
+    if not all_units:
+        return []
+    lines: list[str] = [
+        "# HELP aemo_unit_power_mw Measured output at the newest interval, "
+        "MW, for every dispatch unit in Dispatch_SCADA "
+        "(negative = charging/absorbing). Supersedes aemo_battery_power_mw.",
+        "# TYPE aemo_unit_power_mw gauge",
+    ]
+    for duid in sorted(all_units):
+        u = all_units[duid]
+        m = meta.get(duid) or {}
         lines += [
-            "# HELP aemo_unit_power_mw Measured output at the newest interval, "
-            "MW, for every dispatch unit in Dispatch_SCADA "
-            "(negative = charging/absorbing). Supersedes aemo_battery_power_mw.",
-            "# TYPE aemo_unit_power_mw gauge",
+            'aemo_unit_power_mw{unit="%s",duid="%s",fueltech="%s",region="%s"} %s'
+            % (
+                escape_label(m.get("unit") or ""),
+                escape_label(duid),
+                escape_label(m.get("fueltech") or ""),
+                escape_label(m.get("region") or ""),
+                fmt(u["scada"]),
+            ),
+            'aemo_unit_power_timestamp_seconds{unit="%s",duid="%s"} %s'
+            % (escape_label(m.get("unit") or ""), escape_label(duid), fmt(u["ts"])),
+            'aemo_unit_power_age_seconds{unit="%s",duid="%s"} %s'
+            % (escape_label(m.get("unit") or ""), escape_label(duid), fmt(now - u["ts"])),
         ]
-        for duid in sorted(all_units):
-            u = all_units[duid]
-            m = meta.get(duid) or {}
-            lines += [
-                'aemo_unit_power_mw{unit="%s",duid="%s",fueltech="%s",region="%s"} %s'
-                % (
-                    escape_label(m.get("unit") or ""),
-                    escape_label(duid),
-                    escape_label(m.get("fueltech") or ""),
-                    escape_label(m.get("region") or ""),
-                    fmt(u["scada"]),
-                ),
-                'aemo_unit_power_timestamp_seconds{unit="%s",duid="%s"} %s'
-                % (escape_label(m.get("unit") or ""), escape_label(duid), fmt(u["ts"])),
-                'aemo_unit_power_age_seconds{unit="%s",duid="%s"} %s'
-                % (escape_label(m.get("unit") or ""), escape_label(duid), fmt(now - u["ts"])),
-            ]
-        lines += [
-            "# HELP aemo_unit_power_report_info Processed Dispatch_SCADA file.",
-            "# TYPE aemo_unit_power_report_info gauge",
-            'aemo_unit_power_report_info{file="%s"} 1'
-            % escape_label(scada.get("file", "")),
-            "# HELP aemo_unit_power_interval_timestamp_seconds "
-            "Newest 5-minute interval in the SCADA file.",
-            "# TYPE aemo_unit_power_interval_timestamp_seconds gauge",
-            "aemo_unit_power_interval_timestamp_seconds %s"
-            % fmt(scada.get("newest_interval")),
-            "# HELP aemo_unit_power_units Number of dispatch units in the "
-            "SCADA file.",
-            "# TYPE aemo_unit_power_units gauge",
-            "aemo_unit_power_units %d" % len(all_units),
-        ]
+    lines += [
+        "# HELP aemo_unit_power_report_info Processed Dispatch_SCADA file.",
+        "# TYPE aemo_unit_power_report_info gauge",
+        'aemo_unit_power_report_info{file="%s"} 1'
+        % escape_label(scada.get("file", "")),
+        "# HELP aemo_unit_power_interval_timestamp_seconds "
+        "Newest 5-minute interval in the SCADA file.",
+        "# TYPE aemo_unit_power_interval_timestamp_seconds gauge",
+        "aemo_unit_power_interval_timestamp_seconds %s"
+        % fmt(scada.get("newest_interval")),
+        "# HELP aemo_unit_power_units Number of dispatch units in the "
+        "SCADA file.",
+        "# TYPE aemo_unit_power_units gauge",
+        "aemo_unit_power_units %d" % len(all_units),
+    ]
+    return lines
 
+
+def _emit_battery_power(src: dict) -> list[str]:
+    """The legacy `aemo_battery_power_mw` series, storage units only."""
+    scada = src["scada"]
+    now = src["now"]
+    meta = src["meta"]
     units = scada.get("units") or {}
-    if units and scada_ok:
+    if not units:
+        return []
+    lines: list[str] = [
+        "# HELP aemo_battery_power_mw Measured output at the newest interval, "
+        "MW (negative = charging/absorbing). Deprecated in favour of "
+        "aemo_unit_power_mw, which carries the same measurement for every "
+        "dispatch unit with fueltech/region labels.",
+        "# TYPE aemo_battery_power_mw gauge",
+    ]
+    for duid in sorted(units):
+        u = units[duid]
+        m = meta.get(duid) or {}
         lines += [
-            "# HELP aemo_battery_power_mw Measured output at the newest interval, "
-            "MW (negative = charging/absorbing). Deprecated in favour of "
-            "aemo_unit_power_mw, which carries the same measurement for every "
-            "dispatch unit with fueltech/region labels.",
-            "# TYPE aemo_battery_power_mw gauge",
+            'aemo_battery_power_mw{unit="%s",duid="%s"} %s'
+            % (escape_label(m.get("unit") or ""), escape_label(duid), fmt(u["scada"])),
+            'aemo_battery_power_timestamp_seconds{unit="%s",duid="%s"} %s'
+            % (escape_label(m.get("unit") or ""), escape_label(duid), fmt(u["ts"])),
+            'aemo_battery_power_age_seconds{unit="%s",duid="%s"} %s'
+            % (escape_label(m.get("unit") or ""), escape_label(duid), fmt(now - u["ts"])),
         ]
-        for duid in sorted(units):
-            u = units[duid]
-            m = meta.get(duid) or {}
-            lines += [
-                'aemo_battery_power_mw{unit="%s",duid="%s"} %s'
-                % (escape_label(m.get("unit") or ""), escape_label(duid), fmt(u["scada"])),
-                'aemo_battery_power_timestamp_seconds{unit="%s",duid="%s"} %s'
-                % (escape_label(m.get("unit") or ""), escape_label(duid), fmt(u["ts"])),
-                'aemo_battery_power_age_seconds{unit="%s",duid="%s"} %s'
-                % (escape_label(m.get("unit") or ""), escape_label(duid), fmt(now - u["ts"])),
-            ]
-        lines += [
-            "# HELP aemo_battery_power_report_info Processed Dispatch_SCADA file.",
-            "# TYPE aemo_battery_power_report_info gauge",
-            'aemo_battery_power_report_info{file="%s"} 1'
-            % escape_label(scada.get("file", "")),
-            "# HELP aemo_battery_power_interval_timestamp_seconds "
-            "Newest 5-minute interval in the SCADA file.",
-            "# TYPE aemo_battery_power_interval_timestamp_seconds gauge",
-            "aemo_battery_power_interval_timestamp_seconds %s"
-            % fmt(scada.get("newest_interval")),
-            "# HELP aemo_battery_units_with_power Storage units in the SCADA file.",
-            "# TYPE aemo_battery_units_with_power gauge",
-            "aemo_battery_units_with_power %d" % len(units),
-        ]
+    lines += [
+        "# HELP aemo_battery_power_report_info Processed Dispatch_SCADA file.",
+        "# TYPE aemo_battery_power_report_info gauge",
+        'aemo_battery_power_report_info{file="%s"} 1'
+        % escape_label(scada.get("file", "")),
+        "# HELP aemo_battery_power_interval_timestamp_seconds "
+        "Newest 5-minute interval in the SCADA file.",
+        "# TYPE aemo_battery_power_interval_timestamp_seconds gauge",
+        "aemo_battery_power_interval_timestamp_seconds %s"
+        % fmt(scada.get("newest_interval")),
+        "# HELP aemo_battery_units_with_power Storage units in the SCADA file.",
+        "# TYPE aemo_battery_units_with_power gauge",
+        "aemo_battery_units_with_power %d" % len(units),
+    ]
+    return lines
 
-    # Which dispatch units in the storage set have no fleet row. Without one
-    # they get no fueltech, no region and no registered capacity, so they drop
-    # out of every region grouping and out of the 100% top clamp on their
-    # inferred stored energy - and that used to happen silently.
-    #
-    # Scoped to the storage set rather than every dispatch unit in SCADA: the
-    # aggregate DUIDs AEMO publishes for rooftop PV and distributed generation
-    # are not facilities and will never be in OpenElectricity's fleet, so
-    # counting them would make the baseline permanent instead of zero. Gated on
-    # a non-empty map for the same reason: an empty `unit_meta` means the fleet
-    # cache has not been read yet, not that every unit is missing.
-    fleet_by_duid = unit_meta or {}
-    if units and fleet_by_duid:
-        missing = [duid for duid in sorted(units) if duid not in fleet_by_duid]
-        if missing:
-            lines += [
-                "# HELP aemo_battery_fleet_metadata_missing Dispatch units in "
-                "the storage set with no OpenElectricity fleet row, and "
-                "therefore no fueltech, region or registered capacity. Expected "
-                "to be empty; a DUID listed here is one to add to "
-                "fleet.UNIT_ALIASES or to raise upstream.",
-                "# TYPE aemo_battery_fleet_metadata_missing gauge",
-            ]
-            for duid in missing:
-                lines.append(
-                    'aemo_battery_fleet_metadata_missing{duid="%s"} 1'
-                    % escape_label(duid)
-                )
 
+def _emit_fleet_metadata_missing(src: dict) -> list[str]:
+    """`aemo_battery_fleet_metadata_missing`: storage units with no fleet row.
+
+    Which dispatch units in the storage set have no OpenElectricity fleet row.
+    Without one they get no fueltech, no region and no registered capacity, so
+    they drop out of every region grouping and out of the 100% top clamp on
+    their inferred stored energy - and that used to happen silently.
+
+    Scoped to the storage set rather than every dispatch unit in SCADA: the
+    aggregate DUIDs AEMO publishes for rooftop PV and distributed generation
+    are not facilities and will never be in OpenElectricity's fleet, so
+    counting them would make the baseline permanent instead of zero. Gated on
+    a non-empty map for the same reason: an empty `unit_meta` means the fleet
+    cache has not been read yet, not that every unit is missing.
+    """
+    units = src["scada"].get("units") or {}
+    fleet_by_duid = src["meta"]
+    if not units or not fleet_by_duid:
+        return []
+    missing = [duid for duid in sorted(units) if duid not in fleet_by_duid]
+    if not missing:
+        return []
+    lines: list[str] = [
+        "# HELP aemo_battery_fleet_metadata_missing Dispatch units in "
+        "the storage set with no OpenElectricity fleet row, and "
+        "therefore no fueltech, region or registered capacity. Expected "
+        "to be empty; a DUID listed here is one to add to "
+        "fleet.UNIT_ALIASES or to raise upstream.",
+        "# TYPE aemo_battery_fleet_metadata_missing gauge",
+    ]
+    for duid in missing:
+        lines.append(
+            'aemo_battery_fleet_metadata_missing{duid="%s"} 1'
+            % escape_label(duid)
+        )
+    return lines
+
+
+def _emit_region_storage(src: dict) -> list[str]:
+    """Per-region stored/initial MWh and their interval timestamps."""
+    region_storage = src["region_storage"]
     regions = region_storage.get("regions") or {}
-    if regions and region_ok:
+    if not regions:
+        return []
+    lines: list[str] = [
+        "# HELP aemo_battery_region_initial_stored_mwh BDU_INITIAL_ENERGY_"
+        "STORAGE at the newest interval, MWh.",
+        "# TYPE aemo_battery_region_initial_stored_mwh gauge",
+        "# HELP aemo_battery_region_stored_mwh BDU_ENERGY_STORAGE at the "
+        "newest interval, MWh.",
+        "# TYPE aemo_battery_region_stored_mwh gauge",
+        "# HELP aemo_battery_region_storage_timestamp_seconds Newest interval "
+        "behind the region storage readings.",
+        "# TYPE aemo_battery_region_storage_timestamp_seconds gauge",
+    ]
+    for region in sorted(regions):
+        r = regions[region]
         lines += [
-            "# HELP aemo_battery_region_initial_stored_mwh BDU_INITIAL_ENERGY_"
-            "STORAGE at the newest interval, MWh.",
-            "# TYPE aemo_battery_region_initial_stored_mwh gauge",
-            "# HELP aemo_battery_region_stored_mwh BDU_ENERGY_STORAGE at the "
-            "newest interval, MWh.",
-            "# TYPE aemo_battery_region_stored_mwh gauge",
-            "# HELP aemo_battery_region_storage_timestamp_seconds Newest interval "
-            "behind the region storage readings.",
-            "# TYPE aemo_battery_region_storage_timestamp_seconds gauge",
+            'aemo_battery_region_initial_stored_mwh{region="%s"} %s'
+            % (escape_label(region), fmt(r["initial"])),
+            'aemo_battery_region_stored_mwh{region="%s"} %s'
+            % (escape_label(region), fmt(r["energy"])),
+            'aemo_battery_region_storage_timestamp_seconds{region="%s"} %s'
+            % (escape_label(region), fmt(r["ts"])),
         ]
-        for region in sorted(regions):
-            r = regions[region]
-            lines += [
-                'aemo_battery_region_initial_stored_mwh{region="%s"} %s'
-                % (escape_label(region), fmt(r["initial"])),
-                'aemo_battery_region_stored_mwh{region="%s"} %s'
-                % (escape_label(region), fmt(r["energy"])),
-                'aemo_battery_region_storage_timestamp_seconds{region="%s"} %s'
-                % (escape_label(region), fmt(r["ts"])),
-            ]
-        lines += [
-            "# HELP aemo_battery_region_storage_report_info Processed DispatchIS "
-            "file.",
-            "# TYPE aemo_battery_region_storage_report_info gauge",
-            'aemo_battery_region_storage_report_info{file="%s"} 1'
-            % escape_label(region_storage.get("file", "")),
-            "# HELP aemo_battery_region_storage_interval_timestamp_seconds "
-            "Newest 5-minute interval in the DispatchIS file.",
-            "# TYPE aemo_battery_region_storage_interval_timestamp_seconds gauge",
-            "aemo_battery_region_storage_interval_timestamp_seconds %s"
-            % fmt(region_storage.get("newest_interval")),
-        ]
+    lines += [
+        "# HELP aemo_battery_region_storage_report_info Processed DispatchIS "
+        "file.",
+        "# TYPE aemo_battery_region_storage_report_info gauge",
+        'aemo_battery_region_storage_report_info{file="%s"} 1'
+        % escape_label(region_storage.get("file", "")),
+        "# HELP aemo_battery_region_storage_interval_timestamp_seconds "
+        "Newest 5-minute interval in the DispatchIS file.",
+        "# TYPE aemo_battery_region_storage_interval_timestamp_seconds gauge",
+        "aemo_battery_region_storage_interval_timestamp_seconds %s"
+        % fmt(region_storage.get("newest_interval")),
+    ]
+    return lines
 
-    curtailment = region_storage.get("curtailment") or {}
-    if curtailment and region_ok:
-        lines += [
-            "# HELP aemo_battery_region_curtailment_mw Renewable capacity the "
-            "dispatch engine did not clear, at the newest interval, MW: the "
-            "self-forecast (SS_*_UIGF) minus the cleared MW (SS_*_CLEAREDMW), "
-            "per region and fuel. Floored at zero; the raw gap is negative when "
-            "a unit generates above its own forecast.",
-            "# TYPE aemo_battery_region_curtailment_mw gauge",
-            "# HELP aemo_battery_region_curtailment_timestamp_seconds Newest "
-            "interval behind the region curtailment readings.",
-            "# TYPE aemo_battery_region_curtailment_timestamp_seconds gauge",
-        ]
-        for region in sorted(curtailment):
-            r = curtailment[region]
-            for fuel in ("wind", "solar"):
-                if fuel in r:
-                    lines.append(
-                        'aemo_battery_region_curtailment_mw{region="%s",fuel="%s"} %s'
-                        % (escape_label(region), fuel, fmt(r[fuel]))
-                    )
-            lines.append(
-                'aemo_battery_region_curtailment_timestamp_seconds{region="%s"} %s'
-                % (escape_label(region), fmt(r["ts"]))
-            )
 
-    fossil = scada.get("region_fossil") or {}
-    if fossil and scada_ok:
-        lines += [
-            "# HELP aemo_battery_region_fossil_generation_mw Measured output of "
-            "coal, gas and distillate units, summed per region, MW. The MW are "
-            "AEMO Dispatch_SCADA; the fuel and region attribution is "
-            "OpenElectricity fleet metadata (--fleet-cache-file), the only "
-            "source of a per-region fuel breakdown.",
-            "# TYPE aemo_battery_region_fossil_generation_mw gauge",
-            "# HELP aemo_battery_region_fossil_timestamp_seconds Newest SCADA "
-            "interval behind the region fossil generation.",
-            "# TYPE aemo_battery_region_fossil_timestamp_seconds gauge",
-        ]
-        for region in sorted(fossil):
-            f = fossil[region]
-            lines += [
-                'aemo_battery_region_fossil_generation_mw{region="%s"} %s'
-                % (escape_label(region), fmt(f["mw"])),
-                'aemo_battery_region_fossil_timestamp_seconds{region="%s"} %s'
-                % (escape_label(region), fmt(f["ts"])),
-            ]
-        lines += [
-            "# HELP aemo_battery_fossil_units Fossil units with a live reading "
-            "this cycle.",
-            "# TYPE aemo_battery_fossil_units gauge",
-            "aemo_battery_fossil_units %d"
-            % sum(f["units"] for f in fossil.values()),
-        ]
+def _emit_curtailment(src: dict) -> list[str]:
+    """Per-region renewable curtailment (self-forecast minus cleared MW)."""
+    curtailment = src["region_storage"].get("curtailment") or {}
+    if not curtailment:
+        return []
+    lines: list[str] = [
+        "# HELP aemo_battery_region_curtailment_mw Renewable capacity the "
+        "dispatch engine did not clear, at the newest interval, MW: the "
+        "self-forecast (SS_*_UIGF) minus the cleared MW (SS_*_CLEAREDMW), "
+        "per region and fuel. Floored at zero; the raw gap is negative when "
+        "a unit generates above its own forecast.",
+        "# TYPE aemo_battery_region_curtailment_mw gauge",
+        "# HELP aemo_battery_region_curtailment_timestamp_seconds Newest "
+        "interval behind the region curtailment readings.",
+        "# TYPE aemo_battery_region_curtailment_timestamp_seconds gauge",
+    ]
+    for region in sorted(curtailment):
+        r = curtailment[region]
+        for fuel in ("wind", "solar"):
+            if fuel in r:
+                lines.append(
+                    'aemo_battery_region_curtailment_mw{region="%s",fuel="%s"} %s'
+                    % (escape_label(region), fuel, fmt(r[fuel]))
+                )
+        lines.append(
+            'aemo_battery_region_curtailment_timestamp_seconds{region="%s"} %s'
+            % (escape_label(region), fmt(r["ts"]))
+        )
+    return lines
 
+
+def _emit_region_fossil(src: dict) -> list[str]:
+    """Per-region measured fossil generation, summed from the SCADA rows."""
+    fossil = src["scada"].get("region_fossil") or {}
+    if not fossil:
+        return []
+    lines: list[str] = [
+        "# HELP aemo_battery_region_fossil_generation_mw Measured output of "
+        "coal, gas and distillate units, summed per region, MW. The MW are "
+        "AEMO Dispatch_SCADA; the fuel and region attribution is "
+        "OpenElectricity fleet metadata (--fleet-cache-file), the only "
+        "source of a per-region fuel breakdown.",
+        "# TYPE aemo_battery_region_fossil_generation_mw gauge",
+        "# HELP aemo_battery_region_fossil_timestamp_seconds Newest SCADA "
+        "interval behind the region fossil generation.",
+        "# TYPE aemo_battery_region_fossil_timestamp_seconds gauge",
+    ]
+    for region in sorted(fossil):
+        f = fossil[region]
+        lines += [
+            'aemo_battery_region_fossil_generation_mw{region="%s"} %s'
+            % (escape_label(region), fmt(f["mw"])),
+            'aemo_battery_region_fossil_timestamp_seconds{region="%s"} %s'
+            % (escape_label(region), fmt(f["ts"])),
+        ]
+    lines += [
+        "# HELP aemo_battery_fossil_units Fossil units with a live reading "
+        "this cycle.",
+        "# TYPE aemo_battery_fossil_units gauge",
+        "aemo_battery_fossil_units %d"
+        % sum(f["units"] for f in fossil.values()),
+    ]
+    return lines
+
+
+def _emit_interconnectors(src: dict) -> list[str]:
+    """Interconnector flow/limits, plus report_info and the count gauge.
+
+    The one block that is not withheld on missing data: a feed-verified cycle
+    with an empty interconnector set still publishes report_info and
+    `aemo_interconnector_count 0` - that absence is the signal a DISPATCH,
+    INTERCONNECTORRES table went missing - while the per-link series and their
+    HELP headers need readings to exist.
+    """
+    region_storage = src["region_storage"]
+    now = src["now"]
     interconnectors = region_storage.get("interconnectors") or {}
-    if region_ok:
-        if interconnectors:
-            lines += [
-                "# HELP aemo_interconnector_flow_mw Algebraic MW flow on the "
+    lines: list[str] = []
+    if interconnectors:
+        lines += [
+            "# HELP aemo_interconnector_flow_mw Algebraic MW flow on the "
             "interconnector at the newest interval (AEMO's own per-link sign "
             "convention).",
             "# TYPE aemo_interconnector_flow_mw gauge",
@@ -1713,134 +1709,236 @@ def render_intraday(
                     'aemo_interconnector_nominal_reverse_mw{interconnector="%s"} %s'
                     % (escape_label(ic), fmt(link.nominal_reverse_mw)),
                 ]
-        lines += [
-            "# HELP aemo_interconnector_report_info Processed DispatchIS file.",
-            "# TYPE aemo_interconnector_report_info gauge",
-            'aemo_interconnector_report_info{file="%s"} 1'
-            % escape_label(region_storage.get("file", "")),
-            "# HELP aemo_interconnector_count Interconnectors with a reading "
-            "this cycle; 0 when the DISPATCH,INTERCONNECTORRES table was "
-            "missing or unparsable.",
-            "# TYPE aemo_interconnector_count gauge",
-            "aemo_interconnector_count %d" % len(interconnectors),
-        ]
+    lines += [
+        "# HELP aemo_interconnector_report_info Processed DispatchIS file.",
+        "# TYPE aemo_interconnector_report_info gauge",
+        'aemo_interconnector_report_info{file="%s"} 1'
+        % escape_label(region_storage.get("file", "")),
+        "# HELP aemo_interconnector_count Interconnectors with a reading "
+        "this cycle; 0 when the DISPATCH,INTERCONNECTORRES table was "
+        "missing or unparsable.",
+        "# TYPE aemo_interconnector_count gauge",
+        "aemo_interconnector_count %d" % len(interconnectors),
+    ]
+    return lines
 
-    interchange = region_interchange(interconnectors)
-    if interchange and region_ok:
-        lines += [
-            "# HELP aemo_battery_region_import_mw Gross MW flow into the region "
-            "at the newest interval, summed over its interconnectors. AEMO "
-            "publishes no gross regional import/export (REGIONSUM carries only "
-            "NETINTERCHANGE), so this is derived from the per-link MWFLOW: a "
-            "positive flow on a link leaves its FROM region and enters its TO "
-            "region. Interconnector losses are not modelled, so a region's "
-            "import is the flow value AEMO signs on the link.",
-            "# TYPE aemo_battery_region_import_mw gauge",
-            "# HELP aemo_battery_region_export_mw Gross MW flow out of the region "
-            "at the newest interval, summed over its interconnectors. See "
-            "aemo_battery_region_import_mw for how it is derived.",
-            "# TYPE aemo_battery_region_export_mw gauge",
-        ]
-        for region in sorted(interchange):
-            r = interchange[region]
-            lines += [
-                'aemo_battery_region_import_mw{region="%s"} %s'
-                % (escape_label(region), fmt(r["import"])),
-                'aemo_battery_region_export_mw{region="%s"} %s'
-                % (escape_label(region), fmt(r["export"])),
-            ]
 
-    rp = (rooftop or {}).get("regions") or {}
-    if rp and rooftop_ok:
+def _emit_region_interchange(src: dict) -> list[str]:
+    """Gross per-region import/export, derived from the per-link MWFLOW."""
+    interchange = src["interchange"]
+    if not interchange:
+        return []
+    lines: list[str] = [
+        "# HELP aemo_battery_region_import_mw Gross MW flow into the region "
+        "at the newest interval, summed over its interconnectors. AEMO "
+        "publishes no gross regional import/export (REGIONSUM carries only "
+        "NETINTERCHANGE), so this is derived from the per-link MWFLOW: a "
+        "positive flow on a link leaves its FROM region and enters its TO "
+        "region. Interconnector losses are not modelled, so a region's "
+        "import is the flow value AEMO signs on the link.",
+        "# TYPE aemo_battery_region_import_mw gauge",
+        "# HELP aemo_battery_region_export_mw Gross MW flow out of the region "
+        "at the newest interval, summed over its interconnectors. See "
+        "aemo_battery_region_import_mw for how it is derived.",
+        "# TYPE aemo_battery_region_export_mw gauge",
+    ]
+    for region in sorted(interchange):
+        r = interchange[region]
         lines += [
-            "# HELP aemo_battery_region_rooftop_solar_mw AEMO satellite-based "
-            "estimate of distributed (rooftop) PV generation, MW, per region, "
-            "at the newest 5-minute interval.",
-            "# TYPE aemo_battery_region_rooftop_solar_mw gauge",
+            'aemo_battery_region_import_mw{region="%s"} %s'
+            % (escape_label(region), fmt(r["import"])),
+            'aemo_battery_region_export_mw{region="%s"} %s'
+            % (escape_label(region), fmt(r["export"])),
         ]
-        for region in sorted(rp):
-            r = rp[region]
-            if isinstance(r.get("mw"), (int, float)) and not isinstance(
-                r.get("mw"), bool
-            ):
-                lines.append(
-                    'aemo_battery_region_rooftop_solar_mw{region="%s"} %s'
-                    % (escape_label(region), fmt(r["mw"]))
-                )
-        lines += [
-            "# HELP aemo_battery_region_rooftop_solar_timestamp_seconds "
-            "Newest interval behind the rooftop PV readings.",
-            "# TYPE aemo_battery_region_rooftop_solar_timestamp_seconds gauge",
-        ]
-        for region in sorted(rp):
-            r = rp[region]
+    return lines
+
+
+def _emit_rooftop(src: dict) -> list[str]:
+    """AEMO's satellite-estimated rooftop PV output, per region."""
+    rooftop = src["rooftop"]
+    rp = rooftop.get("regions") or {}
+    if not rp:
+        return []
+    lines: list[str] = [
+        "# HELP aemo_battery_region_rooftop_solar_mw AEMO satellite-based "
+        "estimate of distributed (rooftop) PV generation, MW, per region, "
+        "at the newest 5-minute interval.",
+        "# TYPE aemo_battery_region_rooftop_solar_mw gauge",
+    ]
+    for region in sorted(rp):
+        r = rp[region]
+        if isinstance(r.get("mw"), (int, float)) and not isinstance(
+            r.get("mw"), bool
+        ):
             lines.append(
-                'aemo_battery_region_rooftop_solar_timestamp_seconds{region="%s"} %s'
-                % (escape_label(region), fmt(r.get("ts")))
+                'aemo_battery_region_rooftop_solar_mw{region="%s"} %s'
+                % (escape_label(region), fmt(r["mw"]))
             )
-        lines += [
-            "# HELP aemo_battery_region_rooftop_solar_report_info Processed "
-            "ROOFTOP_PV file.",
-            "# TYPE aemo_battery_region_rooftop_solar_report_info gauge",
-            'aemo_battery_region_rooftop_solar_report_info{file="%s"} 1'
-            % escape_label(rooftop.get("file", "")),
-        ]
+    lines += [
+        "# HELP aemo_battery_region_rooftop_solar_timestamp_seconds "
+        "Newest interval behind the rooftop PV readings.",
+        "# TYPE aemo_battery_region_rooftop_solar_timestamp_seconds gauge",
+    ]
+    for region in sorted(rp):
+        r = rp[region]
+        lines.append(
+            'aemo_battery_region_rooftop_solar_timestamp_seconds{region="%s"} %s'
+            % (escape_label(region), fmt(r.get("ts")))
+        )
+    lines += [
+        "# HELP aemo_battery_region_rooftop_solar_report_info Processed "
+        "ROOFTOP_PV file.",
+        "# TYPE aemo_battery_region_rooftop_solar_report_info gauge",
+        'aemo_battery_region_rooftop_solar_report_info{file="%s"} 1'
+        % escape_label(rooftop.get("file", "")),
+    ]
+    return lines
 
-    infer_units = (infer or {}).get("units") or {}
-    if infer_units and infer_ok:
+
+def _emit_inferred(src: dict) -> list[str]:
+    """The per-unit inferred stored MWh, anchored at the daily report."""
+    infer = src["infer"]
+    now = src["now"]
+    meta = src["meta"]
+    infer_units = infer.get("units") or {}
+    if not infer_units:
+        return []
+    lines: list[str] = [
+        "# HELP aemo_battery_inferred_stored_mwh Anchor ENERGY_STORAGE plus "
+        "SCADA-integrated change, MWh (charge_efficiency x charging energy is "
+        "stored; discharging is deducted in full).",
+        "# TYPE aemo_battery_inferred_stored_mwh gauge",
+        "# HELP aemo_battery_inferred_clamped Whether the raw SCADA-"
+        "integrated stored MWh left the [0, capacity] envelope (below zero "
+        "always; above the unit's registered capacity when it is known) and "
+        "was clamped. Reported whether or not clamping is applied, so a "
+        "battery pinned at empty or full is distinguishable from one "
+        "genuinely there.",
+        "# TYPE aemo_battery_inferred_clamped gauge",
+        "# HELP aemo_battery_inferred_timestamp_seconds Integrated interval "
+        "behind the inferred stored MWh.",
+        "# TYPE aemo_battery_inferred_timestamp_seconds gauge",
+        "# HELP aemo_battery_inferred_age_seconds Age of that interval at "
+        "export time.",
+        "# TYPE aemo_battery_inferred_age_seconds gauge",
+    ]
+    for duid in sorted(infer_units):
+        u = infer_units[duid]
+        m = meta.get(duid) or {}
+        unit = escape_label(m.get("unit") or "")
+        key = 'unit="%s",duid="%s"' % (unit, escape_label(duid))
         lines += [
-            "# HELP aemo_battery_inferred_stored_mwh Anchor ENERGY_STORAGE plus "
-            "SCADA-integrated change, MWh (charge_efficiency x charging energy is "
-            "stored; discharging is deducted in full).",
-            "# TYPE aemo_battery_inferred_stored_mwh gauge",
-            "# HELP aemo_battery_inferred_clamped Whether the raw SCADA-"
-            "integrated stored MWh left the [0, capacity] envelope (below zero "
-            "always; above the unit's registered capacity when it is known) and "
-            "was clamped. Reported whether or not clamping is applied, so a "
-            "battery pinned at empty or full is distinguishable from one "
-            "genuinely there.",
-            "# TYPE aemo_battery_inferred_clamped gauge",
-            "# HELP aemo_battery_inferred_timestamp_seconds Integrated interval "
-            "behind the inferred stored MWh.",
-            "# TYPE aemo_battery_inferred_timestamp_seconds gauge",
-            "# HELP aemo_battery_inferred_age_seconds Age of that interval at "
-            "export time.",
-            "# TYPE aemo_battery_inferred_age_seconds gauge",
+            'aemo_battery_inferred_stored_mwh{%s} %s' % (key, fmt(u["mwh"])),
+            'aemo_battery_inferred_clamped{%s} %s'
+            % (key, fmt(u.get("clamped", 0.0))),
+            'aemo_battery_inferred_timestamp_seconds{%s} %s' % (key, fmt(u["ts"])),
+            'aemo_battery_inferred_age_seconds{%s} %s' % (key, fmt(now - u["ts"])),
         ]
-        for duid in sorted(infer_units):
-            u = infer_units[duid]
-            m = meta.get(duid) or {}
-            unit = escape_label(m.get("unit") or "")
-            key = 'unit="%s",duid="%s"' % (unit, escape_label(duid))
-            lines += [
-                'aemo_battery_inferred_stored_mwh{%s} %s' % (key, fmt(u["mwh"])),
-                'aemo_battery_inferred_clamped{%s} %s'
-                % (key, fmt(u.get("clamped", 0.0))),
-                'aemo_battery_inferred_timestamp_seconds{%s} %s' % (key, fmt(u["ts"])),
-                'aemo_battery_inferred_age_seconds{%s} %s' % (key, fmt(now - u["ts"])),
-            ]
-        lines += [
-            "# HELP aemo_battery_inferred_units Inferred units being served.",
-            "# TYPE aemo_battery_inferred_units gauge",
-            "aemo_battery_inferred_units %d" % len(infer_units),
-            "# HELP aemo_battery_inferred_clamped_units Inferred units held at a "
-            "boundary because the raw integral left the [0, capacity] envelope.",
-            "# TYPE aemo_battery_inferred_clamped_units gauge",
-            "aemo_battery_inferred_clamped_units %d"
-            % sum(1 for u in infer_units.values() if float(u.get("clamped", 0.0)) > 0.0),
-            "# HELP aemo_battery_inferred_fleet_capacity_units Inferred units "
-            "with a known registered storage capacity (from --fleet-cache-file), "
-            "which is what the 100% top clamp clamps against. 0 = no capacity in "
-            "scope, so only the zero floor applies.",
-            "# TYPE aemo_battery_inferred_fleet_capacity_units gauge",
-            "aemo_battery_inferred_fleet_capacity_units %d"
-            % int((infer or {}).get("capacity_units") or 0),
-            "# HELP aemo_battery_inferred_report_info Daily report anchoring the "
-            "inferred series.",
-            "# TYPE aemo_battery_inferred_report_info gauge",
-            'aemo_battery_inferred_report_info{file="%s"} 1'
-            % escape_label(infer.get("file", "")),
-        ]
+    lines += [
+        "# HELP aemo_battery_inferred_units Inferred units being served.",
+        "# TYPE aemo_battery_inferred_units gauge",
+        "aemo_battery_inferred_units %d" % len(infer_units),
+        "# HELP aemo_battery_inferred_clamped_units Inferred units held at a "
+        "boundary because the raw integral left the [0, capacity] envelope.",
+        "# TYPE aemo_battery_inferred_clamped_units gauge",
+        "aemo_battery_inferred_clamped_units %d"
+        % sum(1 for u in infer_units.values() if float(u.get("clamped", 0.0)) > 0.0),
+        "# HELP aemo_battery_inferred_fleet_capacity_units Inferred units "
+        "with a known registered storage capacity (from --fleet-cache-file), "
+        "which is what the 100% top clamp clamps against. 0 = no capacity in "
+        "scope, so only the zero floor applies.",
+        "# TYPE aemo_battery_inferred_fleet_capacity_units gauge",
+        "aemo_battery_inferred_fleet_capacity_units %d"
+        % int(infer.get("capacity_units") or 0),
+        "# HELP aemo_battery_inferred_report_info Daily report anchoring the "
+        "inferred series.",
+        "# TYPE aemo_battery_inferred_report_info gauge",
+        'aemo_battery_inferred_report_info{file="%s"} 1'
+        % escape_label(infer.get("file", "")),
+    ]
+    return lines
+
+
+# The intraday failure policy, as data: every block of series and the feed it
+# rides on. render_intraday walks this table in order and emits a block only
+# when its feed verified this cycle; a `None` feed means the block has no feed
+# gate at all and is withheld only by its own data being absent. A failed feed
+# therefore drops exactly its own blocks and leaves the others publishing - and
+# a new feed adds lines here (plus its emitters and a line in the render's
+# `feeds` map), never another branch in the render itself. The block name is
+# the row's human-readable key, and the feed-policy test pins names, feeds and
+# emission order together so the table cannot drift unreviewed.
+INTRADAY_BLOCKS: tuple[tuple[str, str | None, Callable[[dict], list[str]]], ...] = (
+    ("unit_power", "scada", _emit_unit_power),
+    ("battery_power", "scada", _emit_battery_power),
+    ("fleet_metadata_missing", None, _emit_fleet_metadata_missing),
+    ("region_storage", "dispatchis", _emit_region_storage),
+    ("curtailment", "dispatchis", _emit_curtailment),
+    ("region_fossil", "scada", _emit_region_fossil),
+    ("interconnectors", "dispatchis", _emit_interconnectors),
+    ("region_interchange", "dispatchis", _emit_region_interchange),
+    ("rooftop", "rooftop", _emit_rooftop),
+    ("inferred", "infer", _emit_inferred),
+)
+
+
+def render_intraday(
+        scada: dict,
+        scada_ok: bool,
+        region_storage: dict,
+        region_ok: bool,
+        duration: float,
+        now: float,
+        infer: dict | None = None,
+        infer_ok: bool = False,
+        unit_meta: dict | None = None,
+        rooftop: dict | None = None,
+        rooftop_ok: bool = False,
+    ) -> str:
+    """Exposition for the intraday cycle's last readings.
+
+    Each side is independent: a failed SCADA read omits the per-unit power and
+    per-region fossil series while a healthy DispatchIS read still publishes the
+    region storage and curtailment (and vice versa); each has its own success
+    gauge, and neither repeats a measurement it did not verify this cycle. The
+    per-unit *inferred* stored MWh is a coupled side: it is served only when a
+    daily anchor exists AND the SCADA feed is live this cycle, since it is built
+    from SCADA.
+
+    That policy is declared in INTRADAY_BLOCKS rather than coded here: the walk
+    below emits each block only when its feed verified this cycle, so the
+    branches in this function are loop iterations, not feed conditions.
+
+    The `aemo_unit_power_mw` series carries every dispatch unit in the SCADA
+    file - generators, loads and storage alike - labelled with its fueltech and
+    region from the OE fleet cache (`unit_meta`). It is the superset of the
+    legacy `aemo_battery_power_mw` series, which stays filtered to storage units
+    so existing dashboards keep their exact semantics while consumers migrate.
+    """
+    feeds = {
+        "scada": scada_ok,
+        "dispatchis": region_ok,
+        "rooftop": rooftop_ok,
+        "infer": infer_ok,
+    }
+    # `meta` is keyed by DUID (not AEMO's spelling of it): the fleet unit code
+    # rides on every per-unit series so consumers can join on the fleet's own
+    # identifier - see docs/adr/0001 and fleet.UNIT_ALIASES.
+    src: dict = {
+        "meta": unit_meta or {},
+        "now": now,
+        "scada": scada,
+        "region_storage": region_storage,
+        "rooftop": rooftop or {},
+        "infer": infer or {},
+        "interchange": region_interchange(
+            region_storage.get("interconnectors") or {}
+        ),
+    }
+    lines: list[str] = []
+    for _block, feed, emit in INTRADAY_BLOCKS:
+        if feed is None or feeds[feed]:
+            lines += emit(src)
     lines += [
         "# HELP aemo_battery_infer_success Whether the inferred stored-MWh series "
         "is being served (fresh anchor, live SCADA, and any anchor gap "

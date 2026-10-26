@@ -772,7 +772,7 @@ python3 scrapers/aemo_battery_exporter.py --fleet-cache-file=/oefleet/fleet.json
 
 ### Tests
 
-143 tests in this file, **no network access** — upstream responses are synthetic
+166 tests in this file, **no network access** — upstream responses are synthetic
 zips built in-test against the real column indices, and the parsers have been run
 against real captures (details in `NOTES.md`). Alert on `aemo_battery_scrape_success
 == 0` or `time() - aemo_battery_report_newest_interval_timestamp_seconds` being

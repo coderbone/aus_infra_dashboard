@@ -41,12 +41,8 @@ LIVE_QUERIES = {
     "interconnectors": {
         "flow": {"expr": "aemo_interconnector_flow_mw", "key": "interconnector"},
         "metered": {"expr": "aemo_interconnector_metered_flow_mw", "key": "interconnector"},
-        # Dynamic dispatch limits, carried for display only. They are NOT the
-        # denominator of any load factor: they bend to the binding constraint,
-        # go negative on some links and can collapse onto the flow itself, so a
-        # utilisation taken against them is meaningless. The nominal ratings
-        # below are the system-normal capability and are what a link is measured
-        # against. See the exporter's INTERCONNECTOR_NOMINAL_MW comment.
+        # Dynamic dispatch limits, carried for display only - never a
+        # denominator. `_utilisation` below says why they cannot be one.
         "export_limit": {"expr": "aemo_interconnector_export_limit_mw", "key": "interconnector"},
         "import_limit": {"expr": "aemo_interconnector_import_limit_mw", "key": "interconnector"},
         "nominal_forward": {"expr": "aemo_interconnector_nominal_forward_mw", "key": "interconnector"},

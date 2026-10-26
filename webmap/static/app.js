@@ -421,7 +421,7 @@ function applyLines() {
     if (typeof u !== "number" || !isFinite(u)) {
       // Flowing, but the rating is unknown: draw it and show the direction
       // rather than pretending it is idle or saturated. There is no
-      // denominator, so no load factor is stated.
+      // denominator, so no utilisation is stated.
       e.layer.setStyle({ color: LINE_COLORS.nodata, weight: 2, opacity: 0.8, dashArray: null });
       updateLineTip(e, f);
       updateArrow(e, f);

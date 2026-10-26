@@ -19,7 +19,6 @@ Run with the second discovery root, from the repo root:
 from __future__ import annotations
 
 import json
-import math
 import os
 import sys
 import tempfile
@@ -125,16 +124,32 @@ class BuildLiveTest(unittest.TestCase):
         self.assertNotIn("nominal_forward", unrated)
         self.assertIsNone(unrated["utilisation"])
 
-    def test_a_missing_reading_has_no_utilisation(self):
+    def test_a_non_finite_historical_time_does_not_poison_the_payload(self):
+        """`?t=` is part of /data/live too.
+
+        The historical snapshot timestamp is echoed into the payload, so a
+        non-finite `t` would reach `json.dumps` the same way a NaN reading
+        did - as a bare NaN or Infinity the browser rejects.
+        """
+        for at in (float("nan"), float("inf"), float("-inf")):
+            live = server.build_live(at=at, source=memory())
+            self.assertNotIn("at", live)
+            json.dumps(live, allow_nan=False)
+
+    def test_a_missing_reading_is_absent_and_has_no_utilisation(self):
         """The exporter writes NaN for a reading it does not have.
 
-        `float("NaN")` is a float that satisfies neither `< 0` nor `<= 0`, so
-        it would otherwise pass every guard and be returned as the answer -
-        which `json.dumps` then emits as a bare NaN that the browser rejects.
+        The reading must arrive as absent, not as a number: `float("NaN")` is
+        a float, so it would pass every guard and `json.dumps` would emit a
+        bare NaN that the browser rejects, taking the whole payload - and the
+        live feed - down with it.
         """
         live = self.build()
-        self.assertTrue(math.isnan(live["interconnectors"][MISSING]["flow"]))
-        self.assertIsNone(live["interconnectors"][MISSING]["utilisation"])
+        missing = live["interconnectors"][MISSING]
+        self.assertNotIn("flow", missing)
+        # The rest of the link's readings still arrive.
+        self.assertEqual(missing["nominal_forward"], 1000.0)
+        self.assertIsNone(missing["utilisation"])
 
 
 class SnapshotSeamTest(unittest.TestCase):
@@ -216,6 +231,54 @@ class SnapshotSeamTest(unittest.TestCase):
             "capacity must not be queried from Prometheus; the fleet module "
             "supplies it",
         )
+
+    def test_a_non_finite_reading_is_absent_and_the_payload_stays_strict_json(self):
+        """A NaN or infinity from Prometheus must not reach the payload.
+
+        This is the seam the front end consumes: if a bare NaN reaches the
+        JSON, `JSON.parse` rejects the whole response and the map stops
+        applying live data. The reading must be absent instead, leaving the
+        link's other fields and every other group intact. The per-fuel
+        curtailment map is merged down a different path, so it is covered too.
+        """
+        wire = [
+            {"metric": {"__name__": "aemo_interconnector_flow_mw",
+                        "interconnector": VICTORIA_NSW},
+             "value": [1700000000.0, "NaN"]},
+            {"metric": {"__name__": "aemo_interconnector_flow_mw",
+                        "interconnector": BASSLINK},
+             "value": [1700000000.0, "+Inf"]},
+            {"metric": {"__name__": "aemo_interconnector_flow_mw",
+                        "interconnector": UNRATED},
+             "value": [1700000000.0, "-Inf"]},
+            {"metric": {"__name__": "aemo_interconnector_nominal_forward_mw",
+                        "interconnector": VICTORIA_NSW},
+             "value": [1700000000.0, "1700"]},
+            {"metric": {"__name__": "aemo_battery_region_curtailment_mw",
+                        "region": "NSW1", "fuel": "wind"},
+             "value": [1700000000.0, "NaN"]},
+            {"metric": {"__name__": "aemo_battery_region_curtailment_mw",
+                        "region": "NSW1", "fuel": "solar"},
+             "value": [1700000000.0, "12.5"]},
+        ]
+
+        def query(text, timeout=10.0, at=None):
+            return wire if "aemo_" in text else []
+
+        with mock.patch.object(server, "_query_prometheus", query):
+            live = server.build_live()
+
+        for link in (VICTORIA_NSW, BASSLINK, UNRATED):
+            # A link whose only reading was non-finite has nothing left to
+            # report, so the entry itself may be absent.
+            self.assertNotIn("flow", live["interconnectors"].get(link, {}), link)
+        vic = live["interconnectors"][VICTORIA_NSW]
+        self.assertEqual(vic["nominal_forward"], 1700.0)
+        self.assertIsNone(vic["utilisation"])
+        curtail = live["regions"]["NSW1"]["curtail"]
+        self.assertNotIn("wind", curtail)
+        self.assertEqual(curtail["solar"], 12.5)
+        json.dumps(live, allow_nan=False)
 
     def test_a_failed_group_degrades_the_payload_without_dropping_the_rest(self):
         """One bad metric family must not sink the page: the failed group

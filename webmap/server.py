@@ -168,11 +168,17 @@ def _merge(accum, field, spec, labels, value):
     key = labels.get(spec["key"], "")
     if key == "":
         return
+    # A reading enters the payload here, so this is where `_number` rejects a
+    # non-finite sample. Leave the field absent: the front end already renders
+    # an absent field as "n/a", and the rest of the payload survives.
+    reading = _number(value)
+    if reading is None:
+        return
     obj = accum.setdefault(key, {})
     if spec.get("extra"):
-        obj.setdefault("curtail", {})[labels[spec["extra"]]] = float(value)
+        obj.setdefault("curtail", {})[labels[spec["extra"]]] = reading
     else:
-        obj[field] = float(value)
+        obj[field] = reading
 
 
 def _number(value):
@@ -182,9 +188,17 @@ def _number(value):
     one - `float("NaN")` is a float that satisfies neither `< 0` nor `<= 0`,
     so it would sail past a plain isinstance check, reach `json.dumps`, and
     come out as a bare `NaN` that the browser's `response.json()` rejects,
-    taking the whole payload with it.
+    taking the whole payload with it. Parsing the wire string here keeps that
+    rule in one place, for readings and derived values alike.
     """
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        try:
+            value = float(value)
+        except ValueError:
+            return None
+    if not isinstance(value, (int, float)):
         return None
     return value if math.isfinite(value) else None
 
@@ -307,6 +321,7 @@ def build_live(at: float | None = None, source=None):
     out = {"fetched_at": time.time(), "prometheus": "ok", "errors": [],
            "interconnectors": {}, "regions": {}, "batteries": {}, "units": {},
            "reservoirs": {}}
+    at = _number(at)
     if at is not None:
         out["at"] = at
     # The SoC ramp, adapted from the policy module's percent stops to the
@@ -512,7 +527,11 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _send_json(self, obj, code=200):
-        self._send(code, json.dumps(obj), "application/json; charset=utf-8")
+        # allow_nan=False: bare NaN/Infinity is not JSON, and the browser's
+        # JSON.parse rejects the whole response. A 500 error body is better
+        # than a 200 the map cannot read.
+        self._send(code, json.dumps(obj, allow_nan=False),
+                   "application/json; charset=utf-8")
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -536,6 +555,8 @@ class Handler(BaseHTTPRequestHandler):
             if raw_t:
                 try:
                     t = float(raw_t)
+                    if not math.isfinite(t):
+                        raise ValueError("t must be finite")
                     if t > time.time() + 1:  # a little slack for clock skew
                         raise ValueError("t is in the future")
                     at = t

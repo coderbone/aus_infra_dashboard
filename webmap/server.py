@@ -308,13 +308,195 @@ class MemorySource:
         return groups, errors
 
 
-def build_live(at: float | None = None, source=None):
+# The /data/live contract: every group the payload answers with, every field
+# inside a group, and every fueltech spelling the map draws its markers from,
+# declared in one place.
+#
+# The front end reads these names in JavaScript and nothing else can check
+# them - a field renamed in the assembler blanks the layer that read it while
+# the rest of the suite stays green, because no other test knows the names.
+# So the names are written down here, and webmap/test_server.py walks a built
+# payload against this, key by key, in both directions.
+#
+# Deliberately a literal declaration rather than a projection of LIVE_QUERIES:
+# the query table says where a reading comes from, this says what the payload
+# calls it, and a rename has to change both or the walk fails.
+#
+# What "present" means here: required of a payload whose readings arrived.
+# `_merge` leaves a field absent when its reading never came or was not
+# finite (the front end renders an absent field as "n/a"), so a production
+# payload may carry fewer keys than this - never more, which is the other
+# half of the walk. The walk builds its payload with a reading for every
+# field the query table names, so that a field whose rename would otherwise
+# arrive as an absence is still caught.
+#
+# The shape language, which walk_shape in the tests reads:
+#   dict         an object; the "*" key is the shape of every member of a
+#                dynamic collection - a map keyed by a link id, a region or
+#                a unit code, or a list of facilities - and such a
+#                collection must not be empty
+#   "?key"       an optional key: absent is fine, present must still match
+#   [X]          a sequence, every element shaped as X (an empty one is fine)
+#   frozenset()  the closed set of spellings the value must be one of
+#   ...          a value carried as it stands: present, not inspected
+LIVE_PAYLOAD = {
+    "fetched_at": ...,
+    # "ok" or "degraded": one failed group batch, not a failed payload.
+    "prometheus": frozenset({"ok", "degraded"}),
+    "errors": [...],
+    # Only for a historical snapshot (?t=), hence optional: a default live
+    # payload carries no `at`, and the shape has to describe that one too.
+    "?at": ...,
+    "soc_ramp": [{"v": ..., "c": [...]}],
+    "interconnectors": {"*": {
+        "flow": ...,
+        "metered": ...,
+        "export_limit": ...,
+        "import_limit": ...,
+        "nominal_forward": ...,
+        "nominal_reverse": ...,
+        "timestamp": ...,
+        "age": ...,
+        # Derived here, from the nominal of the direction of travel.
+        "utilisation": ...,
+    }},
+    "regions": {"*": {
+        "stored_mwh": ...,
+        "fossil_mw": ...,
+        "rooftop_mw": ...,
+        "import_mw": ...,
+        "export_mw": ...,
+        # Per fuel, nested: the field is the map of fuels, not a number.
+        "curtail": {"*": ...},
+    }},
+    # Per dispatch unit, every field keyed by the fleet unit code (the units
+    # group below included) - see docs/adr/0001.
+    "batteries": {"*": {
+        "inf_stored_mwh": ...,
+        "inf_age_s": ...,
+        "inf_timestamp": ...,
+        "peak_stored_mwh": ...,
+        "aemo_power_mw": ...,
+        "aemo_power_age_s": ...,
+        "aemo_power_ts": ...,
+    }},
+    "units": {"*": {"power_mw": ..., "age_s": ..., "timestamp": ...}},
+    "reservoirs": {"*": {"level": ..., "change_7d": ..., "last_sample": ...}},
+    # The drawn fleet, one entry per facility per bucket - a list, not a map:
+    # the front end iterates it. `kind` and `fueltech_id` are the spellings it
+    # switches on to decide what a marker is, so they are closed sets rather
+    # than bare values.
+    "fleet": [{
+        "facility": ...,
+        "name": ...,
+        "region": ...,
+        "location": ...,
+        "kind": frozenset({"battery"}),
+        "units": [{
+            "code": ...,
+            "capacity_mwh": ...,
+            "registered_mw": ...,
+            "status": ...,
+            "data_last_seen": ...,
+            "fueltech_id": frozenset({"battery"}),
+        }],
+    }],
+    "renewables": [{
+        "facility": ...,
+        "name": ...,
+        "region": ...,
+        "location": ...,
+        "kind": frozenset({"renewable"}),
+        # The map draws wind and solar apart on these spellings; the fleet's
+        # `wind_farm` is normalised to `wind` on the way into the payload.
+        "units": [{
+            "code": ...,
+            "capacity_mw": ...,
+            "status": ...,
+            "fueltech_id": frozenset({"solar", "solar_utility", "wind"}),
+        }],
+    }],
+    "hydro": [{
+        "facility": ...,
+        "name": ...,
+        "region": ...,
+        "location": ...,
+        "kind": frozenset({"hydro"}),
+        # Whether the scheme is pumped storage, which the map draws with a
+        # second outline rather than as a spelling of its own.
+        "pumped": ...,
+        # `pumps` is the load half of a pumped scheme and is summed as load,
+        # not generation, so it has to survive as its own spelling.
+        "units": [{
+            "code": ...,
+            "capacity_mw": ...,
+            "status": ...,
+            "fueltech_id": frozenset({"hydro", "pumps"}),
+        }],
+    }],
+    # The fossil buckets pass the fleet module's own fueltech spelling
+    # through - the map draws them by facility kind, not by spelling - but
+    # the set is closed here all the same, so an OE unit filed into the wrong
+    # bucket fails here rather than showing as the wrong fuel.
+    "coal": [{
+        "facility": ...,
+        "name": ...,
+        "region": ...,
+        "location": ...,
+        "kind": frozenset({"coal"}),
+        "units": [{
+            "code": ...,
+            "capacity_mw": ...,
+            "status": ...,
+            "fueltech_id": frozenset({"coal_black", "coal_brown"}),
+        }],
+    }],
+    "gas": [{
+        "facility": ...,
+        "name": ...,
+        "region": ...,
+        "location": ...,
+        "kind": frozenset({"gas"}),
+        "units": [{
+            "code": ...,
+            "capacity_mw": ...,
+            "status": ...,
+            "fueltech_id": frozenset({
+                "gas_ccgt", "gas_ocgt", "gas_steam", "gas_recip", "gas_wcmg",
+            }),
+        }],
+    }],
+    "distillate": [{
+        "facility": ...,
+        "name": ...,
+        "region": ...,
+        "location": ...,
+        "kind": frozenset({"distillate"}),
+        "units": [{
+            "code": ...,
+            "capacity_mw": ...,
+            "status": ...,
+            "fueltech_id": frozenset({"distillate"}),
+        }],
+    }],
+}
+
+
+def build_live(at: float | None = None, source=None, fleet_path: str | None = None):
     """The /data/live payload: readings from the snapshot source, shaped for
     the front end and merged with the fleet cache.
+
+    What it returns is declared, key for key, as LIVE_PAYLOAD above; the
+    suite walks a built payload against it.
 
     The source defaults to the production Prometheus adapter; tests pass a
     MemorySource. Errors the source reports (a failed group batch) mark the
     payload degraded without dropping the groups that did answer.
+
+    `fleet_path` is where the fleet metadata is read from; None means the
+    FLEET_CACHE environment variable, which is the deployment's answer and
+    nothing else. A test that needs another file passes the path outright
+    rather than editing the environment out from under the process.
     """
     if source is None:
         source = PrometheusSource()
@@ -350,7 +532,7 @@ def build_live(at: float | None = None, source=None):
     # number instead of recomputing a rule it has no way to test.
     for link in out["interconnectors"].values():
         link["utilisation"] = _utilisation(link)
-    fl = build_fleet()
+    fl = build_fleet(fleet_path)
     out["fleet"] = fl.get("fleet", []) if isinstance(fl, dict) else fl
     out["renewables"] = fl.get("renewables", []) if isinstance(fl, dict) else []
     out["hydro"] = fl.get("hydro", []) if isinstance(fl, dict) else []
@@ -360,7 +542,24 @@ def build_live(at: float | None = None, source=None):
     return out
 
 
-_fleet_cache = {"mtime": None, "data": None}
+# The fleet metadata file. The environment variable is how the deployment
+# says where the volume is mounted, and is only ever a default: a caller that
+# already knows which file it wants passes the path (tests do, so that they
+# do not edit the process's environment or the memo below to get one).
+FLEET_CACHE_DEFAULT = "/cache/fleet.json"
+
+
+def _fleet_cache_path(path: str | None = None) -> str:
+    if path is not None:
+        return path
+    return os.environ.get("FLEET_CACHE", FLEET_CACHE_DEFAULT)
+
+
+# path -> {"mtime", "data"}. Keyed by path rather than held as one slot so
+# that two callers reading two files can never be handed each other's answer -
+# which is what a memo keyed only on mtime would do to a test that points at
+# a different cache than the deployment's.
+_fleet_cache: dict[str, dict] = {}
 
 # What a facility and a unit *are* - its category, whether its capacity counts,
 # whether a scheme is pumped storage - is the fleet module's answer, not this
@@ -380,14 +579,21 @@ def _facility_entry(fac: fleet.Facility, units: list, kind: str) -> dict:
     }
 
 
-def build_fleet():
-    path = os.environ.get("FLEET_CACHE", "/cache/fleet.json")
+def build_fleet(path: str | None = None):
+    """The drawn fleet from one metadata file, or [] when there is none.
+
+    `path` names the fleet cache; None takes FLEET_CACHE, which is the
+    deployment's answer and nothing else. The result is memoised per path
+    against the file's mtime, so an unchanged file costs no re-parse and a
+    caller reading a second file shares no memo with the first.
+    """
+    path = _fleet_cache_path(path)
     try:
         mtime = os.path.getmtime(path)
     except OSError:
         return []
-    cached = _fleet_cache
-    if cached["mtime"] == mtime:
+    cached = _fleet_cache.get(path)
+    if cached is not None and cached["mtime"] == mtime:
         return cached["data"]
     fl = fleet.load(path)
     if fl is None:
@@ -463,9 +669,8 @@ def build_fleet():
         for category in ("coal", "gas", "distillate"):
             if drawn[category] and located:
                 out[category].append(_facility_entry(fac, drawn[category], category))
-    _fleet_cache["mtime"] = mtime
-    _fleet_cache["data"] = out
-    return _fleet_cache["data"]
+    _fleet_cache[path] = {"mtime": mtime, "data": out}
+    return out
 
 
 def _read_file(path, root):
@@ -571,7 +776,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/data/fleet.json":
             try:
-                cache = os.environ.get("FLEET_CACHE", "/cache/fleet.json")
+                cache = _fleet_cache_path()
                 body, code = _read_file(cache, os.path.dirname(cache))
                 if code != 200:
                     self._send(404, "fleet cache not mounted", "text/plain")

@@ -48,6 +48,18 @@ MISSING = "MISSING"  # the exporter writes NaN for a reading it does not have
 # the exporter publishes exactly those numbers.
 RATED_IDS = (VICTORIA_NSW, BASSLINK)
 
+# The payload's top-level keys as the front end's applySnapshot is written
+# against them (webmap/static/app.js): the groups it copies into state plus
+# the envelope around them. Its own list rather than a read of the server's
+# declaration, because the point is to check the two against each other - a
+# group dropped from one and not the other has to fail here. The historical
+# `at` is not in it because it is optional; the declaration checks that one.
+FRONT_END_KEYS = (
+    "fetched_at", "prometheus", "errors", "interconnectors", "regions",
+    "batteries", "units", "reservoirs", "soc_ramp",
+    "fleet", "renewables", "hydro", "coal", "gas", "distillate",
+)
+
 # metric -> {key: value}, the in-memory adapter's canned series. Queries absent
 # here return no series, which is what an exporter that has not published them
 # would look like. The nominal series are built from the registry - the
@@ -76,6 +88,235 @@ SERIES = {
 
 def memory(series=None, fail=()) -> server.MemorySource:
     return server.MemorySource(series if series is not None else SERIES, fail=fail)
+
+
+def write_cache(path, payload) -> str:
+    """Write `payload` as a fleet cache file and return the path."""
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle)
+    return path
+
+
+def write_battery_cache(path, capacity_mwh=1997.0) -> str:
+    """Write a one-facility fleet cache holding ERB01, and return its path.
+
+    1997 MWh is the unit's real registered storage - the figure the SoC
+    denominator is pinned against - and `path` is the seam the fleet metadata
+    reader takes, so a test points at its own file instead of editing the
+    environment the process was started with.
+    """
+    return write_cache(
+        path,
+        {
+            "cached_at": 1.0,
+            "data": [
+                {
+                    "code": "ERB",
+                    "name": "Eraring BESS",
+                    "network_region": "NSW1",
+                    "units": [
+                        {
+                            "code": "ERB01",
+                            "status_id": "operating",
+                            "fueltech_id": "battery",
+                            "capacity_storage": capacity_mwh,
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+
+
+# --- the declared live payload contract, and the walk that pins it ----------
+
+
+def complete_series() -> dict:
+    """A canned series for every metric the query table fields.
+
+    One finite reading under one key per group, so a built payload carries
+    every field the contract declares and a rename cannot hide behind a
+    reading that never arrived. Built from the query table for coverage, but
+    asserted against the contract below rather than against the table - the
+    two are independent, which is what makes a rename fail here.
+    """
+    key_of = {
+        "interconnector": VICTORIA_NSW,
+        "region": "NSW1",
+        "unit": "ERB01",
+        "reservoir": "TANTANGARA",
+    }
+    series = {}
+    for fields in server.LIVE_QUERIES.values():
+        for spec in fields.values():
+            key = key_of[spec["key"]]
+            if spec.get("extra"):
+                # A multi-valued field (curtailment per fuel) is nested.
+                series[spec["metric"]] = {key: {"wind": 1.0, "solar": 2.0}}
+            else:
+                series[spec["metric"]] = {key: 1.0}
+    return series
+
+
+# One facility per drawn fleet group, carrying the fueltech spellings that
+# group's markers are drawn from: a battery, a wind + solar site (the front
+# end's `wind_farm` arrives as `wind`, normalised here), a pumped scheme with
+# its sibling pumps unit, and one plant per fossil category. Every one has a
+# coordinate, because the point sources are dropped without one.
+SHAPE_FLEET = {
+    "cached_at": 1.0,
+    "data": [
+        {
+            "code": "ERB",
+            "name": "Eraring BESS",
+            "network_region": "NSW1",
+            "location": {"lat": -32.88, "lng": 151.55},
+            "units": [
+                {
+                    "code": "ERB01",
+                    "status_id": "operating",
+                    "fueltech_id": "battery",
+                    "capacity_storage": 1997.0,
+                    "capacity_registered": 100.0,
+                }
+            ],
+        },
+        {
+            "code": "SWF",
+            "name": "Snowy Wind Farm",
+            "network_region": "NSW1",
+            "location": {"lat": -36.0, "lng": 148.0},
+            "units": [
+                {
+                    "code": "SWFW1",
+                    "status_id": "operating",
+                    "fueltech_id": "wind_farm",
+                    "capacity_registered": 100.0,
+                },
+                {
+                    "code": "SWFS1",
+                    "status_id": "operating",
+                    "fueltech_id": "solar_utility",
+                    "capacity_registered": 50.0,
+                },
+                {
+                    "code": "SWFS2",
+                    "status_id": "operating",
+                    "fueltech_id": "solar",
+                    "capacity_registered": 25.0,
+                },
+            ],
+        },
+        {
+            "code": "TUM3",
+            "name": "Tumut 3",
+            "network_region": "NSW1",
+            "description": "Pumped Storage Scheme",
+            "location": {"lat": -35.4, "lng": 148.2},
+            "units": [
+                {
+                    "code": "TUM31",
+                    "status_id": "operating",
+                    "fueltech_id": "hydro",
+                    "capacity_registered": 600.0,
+                    "capacity_storage": 2000.0,
+                },
+                {
+                    "code": "TUM3P",
+                    "status_id": "operating",
+                    "fueltech_id": "pumps",
+                    "capacity_registered": 600.0,
+                },
+            ],
+        },
+        {
+            "code": "CLB",
+            "name": "Coal B",
+            "network_region": "NSW1",
+            "location": {"lat": -32.0, "lng": 151.0},
+            "units": [
+                {
+                    "code": "CLB01",
+                    "status_id": "operating",
+                    "fueltech_id": "coal_black",
+                    "capacity_registered": 500.0,
+                }
+            ],
+        },
+        {
+            "code": "GCC",
+            "name": "Gas CCGT",
+            "network_region": "NSW1",
+            "location": {"lat": -33.0, "lng": 150.0},
+            "units": [
+                {
+                    "code": "GCC01",
+                    "status_id": "operating",
+                    "fueltech_id": "gas_ccgt",
+                    "capacity_registered": 300.0,
+                }
+            ],
+        },
+        {
+            "code": "DST",
+            "name": "Distillate A",
+            "network_region": "QLD1",
+            "location": {"lat": -27.0, "lng": 153.0},
+            "units": [
+                {
+                    "code": "DST01",
+                    "status_id": "operating",
+                    "fueltech_id": "distillate",
+                    "capacity_registered": 50.0,
+                }
+            ],
+        },
+    ],
+}
+
+
+def walk_shape(test, payload, shape, path):
+    """Check `payload` against the declared `shape`, key by key, both ways.
+
+    Reads the shape language documented at `server.LIVE_PAYLOAD` - the
+    declaration owns that description, this is only its interpreter. Every
+    failure names the path it failed at, so a rename says which key moved
+    rather than only that something did.
+    """
+    if isinstance(shape, dict):
+        test.assertIsInstance(payload, dict, path)
+        wildcard = shape.get("*")
+        optional = set()
+        for key, sub in shape.items():
+            if key == "*":
+                continue
+            if key.startswith("?"):
+                # Declared optional: absent is fine, present must still match.
+                optional.add(key[1:])
+                key = key[1:]
+                if key not in payload:
+                    continue
+            else:
+                test.assertIn(key, payload, f"{path}.{key} is missing")
+            walk_shape(test, payload[key], sub, f"{path}.{key}")
+        for key, value in payload.items():
+            if key in shape or key in optional:
+                continue
+            test.assertIsNotNone(
+                wildcard, f"{path}.{key} is not in the declared shape"
+            )
+            walk_shape(test, value, wildcard, f"{path}[{key}]")
+        if wildcard is not None:
+            test.assertTrue(payload, f"{path} is empty")
+    elif isinstance(shape, list):
+        test.assertIsInstance(payload, (list, tuple), path)
+        if len(shape) != 1:
+            raise AssertionError("a sequence shape is exactly one element shape")
+        for index, item in enumerate(payload):
+            walk_shape(test, item, shape[0], f"{path}[{index}]")
+    elif isinstance(shape, frozenset):
+        test.assertIn(payload, shape, f"{path} is not a declared spelling")
+    # `...`: presence is the assertion, already made by the caller's key check.
 
 
 class BuildLiveTest(unittest.TestCase):
@@ -175,17 +416,18 @@ class SnapshotSeamTest(unittest.TestCase):
 
         return mock.patch.object(server, "_query_prometheus", recording), queried
 
-    def test_the_payload_carries_every_group_the_front_end_reads(self):
+    def test_an_empty_source_still_answers_with_every_group_the_front_end_reads(self):
         """Shape pin: whatever the source, the payload answers with every
-        group `applySnapshot` copies into state - an assembly that drops one
-        would blank a whole layer of the map."""
+        group the front end reads - an assembly that dropped one would blank
+        a whole layer of the map. Two oracles, checked against each other:
+        the front end's own list above, and the server's declaration."""
         live = server.build_live(source=memory({}))
-        for key in (
-            "fetched_at", "prometheus", "errors", "interconnectors", "regions",
-            "batteries", "units", "reservoirs", "soc_ramp",
-            "fleet", "renewables", "hydro", "coal", "gas", "distillate",
-        ):
+        for key in FRONT_END_KEYS:
             self.assertIn(key, live, key)
+        declared = {
+            key for key in server.LIVE_PAYLOAD if not key.startswith("?")
+        }
+        self.assertEqual(declared, set(FRONT_END_KEYS))
         self.assertEqual(live["prometheus"], "ok")
         self.assertEqual(live["errors"], [])
 
@@ -306,6 +548,63 @@ class SnapshotSeamTest(unittest.TestCase):
         self.assertTrue(any("regions" in err for err in live["errors"]), live["errors"])
 
 
+class PayloadContractTest(unittest.TestCase):
+    """The /data/live contract, declared once and walked key by key.
+
+    The front end reads these names in JavaScript and cannot be tested here:
+    a field renamed in the assembler blanks the layer that read it while every
+    other test stays green, because nothing else knows the names. So the
+    server declares them - every group, every field inside a group, and the
+    fueltech spellings its markers are drawn from - and the built payload is
+    walked against that declaration in both directions: a declared key that
+    never arrives fails, and a key the payload carries that is not declared
+    fails.
+    """
+
+    @staticmethod
+    def build(at: float | None = None) -> dict:
+        """A payload with every declared field populated.
+
+        Every metric the query table fields carries a finite reading, and the
+        fleet cache draws one facility per fleet group, so no declared field
+        is absent for want of a reading and a rename has nowhere to hide.
+        `at` asks for the historical shape, which is the only one carrying
+        that key.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_cache(os.path.join(tmp, "fleet.json"), SHAPE_FLEET)
+            return server.build_live(
+                at=at,
+                source=memory(complete_series()),
+                fleet_path=path,
+            )
+
+    def assert_contract(self, live: dict) -> None:
+        walk_shape(self, live, server.LIVE_PAYLOAD, "$")
+        # The walk descends into a group's members, so a group that came back
+        # empty would check nothing at all and let a rename through. The map
+        # groups are covered by the walk's own non-empty rule for a dynamic
+        # map; the fleet groups are lists, which a sequence shape cannot
+        # distinguish from an empty one.
+        for group in ("fleet", "renewables", "hydro", "coal", "gas", "distillate"):
+            self.assertTrue(live[group], group)
+        # The envelope's values, which a shape cannot state: a healthy build
+        # says so and reports no group errors.
+        self.assertEqual(live["prometheus"], "ok")
+        self.assertEqual(live["errors"], [])
+
+    def test_the_built_payload_matches_the_declared_contract_key_by_key(self):
+        """Both shapes the contract describes: the default live payload, and
+        the historical snapshot that adds `at` - declared optional, so that
+        one key has to be right either way round."""
+        default = self.build()
+        self.assert_contract(default)
+        self.assertNotIn("at", default)
+        historical = self.build(at=1700000000.0)
+        self.assert_contract(historical)
+        self.assertEqual(historical["at"], 1700000000.0)
+
+
 class SoCPolicyTest(unittest.TestCase):
     """The SoC policy travels to the consumers that cannot import it.
 
@@ -348,41 +647,8 @@ class SoCPolicyTest(unittest.TestCase):
         for that unit exists in the payload to divide by instead.
         """
         with tempfile.TemporaryDirectory() as tmp:
-            cache = os.path.join(tmp, "fleet.json")
-            with open(cache, "w", encoding="utf-8") as handle:
-                json.dump(
-                    {
-                        "cached_at": 1.0,
-                        "data": [
-                            {
-                                "code": "ERB",
-                                "name": "Eraring BESS",
-                                "network_region": "NSW1",
-                                "units": [
-                                    {
-                                        "code": "ERB01",
-                                        "status_id": "operating",
-                                        "fueltech_id": "battery",
-                                        "capacity_storage": 1997.0,
-                                    }
-                                ],
-                            }
-                        ],
-                    },
-                    handle,
-                )
-            old_cache = os.environ.get("FLEET_CACHE")
-            old_memo = dict(server._fleet_cache)
-            os.environ["FLEET_CACHE"] = cache
-            server._fleet_cache.update(mtime=None, data=None)
-            try:
-                live = server.build_live(source=memory())
-            finally:
-                server._fleet_cache.update(old_memo)
-                if old_cache is None:
-                    os.environ.pop("FLEET_CACHE", None)
-                else:
-                    os.environ["FLEET_CACHE"] = old_cache
+            cache = write_battery_cache(os.path.join(tmp, "fleet.json"))
+            live = server.build_live(source=memory(), fleet_path=cache)
 
         batteries = [
             unit
@@ -392,6 +658,43 @@ class SoCPolicyTest(unittest.TestCase):
         ]
         self.assertEqual(len(batteries), 1)
         self.assertEqual(batteries[0]["capacity_mwh"], 1997.0)
+
+
+class FleetMetadataPathTest(unittest.TestCase):
+    """The fleet metadata reader takes its file path; the environment is only
+    the default.
+
+    The deployment says where the volume is mounted by environment, and that
+    is the whole job of that variable. A caller that already knows which file
+    it wants passes the path, so pointing a test at another cache costs no
+    save/restore of the process's environment and no reset of the module's
+    memo - the two files are memoised apart, keyed by the path they came from.
+    """
+
+    @staticmethod
+    def codes(drawn) -> list:
+        return [unit["code"] for fac in drawn["fleet"] for unit in fac["units"]]
+
+    def test_the_environment_is_the_default_when_no_path_is_given(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = write_battery_cache(os.path.join(tmp, "fleet.json"))
+            with mock.patch.dict(os.environ, {"FLEET_CACHE": cache}):
+                self.assertEqual(self.codes(server.build_fleet()), ["ERB01"])
+            # A mount that is not there degrades to no fleet, as it always has.
+            with mock.patch.dict(
+                os.environ, {"FLEET_CACHE": os.path.join(tmp, "unmounted.json")}
+            ):
+                self.assertEqual(server.build_fleet(), [])
+
+    def test_an_explicit_path_is_read_as_given_and_wins_over_the_environment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = write_battery_cache(os.path.join(tmp, "fleet.json"))
+            unmounted = os.path.join(tmp, "unmounted.json")
+            with mock.patch.dict(os.environ, {"FLEET_CACHE": unmounted}):
+                # The environment names a file that is not there; the explicit
+                # path answers anyway, and the two do not share a memo entry.
+                self.assertEqual(self.codes(server.build_fleet(cache)), ["ERB01"])
+                self.assertEqual(server.build_fleet(), [])
 
 
 if __name__ == "__main__":

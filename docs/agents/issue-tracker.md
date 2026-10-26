@@ -17,6 +17,17 @@ The `gh` CLI is required for every operation below.
 The five triage labels from `triage-labels.md` exist on this repo. `wontfix` was
 already present as a GitHub default; the other four were created by this setup.
 
+**Priority labels — always apply one when ticketing.** Every ticket created for
+this repo gets exactly one of:
+
+- `priority:high` — a live correctness bug, or the ticket gates another ticket
+- `priority:medium` — worth doing; no live bug, gates nothing
+
+They are independent of the triage labels (a ticket can be `ready-for-agent` +
+`priority:medium`). Create them if missing:
+`gh label create "priority:high" --color "B60205" --description "Focus first: live bug or gates another ticket"`
+`gh label create "priority:medium" --color "F9D0C4" --description "Worth doing; no live bug, gates nothing"`
+
 ## Conventions
 
 - **Create an issue**: `gh issue create --title "..." --body "..."`. Use a heredoc for multi-line bodies.

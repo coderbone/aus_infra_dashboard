@@ -1450,7 +1450,9 @@ class RenderIntradayTest(unittest.TestCase):
         self.isr["file"] = IS_ZIP
 
     def text(self):
-        return exporter.render_intraday(self.scada, True, self.isr, True, 1.5, self.now)
+        return exporter.render_intraday(
+            exporter.build_cycle_state(self.scada, True, self.isr, True, 1.5, self.now)
+        )
 
     def test_every_metric_has_help_and_type(self):
         text = self.text()
@@ -1513,8 +1515,10 @@ class RenderIntradayTest(unittest.TestCase):
         # generation aggregates - never in the fleet - cannot pad the list.
         known = ("DPNTB1", "ERB01", "LIMBESS1")
         text = exporter.render_intraday(
-            self.scada, True, self.isr, True, 1.5, self.now,
-            unit_meta={d: {"fueltech": "battery", "region": "NSW1"} for d in known},
+            exporter.build_cycle_state(
+                self.scada, True, self.isr, True, 1.5, self.now,
+                unit_meta={d: {"fueltech": "battery", "region": "NSW1"} for d in known},
+            )
         )
         self.assertIn('aemo_battery_fleet_metadata_missing{duid="WTAHB1"} 1', text)
         for duid in known:
@@ -1527,19 +1531,21 @@ class RenderIntradayTest(unittest.TestCase):
         # The steady state: baseline zero, so a new series is a real event.
         all_duids = ("DPNTB1", "ERB01", "LIMBESS1", "WTAHB1")
         text = exporter.render_intraday(
-            self.scada, True, self.isr, True, 1.5, self.now,
-            unit_meta={d: {"fueltech": "battery", "region": "NSW1"} for d in all_duids},
+            exporter.build_cycle_state(
+                self.scada, True, self.isr, True, 1.5, self.now,
+                unit_meta={d: {"fueltech": "battery", "region": "NSW1"} for d in all_duids},
+            )
         )
         self.assertNotIn("aemo_battery_fleet_metadata_missing", text)
 
     def test_a_failed_scada_read_omits_power_but_keeps_regions(self):
-        text = exporter.render_intraday(self.scada, False, self.isr, True, 1.5, self.now)
+        text = exporter.render_intraday(exporter.build_cycle_state(self.scada, False, self.isr, True, 1.5, self.now))
         self.assertIn("aemo_battery_scada_success 0", text)
         self.assertEqual(lines_named(text, "aemo_battery_power_mw"), [])
         self.assertIn('aemo_battery_region_stored_mwh{region="NSW1"}', text)
 
     def test_a_failed_dispatchis_read_omits_regions_but_keeps_power(self):
-        text = exporter.render_intraday(self.scada, True, self.isr, False, 1.5, self.now)
+        text = exporter.render_intraday(exporter.build_cycle_state(self.scada, True, self.isr, False, 1.5, self.now))
         self.assertIn("aemo_battery_dispatchis_success 0", text)
         self.assertNotIn("aemo_battery_region_stored_mwh", text)
         self.assertIn('aemo_battery_power_mw{unit="",duid="ERB01"}', text)
@@ -1563,7 +1569,7 @@ class RenderIntradayTest(unittest.TestCase):
         self.assertAlmostEqual(float(nsw.rsplit(" ", 1)[1]), 847.42108, places=4)
 
     def test_a_failed_dispatchis_read_omits_curtailment(self):
-        text = exporter.render_intraday(self.scada, True, self.isr, False, 1.5, self.now)
+        text = exporter.render_intraday(exporter.build_cycle_state(self.scada, True, self.isr, False, 1.5, self.now))
         self.assertNotIn("aemo_battery_region_curtailment_mw", text)
 
     def test_fossil_generation_renders_per_region(self):
@@ -1583,7 +1589,7 @@ class RenderIntradayTest(unittest.TestCase):
 
     def test_a_failed_scada_read_omits_fossil(self):
         self.scada["region_fossil"] = {"NSW1": {"ts": SCADA_TS, "mw": 1.0, "units": 1}}
-        text = exporter.render_intraday(self.scada, False, self.isr, True, 1.5, self.now)
+        text = exporter.render_intraday(exporter.build_cycle_state(self.scada, False, self.isr, True, 1.5, self.now))
         self.assertNotIn("aemo_battery_region_fossil_generation_mw", text)
 
     def test_interconnector_flow_and_limits_render_verbatim(self):
@@ -1699,7 +1705,7 @@ class RenderIntradayTest(unittest.TestCase):
         self.assertAlmostEqual(float(tas_exp.rsplit(" ", 1)[1]), 33.1, places=4)
 
     def test_a_failed_dispatchis_read_omits_interconnectors(self):
-        text = exporter.render_intraday(self.scada, True, self.isr, False, 1.5, self.now)
+        text = exporter.render_intraday(exporter.build_cycle_state(self.scada, True, self.isr, False, 1.5, self.now))
         self.assertNotIn("aemo_interconnector_flow_mw", text)
         self.assertNotIn("aemo_interconnector_count", text)
 
@@ -1714,8 +1720,10 @@ class RenderIntradayTest(unittest.TestCase):
 
     def test_rooftop_series_render_per_region(self):
         text = exporter.render_intraday(
-            self.scada, True, self.isr, True, 1.5, self.now,
-            rooftop=self.rooftop_report(), rooftop_ok=True,
+            exporter.build_cycle_state(
+                self.scada, True, self.isr, True, 1.5, self.now,
+                rooftop=self.rooftop_report(), rooftop_ok=True,
+            )
         )
         nsw = next(
             l for l in lines_named(text, "aemo_battery_region_rooftop_solar_mw")
@@ -1730,8 +1738,10 @@ class RenderIntradayTest(unittest.TestCase):
 
     def test_a_failed_rooftop_read_omits_the_series(self):
         text = exporter.render_intraday(
-            self.scada, True, self.isr, True, 1.5, self.now,
-            rooftop=self.rooftop_report(), rooftop_ok=False,
+            exporter.build_cycle_state(
+                self.scada, True, self.isr, True, 1.5, self.now,
+                rooftop=self.rooftop_report(), rooftop_ok=False,
+            )
         )
         self.assertNotIn("aemo_battery_region_rooftop_solar_mw", text)
         # The other feeds are untouched by a rooftop failure.
@@ -1903,6 +1913,37 @@ class IntradayPollerTest(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn('aemo_battery_power_mw{unit="",duid="WTAHB1"}', body)
         self.assertIn("aemo_battery_scada_success 1", body)
+
+    def test_a_stale_anchor_serves_infer_success_zero_on_scrape(self):
+        """Poll, then let every inferred unit age past the SoC gap limit,
+        then scrape. The served exposition must report infer success 0.
+
+        The regression this pins: the poll path checked the served units but
+        the exposition path checked only the anchor file, so an anchor aged
+        past the gap limit left infer_success at 1 in what Prometheus scrapes
+        while serving no inferred series at all.
+        """
+        daily = make_daily_report(
+            {"ERB01": {"ts": SCADA_TS, "initial": 130.0, "energy": 130.0}}
+        )
+        with mock.patch.object(exporter, "http_get", self.battery_fetcher()):
+            poller = make_intraday(
+                battery_duids={"ERB01"},
+                daily_report_fn=lambda: daily,
+                now=SCADA_TS + 300.0,
+            )
+            poller.poll_once()
+            fresh, _ = poller.exposition()
+            self.assertIn("aemo_battery_infer_success 1", fresh)
+            self.assertIn(
+                'aemo_battery_inferred_stored_mwh{unit="",duid="ERB01"}', fresh
+            )
+            # Every unit leaves the view on the age gate; the anchor file stays.
+            aged_now = SCADA_TS + exporter.MAX_INFER_GAP_HOURS * 3600.0 + 300.0
+            poller.now_fn = lambda: aged_now
+            body, _ = poller.exposition()
+        self.assertNotIn("aemo_battery_inferred_stored_mwh{", body)
+        self.assertIn("aemo_battery_infer_success 0", body)
 
     # -- fossil generation (region = OE fleet metadata) --------------------- #
 
@@ -2282,7 +2323,9 @@ class InferenceTest(unittest.TestCase):
             "efficiency": 0.9,
         }
         now = NOW + 40000.0
-        text = exporter.render_intraday(scada, True, isr, True, 1.5, now, infer, True)
+        text = exporter.render_intraday(
+            exporter.build_cycle_state(scada, True, isr, True, 1.5, now, infer=infer)
+        )
         self.assertIn("aemo_battery_inferred_stored_mwh{unit=\"\",duid=\"ERB01\"} 128.5", text)
         self.assertIn("aemo_battery_inferred_units 2", text)
         self.assertIn("aemo_battery_infer_success 1", text)
@@ -2472,7 +2515,9 @@ class InferenceTest(unittest.TestCase):
             "efficiency": 0.9,
         }
         now = NOW + 40000.0
-        text = exporter.render_intraday(scada, True, isr, True, 1.5, now, infer, True)
+        text = exporter.render_intraday(
+            exporter.build_cycle_state(scada, True, isr, True, 1.5, now, infer=infer)
+        )
         self.assertIn('aemo_battery_inferred_clamped{unit="",duid="ERB01"} 1', text)
         self.assertIn('aemo_battery_inferred_clamped{unit="",duid="LIMBESS1"} 0', text)
         self.assertIn("aemo_battery_inferred_clamped_units 1", text)
@@ -2495,7 +2540,9 @@ class InferenceTest(unittest.TestCase):
             "efficiency": 1.0,
             "capacity_units": 67,
         }
-        text = exporter.render_intraday(scada, True, isr, True, 1.5, NOW, infer, True)
+        text = exporter.render_intraday(
+            exporter.build_cycle_state(scada, True, isr, True, 1.5, NOW, infer=infer)
+        )
         self.assertIn("aemo_battery_inferred_fleet_capacity_units 67", text)
 
     def test_a_stale_anchor_is_never_stamped_forward(self):

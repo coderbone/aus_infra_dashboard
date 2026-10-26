@@ -271,6 +271,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import dataclasses
 import errno
 import io
 import json
@@ -1867,19 +1868,78 @@ INTRADAY_BLOCKS: tuple[tuple[str, str | None, Callable[[dict], list[str]]], ...]
 )
 
 
-def render_intraday(
+@dataclasses.dataclass(frozen=True)
+class CycleState:
+    """One poll cycle's renderable output: every feed's state and health flag.
+
+    The render takes this single value rather than a spread of arguments, so
+    the render itself grows only by fields here. Both serving paths build a
+    CycleState through build_cycle_state and hand it to render_intraday, so
+    they cannot drift apart on what the render sees.
+    """
+
+    now: float
+    duration: float
+    scada: dict
+    scada_ok: bool
+    region_storage: dict
+    region_ok: bool
+    rooftop: dict
+    rooftop_ok: bool
+    infer: dict
+    infer_ok: bool
+    unit_meta: dict
+
+
+def build_cycle_state(
         scada: dict,
         scada_ok: bool,
         region_storage: dict,
         region_ok: bool,
         duration: float,
         now: float,
+        *,
         infer: dict | None = None,
-        infer_ok: bool = False,
         unit_meta: dict | None = None,
         rooftop: dict | None = None,
         rooftop_ok: bool = False,
-    ) -> str:
+    ) -> CycleState:
+    """Assemble one cycle's render inputs; the single home of the infer predicate.
+
+    The inferred side is only "up" when it is actually serving units: an
+    anchor that exists but whose units have aged out (or whose gap could not
+    be reconstructed) serves nothing, and reporting success there is how a
+    fleet-wide stale anchor stayed invisible. Success tracks the served
+    series, not the file - and this is the only place that predicate is
+    written, so the poll path and the scrape path cannot diverge again.
+
+    The optional feeds are keyword-only: a caller that has no rooftop or
+    inferred side names only what it has, and a new feed arrives as one
+    keyword here and one field on CycleState rather than another positional
+    every caller must thread.
+    """
+    infer = infer or {}
+    infer_ok = (
+        scada_ok
+        and bool(infer.get("file"))
+        and bool(infer.get("units"))
+    )
+    return CycleState(
+        now=now,
+        duration=duration,
+        scada=scada,
+        scada_ok=scada_ok,
+        region_storage=region_storage,
+        region_ok=region_ok,
+        rooftop=rooftop or {},
+        rooftop_ok=rooftop_ok,
+        infer=infer,
+        infer_ok=infer_ok,
+        unit_meta=unit_meta or {},
+    )
+
+
+def render_intraday(state: CycleState) -> str:
     """Exposition for the intraday cycle's last readings.
 
     Each side is independent: a failed SCADA read omits the per-unit power and
@@ -1888,7 +1948,8 @@ def render_intraday(
     gauge, and neither repeats a measurement it did not verify this cycle. The
     per-unit *inferred* stored MWh is a coupled side: it is served only when a
     daily anchor exists AND the SCADA feed is live this cycle, since it is built
-    from SCADA.
+    from SCADA - and `state.infer_ok` already carries that combined verdict,
+    computed once in build_cycle_state.
 
     That policy is declared in INTRADAY_BLOCKS rather than coded here: the walk
     below emits each block only when its feed verified this cycle, so the
@@ -1896,28 +1957,28 @@ def render_intraday(
 
     The `aemo_unit_power_mw` series carries every dispatch unit in the SCADA
     file - generators, loads and storage alike - labelled with its fueltech and
-    region from the OE fleet cache (`unit_meta`). It is the superset of the
+    region from the OE fleet cache (`state.unit_meta`). It is the superset of the
     legacy `aemo_battery_power_mw` series, which stays filtered to storage units
     so existing dashboards keep their exact semantics while consumers migrate.
     """
     feeds = {
-        "scada": scada_ok,
-        "dispatchis": region_ok,
-        "rooftop": rooftop_ok,
-        "infer": infer_ok,
+        "scada": state.scada_ok,
+        "dispatchis": state.region_ok,
+        "rooftop": state.rooftop_ok,
+        "infer": state.infer_ok,
     }
     # `meta` is keyed by DUID (not AEMO's spelling of it): the fleet unit code
     # rides on every per-unit series so consumers can join on the fleet's own
     # identifier - see docs/adr/0001 and fleet.UNIT_ALIASES.
     src: dict = {
-        "meta": unit_meta or {},
-        "now": now,
-        "scada": scada,
-        "region_storage": region_storage,
-        "rooftop": rooftop or {},
-        "infer": infer or {},
+        "meta": state.unit_meta,
+        "now": state.now,
+        "scada": state.scada,
+        "region_storage": state.region_storage,
+        "rooftop": state.rooftop,
+        "infer": state.infer,
         "interchange": region_interchange(
-            region_storage.get("interconnectors") or {}
+            state.region_storage.get("interconnectors") or {}
         ),
     }
     lines: list[str] = []
@@ -1929,36 +1990,36 @@ def render_intraday(
         "is being served (fresh anchor, live SCADA, and any anchor gap "
         "reconstructed from the archive).",
         "# TYPE aemo_battery_infer_success gauge",
-        "aemo_battery_infer_success %d" % (1 if infer_ok else 0),
+        "aemo_battery_infer_success %d" % (1 if state.infer_ok else 0),
         "# HELP aemo_battery_inferred_anchor_age_seconds Age of the daily-report "
         "interval behind the inferred series, at export time. The per-unit "
         "values advance with SCADA; this is the anchor itself, so a fleet-wide "
         "stale anchor reads large here even while individual ages look fine.",
         "# TYPE aemo_battery_inferred_anchor_age_seconds gauge",
         "aemo_battery_inferred_anchor_age_seconds %s"
-        % fmt(now - (infer or {}).get("anchor_ts")
-              if isinstance((infer or {}).get("anchor_ts"), (int, float)) else None),
+        % fmt(state.now - state.infer.get("anchor_ts")
+              if isinstance(state.infer.get("anchor_ts"), (int, float)) else None),
         "# HELP aemo_battery_infer_charge_efficiency Share of charging energy "
         "counted as stored when integrating SCADA.",
         "# TYPE aemo_battery_infer_charge_efficiency gauge",
         "aemo_battery_infer_charge_efficiency %s"
-        % fmt((infer or {}).get("efficiency", DEFAULT_INFER_CHARGE_EFFICIENCY)),
+        % fmt(state.infer.get("efficiency", DEFAULT_INFER_CHARGE_EFFICIENCY)),
         "# HELP aemo_battery_scada_success "
         "Whether the last poll of the Dispatch_SCADA archive succeeded.",
         "# TYPE aemo_battery_scada_success gauge",
-        "aemo_battery_scada_success %d" % (1 if scada_ok else 0),
+        "aemo_battery_scada_success %d" % (1 if state.scada_ok else 0),
         "# HELP aemo_battery_dispatchis_success "
         "Whether the last poll of the DispatchIS_Reports archive succeeded.",
         "# TYPE aemo_battery_dispatchis_success gauge",
-        "aemo_battery_dispatchis_success %d" % (1 if region_ok else 0),
+        "aemo_battery_dispatchis_success %d" % (1 if state.region_ok else 0),
         "# HELP aemo_battery_intraday_poll_duration_seconds "
         "Wall time of the last intraday poll cycle.",
         "# TYPE aemo_battery_intraday_poll_duration_seconds gauge",
-        "aemo_battery_intraday_poll_duration_seconds %s" % fmt(duration),
+        "aemo_battery_intraday_poll_duration_seconds %s" % fmt(state.duration),
         "# HELP aemo_battery_intraday_last_poll_timestamp_seconds "
         "Unix time of the last intraday poll cycle.",
         "# TYPE aemo_battery_intraday_last_poll_timestamp_seconds gauge",
-        "aemo_battery_intraday_last_poll_timestamp_seconds %s" % fmt(now),
+        "aemo_battery_intraday_last_poll_timestamp_seconds %s" % fmt(state.now),
     ]
     return "\n".join(lines) + "\n"
 
@@ -2397,17 +2458,15 @@ class IntradayPoller:
         # The inferred side is only "up" when it is actually serving units: an
         # anchor that exists but whose gap could not be reconstructed serves
         # nothing, and reporting success there is how a fleet-wide stale anchor
-        # stayed invisible. Success now tracks the served series, not the file.
-        infer_ok = (
-            scada_ok
-            and self._anchor_file is not None
-            and bool(infer.get("units"))
+        # stayed invisible. That verdict lives in build_cycle_state, shared
+        # with the exposition path.
+        state = build_cycle_state(
+            scada_state, scada_ok, is_state, region_ok, duration, finished,
+            infer=infer, unit_meta=self._unit_meta,
+            rooftop=rooftop_state, rooftop_ok=rooftop_ok,
         )
         return (
-            render_intraday(
-                scada_state, scada_ok, is_state, region_ok, duration, finished,
-                infer, infer_ok, self._unit_meta, rooftop_state, rooftop_ok,
-            ),
+            render_intraday(state),
             scada_ok and region_ok,
         )
 
@@ -2939,12 +2998,13 @@ class IntradayPoller:
             rooftop_health = self._rooftop_health
             duration = self._last_duration
         body = render_intraday(
-            scada_state or {}, scada_health[0],
-            is_state or {}, is_health[0],
-            duration, now,
-            self._infer_view(now), scada_health[0] and self._anchor_file is not None,
-            self._unit_meta,
-            rooftop_state or {}, rooftop_health[0],
+            build_cycle_state(
+                scada_state or {}, scada_health[0],
+                is_state or {}, is_health[0],
+                duration, now,
+                infer=self._infer_view(now), unit_meta=self._unit_meta,
+                rooftop=rooftop_state or {}, rooftop_ok=rooftop_health[0],
+            )
         )
         return body, scada_health[0] and is_health[0]
 

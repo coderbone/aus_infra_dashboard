@@ -5,8 +5,7 @@
       "type": "Feature",
       "properties": {
         "kind": "interconnector",
-        "id": "NSW1-QLD1",
-        "name": "QNI (Queensland\u2011New South Wales)"
+        "id": "NSW1-QLD1"
       },
       "geometry": {
         "type": "LineString",
@@ -30,8 +29,7 @@
       "type": "Feature",
       "properties": {
         "kind": "mnsp",
-        "id": "N-Q-MNSP1",
-        "name": "Directlink (Terranora HVDC)"
+        "id": "N-Q-MNSP1"
       },
       "geometry": {
         "type": "LineString",
@@ -55,8 +53,7 @@
       "type": "Feature",
       "properties": {
         "kind": "interconnector",
-        "id": "VIC1-NSW1",
-        "name": "New South Wales\u2011Victoria"
+        "id": "VIC1-NSW1"
       },
       "geometry": {
         "type": "LineString",
@@ -84,8 +81,7 @@
       "type": "Feature",
       "properties": {
         "kind": "interconnector",
-        "id": "V-SA",
-        "name": "Heywood (Victoria\u2011South Australia)"
+        "id": "V-SA"
       },
       "geometry": {
         "type": "LineString",
@@ -113,8 +109,7 @@
       "type": "Feature",
       "properties": {
         "kind": "mnsp",
-        "id": "T-V-MNSP1",
-        "name": "Basslink (Tasmania\u2011Victoria HVDC)"
+        "id": "T-V-MNSP1"
       },
       "geometry": {
         "type": "LineString",
@@ -134,8 +129,7 @@
       "type": "Feature",
       "properties": {
         "kind": "mnsp",
-        "id": "V-S-MNSP1",
-        "name": "Murraylink (Victoria\u2011South Australia HVDC)"
+        "id": "V-S-MNSP1"
       },
       "geometry": {
         "type": "LineString",
@@ -155,8 +149,7 @@
       "type": "Feature",
       "properties": {
         "kind": "interconnector",
-        "id": "NSW1-SA1",
-        "name": "South Australia\u2011New South Wales (EnergyConnect)"
+        "id": "NSW1-SA1"
       },
       "geometry": {
         "type": "LineString",

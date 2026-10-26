@@ -1271,7 +1271,7 @@ class ParseInterconnectorTest(unittest.TestCase):
 
     def test_region_interchange_skips_unmapped_and_missing_flows(self):
         ic = {
-            "UNKNOWN-LINK": {"mwflow": 500.0},   # not in INTERCONNECTOR_REGIONS
+            "UNKNOWN-LINK": {"mwflow": 500.0},   # not in the link registry
             "NSW1-QLD1": {"mwflow": None},        # no settled flow
         }
         self.assertEqual(exporter.region_interchange(ic), {})

@@ -235,6 +235,9 @@ services:
       # Shared fleet module, mounted beside the exporter so `import fleet`
       # resolves with no PYTHONPATH. See docs/adr/0002.
       - ./scrapers/fleet.py:/app/fleet.py:ro
+      # The link registry: nominal ratings and region pairs derive from it,
+      # same arrangement as the fleet module. See docs/adr/0003.
+      - ./scrapers/links.py:/app/links.py:ro
       # aemo-state holds this exporter's own files only. The OE fleet cache is
       # mounted read-only at a separate path (/oefleet) so it can supply the
       # per-DUID capacity and fueltech without either exporter clobbering the
@@ -378,6 +381,9 @@ services:
       # From the scrapers tree: the fleet is a scraper-side fact the map
       # consumes alongside the cache volume below. See docs/adr/0002.
       - ./scrapers/fleet.py:/app/fleet.py:ro
+      # The link registry, for the display names this server attaches to the
+      # line geometry. See docs/adr/0003.
+      - ./scrapers/links.py:/app/links.py:ro
       - ./webmap/static:/app/static:ro
       - ./webmap/data:/app/data:ro
       - battery-fleet-cache:/cache:ro

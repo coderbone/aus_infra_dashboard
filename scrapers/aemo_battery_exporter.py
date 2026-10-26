@@ -184,10 +184,10 @@ visible.
 
 The same table also yields the per-region gross import/export series: AEMO
 publishes no gross regional figure (REGIONSUM carries only NETINTERCHANGE), so
-each link's MWFLOW is attributed to both its ends via INTERCONNECTOR_REGIONS - a
+each link's MWFLOW is attributed to both its ends via the link registry - a
 positive flow is an export for its FROM region and an import for its TO region,
-and vice versa. Interconnector losses are not modelled. A link whose id is not
-in the map contributes to neither end; when no link reports a flow, neither
+and vice versa. Interconnector losses are not modelled. A link the registry
+does not know contributes to neither end; when no link reports a flow, neither
 series is emitted.
 
 and the intraday bookkeeping:
@@ -291,6 +291,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import fleet
+import links
 
 DEFAULT_DATA_URL = "https://nemweb.com.au/Reports/Current/Next_Day_Dispatch/"
 SCADA_DATA_URL = "https://nemweb.com.au/Reports/Current/Dispatch_SCADA/"
@@ -411,44 +412,6 @@ INTERCONNECTOR_OPTIONAL = (
     "IMPORTLIMIT",
     "MARGINALLOSS",
 )
-
-# Nominal interconnector transfer capability, MW, per direction, from AEMO's
-# "Interconnector Capabilities" report (NER clause 3.13.3(p)). "forward" is the
-# FROM->TO direction, which is the sign convention AEMO's MWFLOW uses (a
-# positive flow leaves the first region of the id for the second). These are
-# the system-normal nominal ratings, deliberately *not* the dynamic
-# EXPORTLIMIT/IMPORTLIMIT the dispatch engine publishes: those bend to the
-# binding constraint, go negative on some links and even collapse onto the flow
-# itself, so a utilisation taken against them is meaningless. A link absent
-# here publishes no nominal series. VNI's rating is a range under different
-# network conditions (400-1700 MW); the upper bound is used as the nominal.
-INTERCONNECTOR_NOMINAL_MW = {
-    "NSW1-QLD1": (900.0, 1400.0),   # QNI
-    "VIC1-NSW1": (1700.0, 1450.0),  # VNI
-    "V-SA": (600.0, 550.0),         # Heywood
-    "V-S-MNSP1": (220.0, 200.0),    # Murraylink
-    "T-V-MNSP1": (594.0, 478.0),    # Basslink
-    "N-Q-MNSP1": (107.0, 210.0),    # Terranora / Directlink
-    "NSW1-SA1": (150.0, 150.0),     # Project EnergyConnect (stage 1)
-}
-
-# Which regions each energy interconnector joins, as (FROM, TO) in the same
-# direction AEMO signs MWFLOW (positive flow leaves FROM and enters TO). AEMO
-# publishes no gross import/export per region - REGIONSUM carries only
-# NETINTERCHANGE - so the region totals are derived from these links. The ids
-# mix full region codes (NSW1-QLD1, VIC1-NSW1, V-SA, NSW1-SA1) with the
-# historical MNSP abbreviations (N=NSW1, Q=QLD1, V=VIC1, S=SA1, T=TAS1), so the
-# ends are spelled out rather than parsed. A link absent here is left out of the
-# region totals rather than mis-attributed; see region_interchange().
-INTERCONNECTOR_REGIONS = {
-    "NSW1-QLD1": ("NSW1", "QLD1"),   # QNI
-    "N-Q-MNSP1": ("NSW1", "QLD1"),   # Terranora / Directlink
-    "VIC1-NSW1": ("VIC1", "NSW1"),   # VNI
-    "V-SA": ("VIC1", "SA1"),         # Heywood
-    "V-S-MNSP1": ("VIC1", "SA1"),    # Murraylink
-    "T-V-MNSP1": ("TAS1", "VIC1"),   # Basslink
-    "NSW1-SA1": ("NSW1", "SA1"),     # Project EnergyConnect (stage 1)
-}
 
 # An error body from these listing pages is not meaningful, but the cap keeps a
 # misrouted HTML page from bloating a log line.
@@ -1272,27 +1235,27 @@ def region_interchange(interconnectors: dict) -> dict:
 
     AEMO publishes no gross import/export at region granularity: DispatchIS
     REGIONSUM carries only NETINTERCHANGE, a single net figure. The gross flows
-    are attributed across each interconnector's two ends instead. With AEMO's
-    sign convention (positive MWFLOW leaves FROM and enters TO) a positive flow
-    is an export for FROM and an import for TO, and a negative flow is the
-    reverse. Interconnector losses are not modelled, so a region's import is the
-    flow value AEMO signs on the link - the same number the map draws on the
-    line. Returns {region: {"import": float, "export": float}}, with a region
-    present only when at least one of its links reported a flow. A link absent
-    from INTERCONNECTOR_REGIONS, or whose MWFLOW is missing, contributes to
-    neither end.
+    are attributed across each link's two ends instead. With AEMO's sign
+    convention (positive MWFLOW leaves the link's from_region and enters its
+    to_region) a positive flow is an export for FROM and an import for TO, and
+    a negative flow is the reverse. Interconnector losses are not modelled, so
+    a region's import is the flow value AEMO signs on the link - the same
+    number the map draws on the line. Returns
+    {region: {"import": float, "export": float}}, with a region present only
+    when at least one of its links reported a flow. A link the link registry
+    does not know, or whose MWFLOW is missing, contributes to neither end.
     """
     out: dict[str, dict] = {}
     for ic, entry in interconnectors.items():
-        ends = INTERCONNECTOR_REGIONS.get(ic)
-        if ends is None:
+        link = links.LINKS.get(ic)
+        if link is None:
             continue
         flow = entry.get("mwflow")
         if not isinstance(flow, (int, float)) or isinstance(flow, bool):
             continue
         if flow == 0:
             continue
-        frm, to = ends
+        frm, to = link.from_region, link.to_region
         a = out.setdefault(frm, {"import": 0.0, "export": 0.0})
         b = out.setdefault(to, {"import": 0.0, "export": 0.0})
         if flow > 0:
@@ -1738,13 +1701,13 @@ def render_intraday(
                     ),
                 ),
             ]
-            nominal = INTERCONNECTOR_NOMINAL_MW.get(ic)
-            if nominal is not None:
+            link = links.LINKS.get(ic)
+            if link is not None:
                 lines += [
                     'aemo_interconnector_nominal_forward_mw{interconnector="%s"} %s'
-                    % (escape_label(ic), fmt(nominal[0])),
+                    % (escape_label(ic), fmt(link.nominal_forward_mw)),
                     'aemo_interconnector_nominal_reverse_mw{interconnector="%s"} %s'
-                    % (escape_label(ic), fmt(nominal[1])),
+                    % (escape_label(ic), fmt(link.nominal_reverse_mw)),
                 ]
         lines += [
             "# HELP aemo_interconnector_report_info Processed DispatchIS file.",

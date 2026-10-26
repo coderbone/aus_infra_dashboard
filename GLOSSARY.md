@@ -52,6 +52,18 @@ exclude distillate because the map draws it on its own.
 
 ## Interconnectors
 
+**Link**:
+An interconnector or MNSP connection joining two NEM regions, identified by its
+AEMO interconnector id (`VIC1-NSW1`, `T-V-MNSP1`).
+_Avoid_: line (that is the drawn geometry, and it also covers corridors that
+are not links)
+
+**Link registry**:
+The single definition of a link's facts: its id, display name, the two regions
+it joins, and its nominal rating in each direction. The exporter's
+interconnector series and the map's displayed link names both derive from it.
+_Avoid_: link table, interconnector table
+
 **Nominal rating**:
 A link's transfer capability in one direction under system-normal conditions,
 in MW. Published separately for each direction, because a link can be

@@ -792,7 +792,10 @@ solar/wind, hydro, coal and gas markers and a Snowy reservoirs card onto a
 plain dark background, so it renders with no internet at all. `./webmap/data`
 is hand-authored schematic `*.geojson` (six regions, the seven
 interconnectors/MNSP links plus the Snowy link, and intra-regional corridors
-AEMO does not publish numbers for). `./webmap/static/app.js` polls
+AEMO does not publish numbers for): the line files carry only `kind` and `id`
+for links — display names are attached by the server from the link registry
+(`scrapers/links.py`, see `docs/adr/0003`), and the coordinate order encodes
+each link's FROM→TO direction. `./webmap/static/app.js` polls
 `/data/live` every 30s, which the server builds from one Prometheus instant
 query per field — 28 of them, for the interconnector flow/limits/nominal and region
 stored/fossil/curtailment series above, plus the top dozen `oe_battery_*`

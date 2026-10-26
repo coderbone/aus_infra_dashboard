@@ -24,6 +24,7 @@ REPO = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(REPO, "scrapers"))  # server.py imports `fleet`
 sys.path.insert(0, HERE)
 
+import links  # noqa: E402
 import server  # noqa: E402
 
 
@@ -33,11 +34,18 @@ import server  # noqa: E402
 # denominator got wrong.
 VICTORIA_NSW = "VIC1-NSW1"
 BASSLINK = "T-V-MNSP1"
-UNRATED = "NEWLINK"  # AEMO reports a link the nominal table does not know
+UNRATED = "NEWLINK"  # AEMO reports a link the link registry does not know
 MISSING = "MISSING"  # the exporter writes NaN for a reading it does not have
 
+# The links whose nominal ratings come from the registry in these fixtures -
+# the exporter publishes exactly those numbers.
+RATED_IDS = (VICTORIA_NSW, BASSLINK)
+
 # query -> {interconnector: value}. Queries absent here return no series, which
-# is what an exporter that has not published them would look like.
+# is what an exporter that has not published them would look like. The nominal
+# series are built from the registry - the exporter publishes exactly those
+# numbers - so the ratings exist in one place; the other values are synthetic
+# Prometheus output, not link facts.
 SERIES = {
     "aemo_interconnector_flow_mw": {
         VICTORIA_NSW: 690.8, BASSLINK: -33.1, UNRATED: 100.0, MISSING: "NaN",
@@ -46,8 +54,16 @@ SERIES = {
     # the old `flow / max(export, import)` denominator read exactly 100%.
     "aemo_interconnector_export_limit_mw": {VICTORIA_NSW: 690.8, BASSLINK: -185.0},
     "aemo_interconnector_import_limit_mw": {VICTORIA_NSW: -595.4, BASSLINK: -220.0},
-    "aemo_interconnector_nominal_forward_mw": {VICTORIA_NSW: 1700.0, BASSLINK: 594.0, MISSING: 1000.0},
-    "aemo_interconnector_nominal_reverse_mw": {VICTORIA_NSW: 1450.0, BASSLINK: 478.0, MISSING: 1000.0},
+    "aemo_interconnector_nominal_forward_mw": {
+        **{ic: links.LINKS[ic].nominal_forward_mw for ic in RATED_IDS},
+        # Synthetic: a denominator for a link with no registry entry, so the
+        # only reason its utilisation can be None is its NaN flow.
+        MISSING: 1000.0,
+    },
+    "aemo_interconnector_nominal_reverse_mw": {
+        **{ic: links.LINKS[ic].nominal_reverse_mw for ic in RATED_IDS},
+        MISSING: 1000.0,
+    },
 }
 
 
@@ -65,12 +81,14 @@ class BuildLiveTest(unittest.TestCase):
 
     def test_nominal_ratings_reach_the_front_end(self):
         """The front end must get the ratings through the live feed, so that
-        nothing in the browser has to hard-code a link's capacity."""
+        nothing in the browser has to hard-code a link's nominal rating. The
+        values travel registry -> Prometheus -> payload; this pins the
+        plumbing, and the exporter's tests pin the numbers themselves."""
         live = self.build()
         vic = live["interconnectors"][VICTORIA_NSW]
         self.assertEqual(vic["flow"], 690.8)
-        self.assertEqual(vic["nominal_forward"], 1700.0)
-        self.assertEqual(vic["nominal_reverse"], 1450.0)
+        self.assertEqual(vic["nominal_forward"], links.LINKS[VICTORIA_NSW].nominal_forward_mw)
+        self.assertEqual(vic["nominal_reverse"], links.LINKS[VICTORIA_NSW].nominal_reverse_mw)
 
     def test_utilisation_is_flow_over_the_nominal_for_the_direction_of_travel(self):
         """Each direction has its own nominal, and the flow's sign says which.
@@ -91,7 +109,7 @@ class BuildLiveTest(unittest.TestCase):
         self.assertAlmostEqual(basslink["utilisation"], 33.1 / 478.0, places=6)
 
     def test_a_link_with_flow_but_no_nominal_has_no_utilisation(self):
-        """AEMO can report a link the nominal table does not know.
+        """AEMO can report a link the link registry does not know.
 
         It has a flow but no denominator, so it must read as unknown rather
         than as infinitely loaded - and rather than falling back to the

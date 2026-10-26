@@ -9,7 +9,8 @@ Routes:
   /                       html app
   /data/live              merged {interconnectors, regions, batteries, fleet}
   /data/fleet.json        raw scraper fleet cache (if the volume is mounted)
-  /data/*.geojson         static region/line geometry
+  /data/*.geojson         static region/line geometry (the lines' link names
+                          come from the link registry, not the file)
   /api/v1/query           raw Prometheus instant-query proxy (debugging)
   /healthz                tcp-friendly probe
 
@@ -29,6 +30,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # Mounted from ../scrapers/fleet.py so all three readers of the fleet cache -
 # this server and the two exporters - interpret it one way. See docs/adr/0002.
 import fleet
+# Mounted from ../scrapers/links.py for the same reason: this server attaches
+# link names to the geometry the exporter's nominal series are keyed by.
+# See docs/adr/0003.
+import links
 
 STATIC_DIR = os.environ.get("WEBMAP_STATIC", os.path.join(os.path.dirname(__file__), "static"))
 DATA_DIR = os.environ.get("WEBMAP_DATA", os.path.join(os.path.dirname(__file__), "data"))
@@ -334,6 +339,34 @@ def _read_file(path, root):
         return None, 404
 
 
+def load_lines():
+    """lines.geojson with each link's display name attached from the registry.
+
+    The file holds only kind/id/geometry for links: the name is a link-registry
+    fact (scrapers/links.py), attached here by id so the file and the registry
+    cannot drift (docs/adr/0003). Features the registry does not know - Snowy
+    and the schematic corridors - pass through with their file properties
+    untouched.
+
+    Returns (doc, ok): ok is True only when the file was read *and* parsed, so
+    the caller can fall back to the generic file path - a missing, forbidden or
+    corrupt lines.geojson then gets exactly the answer it got before names
+    moved.
+    """
+    body, code = _read_file(os.path.join(DATA_DIR, "lines.geojson"), DATA_DIR)
+    if code != 200:
+        return None, False
+    try:
+        doc = json.loads(body)
+    except ValueError:
+        return None, False
+    for feat in doc.get("features", []):
+        link = links.LINKS.get(feat.get("properties", {}).get("id"))
+        if link is not None:
+            feat["properties"]["name"] = link.name
+    return doc, True
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -400,7 +433,18 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path.startswith("/data/"):
-            body, code = _read_file(os.path.join(DATA_DIR, path[len("/data/"):]), DATA_DIR)
+            rel = path[len("/data/"):]
+            body = None
+            if rel == "lines.geojson":
+                # The one geometry file whose link names are not in the file.
+                doc, ok = load_lines()
+                if ok:
+                    body, code = json.dumps(doc), 200
+            if body is None:
+                # The generic path, also the fallback for a lines.geojson that
+                # could not be read or parsed: same bytes, same 403/404, same
+                # content type as before names moved to the registry.
+                body, code = _read_file(os.path.join(DATA_DIR, rel), DATA_DIR)
             ctype = STATIC_TYPES.get(os.path.splitext(path)[1], "application/octet-stream")
             self._send(code, body or (b"not found" if code == 404 else b"forbidden"), ctype)
             return

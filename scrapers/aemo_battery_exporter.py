@@ -272,26 +272,27 @@ from __future__ import annotations
 import argparse
 import csv
 import dataclasses
-import errno
 import io
 import json
 import logging
 import os
 import random
 import re
-import socket
 import sys
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 import zipfile
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from exposition import escape_label, fmt
+# The one retrying client (docs/adr/0008), bound by name the way exposition's
+# two helpers are. All four of its names are bound here, and test_http_client
+# pins each as http_client's definition by identity, so a private copy of the
+# retry loop cannot creep back in unnoticed.
+from http_client import ScrapeError, describe_http_error, http_get, is_transient
 import fleet
 import inference
 import links
@@ -419,115 +420,7 @@ INTERCONNECTOR_OPTIONAL = (
     "MARGINALLOSS",
 )
 
-# An error body from these listing pages is not meaningful, but the cap keeps a
-# misrouted HTML page from bloating a log line.
-MAX_ERROR_BODY = 200
-
-RETRY_BASE_DELAY = 0.5
-
 log = logging.getLogger("aemo_battery_exporter")
-
-
-class ScrapeError(Exception):
-    """Raised when the upstream cannot be read or understood."""
-
-
-# --------------------------------------------------------------------------- #
-# HTTP helpers
-# --------------------------------------------------------------------------- #
-
-
-# Same set as the sibling exporters: the faults a second attempt a moment later
-# can plausibly clear. The one that actually bites inside a container is
-# EAI_AGAIN (-3, "Try again") from getaddrinfo, which Docker's embedded resolver
-# at 127.0.0.11 raises intermittently when forwarding to systemd-resolved.
-# HTTP error responses are deliberately absent - the server answered, so an
-# immediate retry is unlikely to differ.
-TRANSIENT_ERRNOS = frozenset(
-    {
-        socket.EAI_AGAIN,  # -3, only in socket, not errno
-        errno.EAGAIN,
-        errno.ECONNRESET,
-        errno.ECONNABORTED,
-    }
-)
-
-
-def is_transient(reason: object) -> bool:
-    """True for faults a second attempt a moment later can plausibly clear."""
-    if isinstance(reason, (TimeoutError, ConnectionResetError, ConnectionAbortedError)):
-        return True
-    return getattr(reason, "errno", None) in TRANSIENT_ERRNOS
-
-
-def describe_http_error(exc: urllib.error.HTTPError) -> str:
-    """`GET url -> HTTP 404: <body>` (body trimmed to one line)."""
-    detail = ""
-    try:
-        body = exc.read()
-    except Exception:  # noqa: BLE001 - a broken error body must not mask the status
-        body = b""
-    finally:
-        exc.close()
-    if body:
-        text = body.decode("utf-8", "replace").strip()
-        if text:
-            detail = ": " + " ".join(text.split())[:MAX_ERROR_BODY]
-    return "GET %s -> HTTP %s%s" % (exc.url or "?", exc.code, detail)
-
-
-def http_get(url: str, timeout: float, retries: int = 0, retry_budget: float = 0.0) -> bytes:
-    """Fetch a URL, retrying transient faults.
-
-    `retries` caps the attempt count and `retry_budget` caps the total time
-    spent retrying. The budget is the one that matters: a failing DNS lookup
-    inside a container takes ~5s to give up, so an uncapped retry loop can
-    outlast half a poll interval and pile up behind the one download a day.
-    """
-    request = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
-            "Accept-Encoding": "identity",
-            "Accept-Language": "en-AU,en;q=0.9",
-        },
-    )
-    started = time.monotonic()
-    for attempt in range(retries + 1):
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                return response.read()
-        except urllib.error.HTTPError as exc:
-            raise ScrapeError(describe_http_error(exc)) from exc
-        except urllib.error.URLError as exc:
-            if not is_transient(exc.reason):
-                raise ScrapeError("GET %s -> %s" % (url, exc.reason)) from exc
-            if attempt >= retries:
-                raise ScrapeError("GET %s -> %s" % (url, exc.reason)) from exc
-            spent = time.monotonic() - started
-            if retry_budget and spent >= retry_budget:
-                log.warning(
-                    "giving up on %s after %.1fs of retry budget: %s",
-                    url,
-                    spent,
-                    exc.reason,
-                )
-                raise ScrapeError("GET %s -> %s" % (url, exc.reason)) from exc
-            delay = RETRY_BASE_DELAY * (2**attempt)
-            delay *= 0.75 + 0.5 * random.random()
-            log.warning(
-                "transient failure (attempt %d of %d) on %s: %s; retrying in %.1fs",
-                attempt + 1,
-                retries + 1,
-                url,
-                exc.reason,
-                delay,
-            )
-            time.sleep(delay)
-            continue
-    raise ScrapeError("GET %s -> gave up after %d attempts" % (url, retries + 1))
 
 
 # --------------------------------------------------------------------------- #

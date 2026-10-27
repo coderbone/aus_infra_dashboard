@@ -100,21 +100,24 @@ Standard library only.
 from __future__ import annotations
 
 import argparse
-import errno
 import json
 import logging
 import os
 import random
-import socket
 import sys
 import threading
 import time
 import urllib.error
 import urllib.parse
-import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from exposition import escape_label, fmt
+# The one retrying client (docs/adr/0008), bound by name the way exposition's
+# two helpers are. All four of its names are bound here: the suite reaches
+# `exporter.is_transient` through this namespace, and test_http_client pins
+# each as http_client's definition by identity - which for this exporter also
+# covers `AuthError`, a subclass of the shared `ScrapeError`.
+from http_client import ScrapeError, describe_http_error, http_get, is_transient
 import fleet
 
 DEFAULT_API_BASE = "https://api.openelectricity.org.au"
@@ -178,14 +181,7 @@ HOURLY_REFRESH_INTERVAL = 3600.0
 # per poll.
 DEFAULT_REQUEST_INTERVAL = 0.6
 
-MAX_ERROR_BODY = 200
-RETRY_BASE_DELAY = 0.5
-
 log = logging.getLogger("oe_battery_exporter")
-
-
-class ScrapeError(Exception):
-    """Raised when the upstream cannot be read or understood."""
 
 
 class AuthError(ScrapeError):
@@ -195,46 +191,10 @@ class AuthError(ScrapeError):
 # --------------------------------------------------------------------------- #
 # HTTP helpers
 # --------------------------------------------------------------------------- #
-
-
-# Same transient set as the sibling exporters: EAI_AGAIN from Docker's embedded
-# resolver is the one that actually bites in a container.
-TRANSIENT_ERRNOS = frozenset(
-    {
-        socket.EAI_AGAIN,
-        errno.EAGAIN,
-        errno.ECONNRESET,
-        errno.ECONNABORTED,
-    }
-)
-
-
-def is_transient(reason: object) -> bool:
-    if isinstance(reason, (TimeoutError, ConnectionResetError, ConnectionAbortedError)):
-        return True
-    return getattr(reason, "errno", None) in TRANSIENT_ERRNOS
-
-
-def describe_http_error(exc: urllib.error.HTTPError) -> str:
-    """`GET url -> HTTP 403: Forbidden`, with the body folded in when present.
-
-    This API's 403 carries no body at all, which is exactly why the UA trap
-    cost time to find: there is nothing in the response to say the request was
-    rejected for who it claimed to be. The message is still worth building
-    because the 401 case (a genuinely bad key) does carry a JSON body.
-    """
-    try:
-        body = exc.read()
-    except Exception:  # noqa: BLE001 - a broken error body must not mask the status
-        body = b""
-    finally:
-        exc.close()
-    detail = ""
-    if body:
-        text = body.decode("utf-8", "replace").strip()
-        if text:
-            detail = ": " + " ".join(text.split())[:MAX_ERROR_BODY]
-    return "GET %s -> HTTP %s%s" % (exc.url or "?", exc.code, detail)
+# The fetch itself - the transient predicate, the HTTP-error message, the
+# scrape exception and the retry loop - is http_client's (docs/adr/0008). What
+# stays here is what is specific to this API: pacing, credit accounting, the
+# 401/403 classification, and the JSON shape.
 
 
 class OpenElectricityClient:
@@ -272,58 +232,44 @@ class OpenElectricityClient:
             time.sleep(wait)
         self._last_request_at = time.monotonic()
 
+    def _before_attempt(self) -> None:
+        """Pace the burst limit, then count the request against the budget.
+
+        Counted when issued, not when answered: the budget is spent by the
+        request, so a 404 or a 500 still has to show up here or the daily
+        tally quietly under-reports what the exporter actually costs. The
+        shared client runs this before every attempt, retries included.
+        """
+        self._pace()
+        self.requests_made += 1
+
+    def _http_error(self, exc: urllib.error.HTTPError) -> Exception:
+        """A rejected key and an absent facility are not the same failure."""
+        message = describe_http_error(exc)
+        if exc.code in (401, 403):
+            return AuthError(message)
+        # 404 and 4xx are answers, not faults: an absent facility is expected
+        # and retrying cannot change it.
+        return ScrapeError(message)
+
     def _request(self, url: str) -> dict:
-        request = urllib.request.Request(
+        payload = http_get(
             url,
+            self.timeout,
+            retries=self.retries,
+            retry_budget=self.retry_budget,
             headers={
                 "Authorization": "Bearer %s" % self.api_key,
                 "User-Agent": USER_AGENT,
                 "Accept": "application/json",
-                "Accept-Encoding": "identity",
             },
+            before_attempt=self._before_attempt,
+            http_error=self._http_error,
         )
-        started = time.monotonic()
-        last = "gave up"
-        for attempt in range(self.retries + 1):
-            self._pace()
-            # Counted when issued, not when answered: the budget is spent by the
-            # request, so a 404 or a 500 still has to show up here or the daily
-            # tally quietly under-reports what the exporter actually costs.
-            self.requests_made += 1
-            try:
-                with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                    payload = response.read()
-                return json.loads(payload.decode("utf-8"))
-            except urllib.error.HTTPError as exc:
-                message = describe_http_error(exc)
-                if exc.code in (401, 403):
-                    raise AuthError(message) from exc
-                # 404 and 4xx are answers, not faults: an absent facility is
-                # expected and retrying cannot change it.
-                raise ScrapeError(message) from exc
-            except urllib.error.URLError as exc:
-                if not is_transient(exc.reason):
-                    raise ScrapeError("GET %s -> %s" % (url, exc.reason)) from exc
-                last = str(exc.reason)
-                if attempt >= self.retries:
-                    break
-                spent = time.monotonic() - started
-                if self.retry_budget and spent >= self.retry_budget:
-                    log.warning("giving up on %s after %.1fs of retry budget", url, spent)
-                    break
-                delay = RETRY_BASE_DELAY * (2**attempt) * (0.75 + 0.5 * random.random())
-                log.warning(
-                    "transient failure (attempt %d of %d) on %s: %s; retrying in %.1fs",
-                    attempt + 1,
-                    self.retries + 1,
-                    url,
-                    exc.reason,
-                    delay,
-                )
-                time.sleep(delay)
-            except ValueError as exc:
-                raise ScrapeError("GET %s -> invalid JSON: %s" % (url, exc)) from exc
-        raise ScrapeError("GET %s -> %s" % (url, last))
+        try:
+            return json.loads(payload.decode("utf-8"))
+        except ValueError as exc:
+            raise ScrapeError("GET %s -> invalid JSON: %s" % (url, exc)) from exc
 
     def get(self, path: str, params: dict | list | None = None) -> dict:
         url = self.base_url + path

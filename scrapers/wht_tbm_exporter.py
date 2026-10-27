@@ -35,32 +35,32 @@ Standard library only.
 from __future__ import annotations
 
 import argparse
-import errno
 import json
 import logging
 import os
-import random
 import re
-import socket
 import sys
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from exposition import escape_label, fmt
+# The one retrying client (docs/adr/0008), bound by name the way exposition's
+# two helpers are. All four of its names are bound here: the suite reaches
+# `exporter.USER_AGENT` and `exporter.is_transient` through this namespace,
+# and test_http_client pins each name as http_client's definition by identity,
+# so a private copy cannot creep back in unnoticed.
+from http_client import BROWSER_USER_AGENT, ScrapeError, describe_http_error, http_get, is_transient
 
 DEFAULT_PAGE_URL = "https://caportal.com.au/rms/wht/tbm-tracker"
 ARCGIS_ITEM_DATA = "https://www.arcgis.com/sharing/rest/content/items/{item_id}/data?f=json"
 DASHBOARD_URL_RE = re.compile(r"arcgis\.com/apps/dashboards/([0-9a-f]{32})", re.I)
 
-# CloudFront rejects requests without a browser-like User-Agent.
-USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/126.0.0.0 Safari/537.36"
-)
+# CloudFront rejects requests without a browser-like User-Agent, so this
+# exporter sends the shared client's browser UA - which is also the default
+# request in http_client, so a bare `http_get(url, timeout)` carries it.
+USER_AGENT = BROWSER_USER_AGENT
 
 PROGRESS_FIELD_HINTS = ("tunnel_progress_m", "progress_m", "progress")
 RING_FIELD_HINTS = ("ring_number", "ring")
@@ -68,99 +68,12 @@ RING_FIELD_HINTS = ("ring_number", "ring")
 log = logging.getLogger("wht_tbm_exporter")
 
 
-class ScrapeError(Exception):
-    """Raised when a required upstream request fails."""
-
-
 # --------------------------------------------------------------------------- #
 # HTTP helpers
 # --------------------------------------------------------------------------- #
-
-
-# Errnos worth a second attempt. The one actually seen here is EAI_AGAIN (-3,
-# "Try again") out of getaddrinfo: about 10% of lookups fail inside the
-# container (Docker's embedded resolver at 127.0.0.11 forwarding to
-# systemd-resolved), and one failed lookup used to cost the whole scrape.
-# HTTP errors are deliberately absent - the server answered, so an immediate
-# retry is unlikely to differ.
-TRANSIENT_ERRNOS = frozenset(
-    {
-        socket.EAI_AGAIN,  # -3, only in socket, not errno
-        errno.EAGAIN,
-        errno.ECONNRESET,
-        errno.ECONNABORTED,
-    }
-)
-
-
-RETRY_BASE_DELAY = 0.5
-
-
-def is_transient(reason: object) -> bool:
-    """True for faults a second attempt a moment later can plausibly clear."""
-    if isinstance(reason, (TimeoutError, ConnectionResetError, ConnectionAbortedError)):
-        return True
-    return getattr(reason, "errno", None) in TRANSIENT_ERRNOS
-
-
-def http_get(url: str, timeout: float, retries: int = 0, retry_budget: float = 0.0) -> bytes:
-    """Fetch a URL, retrying transient faults.
-
-    `retries` caps the attempt count and `retry_budget` caps the total time
-    spent retrying. The budget is the one that matters: a failing lookup here
-    takes ~5s to give up, so an uncapped retry loop can outlast Prometheus's
-    `scrape_timeout` (30s) and turn a recoverable gap into a target marked
-    down. Bounding by time keeps the failure local to the request.
-    """
-    request = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": USER_AGENT,
-            "Accept": "application/json, text/html;q=0.9, */*;q=0.8",
-            "Accept-Encoding": "identity",
-            "Accept-Language": "en-AU,en;q=0.9",
-        },
-    )
-    started = time.monotonic()
-    for attempt in range(retries + 1):
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                return response.read()
-        except urllib.error.HTTPError as exc:
-            raise ScrapeError("GET %s -> HTTP %s" % (url, exc.code)) from exc
-        except urllib.error.URLError as exc:
-            spent = time.monotonic() - started
-            if not is_transient(exc.reason):
-                raise ScrapeError("GET %s -> %s" % (url, exc.reason)) from exc
-            if attempt >= retries:
-                raise ScrapeError("GET %s -> %s" % (url, exc.reason)) from exc
-            if retry_budget and spent >= retry_budget:
-                log.warning(
-                    "giving up on %s after %.1fs of retry budget: %s",
-                    url,
-                    spent,
-                    exc.reason,
-                )
-                raise ScrapeError("GET %s -> %s" % (url, exc.reason)) from exc
-            # Exponential backoff with jitter. The failures arrive in
-            # correlated bursts - both TBM layers can fail every attempt
-            # inside the same window - so a flat short delay just walks
-            # into the same outage, and retrying in lockstep piles two
-            # machines onto the resolver at once. Jitter de-synchronises
-            # them.
-            delay = RETRY_BASE_DELAY * (2**attempt)
-            delay *= 0.75 + 0.5 * random.random()
-            log.warning(
-                "transient failure (attempt %d of %d) on %s: %s; retrying in %.1fs",
-                attempt + 1,
-                retries + 1,
-                url,
-                exc.reason,
-                delay,
-            )
-            time.sleep(delay)
-            continue
-    raise ScrapeError("GET %s -> gave up after %d attempts" % (url, retries + 1))
+# The fetch itself - the transient predicate, the HTTP-error message, the
+# exception and the retry loop - is http_client's (docs/adr/0008). What stays
+# here is what is specific to this exporter: the ArcGIS error convention.
 
 
 def http_get_json(url: str, timeout: float, retries: int = 0, retry_budget: float = 0.0) -> dict:

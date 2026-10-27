@@ -67,6 +67,9 @@ services:
       # The shared exposition formatter (`escape_label`/`fmt`), mounted beside
       # the exporter so `from exposition import ...` resolves. See docs/adr/0007.
       - ./scrapers/exposition.py:/app/exposition.py:ro
+      # The shared retrying HTTP client (`ScrapeError`, `is_transient`,
+      # `describe_http_error`, `http_get`), same arrangement. See docs/adr/0008.
+      - ./scrapers/http_client.py:/app/http_client.py:ro
       - exporter-cache:/cache
     networks: [monitoring]
     restart: unless-stopped
@@ -118,6 +121,9 @@ services:
       # The shared exposition formatter (`escape_label`/`fmt`), mounted beside
       # the exporter so `from exposition import ...` resolves. See docs/adr/0007.
       - ./scrapers/exposition.py:/app/exposition.py:ro
+      # The shared retrying HTTP client (`ScrapeError`, `is_transient`,
+      # `describe_http_error`, `http_get`), same arrangement. See docs/adr/0008.
+      - ./scrapers/http_client.py:/app/http_client.py:ro
     networks: [monitoring]
     restart: unless-stopped
     # TCP probe only, same reasoning as tbm-exporter: /healthz triggers a real
@@ -165,6 +171,9 @@ services:
       # across all four exporters, replacing this exporter's private six-
       # decimal copy. See docs/adr/0007.
       - ./scrapers/exposition.py:/app/exposition.py:ro
+      # The shared retrying HTTP client: one retry loop across all four,
+      # replacing this exporter's private variant. See docs/adr/0008.
+      - ./scrapers/http_client.py:/app/http_client.py:ro
       # The shared fleet module: it writes the cache below and owns how it is
       # read, so all three readers apply the same rules. Reopens the one-file-
       # per-exporter convention - see docs/adr/0002.
@@ -238,6 +247,9 @@ services:
       # The shared exposition formatter (`escape_label`/`fmt`), same
       # arrangement as the fleet module below. See docs/adr/0007.
       - ./scrapers/exposition.py:/app/exposition.py:ro
+      # The shared retrying HTTP client, same arrangement as the exposition
+      # formatter above. See docs/adr/0008.
+      - ./scrapers/http_client.py:/app/http_client.py:ro
       # Shared fleet module, mounted beside the exporter so `import fleet`
       # resolves with no PYTHONPATH. See docs/adr/0002.
       - ./scrapers/fleet.py:/app/fleet.py:ro

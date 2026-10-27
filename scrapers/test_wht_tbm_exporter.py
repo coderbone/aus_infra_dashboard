@@ -203,6 +203,19 @@ class HttpGetTest(unittest.TestCase):
         self.assertIn("HTTP 404", str(ctx.exception))
         self.assertEqual(len(self.calls), 1, "HTTP errors must not be retried")
 
+    def test_http_error_message_carries_the_response_body(self):
+        # The sibling exporters fold the body into the message; this one used
+        # to drop it, so whatever the 403 said never reached the log.
+        error = urllib.error.HTTPError(
+            "https://example.test/x", 403, "Forbidden", {}, io.BytesIO(b"stale layer id")
+        )
+        self.patch_urlopen([error])
+        with self.assertRaises(ScrapeError) as ctx:
+            exporter.http_get("https://example.test/x", 1.0)
+        self.assertIn("HTTP 403", str(ctx.exception))
+        self.assertIn("stale layer id", str(ctx.exception))
+        self.assertEqual(len(self.calls), 1)
+
     def test_permanent_urerror_fails_without_retrying(self):
         self.patch_urlopen([url_error(permanent_reason())])
         with self.assertRaises(ScrapeError) as ctx:

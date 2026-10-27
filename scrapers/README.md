@@ -1,8 +1,9 @@
 # Prometheus exporters
 
 Four independent, stdlib-only exporters live here. All are single files that
-`docker-compose.yml` bind-mounts into `python:3.12-alpine`; none needs an image
-build.
+`docker-compose.yml` bind-mounts into `python:3.12-alpine`, along with the flat
+shared modules they import (`exposition.py`, `http_client.py`, `fleet.py`,
+`links.py`, `inference.py`, `soc_policy.py`); none needs an image build.
 
 | Exporter | Upstream | Port | Metrics prefix |
 | --- | --- | --- | --- |
@@ -11,7 +12,8 @@ build.
 | [`oe_battery_exporter.py`](#nembattery-state-of-charge-exporter) | OpenElectricity NEM battery storage (`api.openelectricity.org.au`) | 9111 | `oe_battery_`, `oe_batteries_`, `oe_api_`, `oe_poll_`, `oe_last_` |
 | [`aemo_battery_exporter.py`](#aemo-reported-battery-energy-storage-exporter) | AEMO NEMWEB `Next_Day_Dispatch` (`nemweb.com.au`) | 9112 | `aemo_battery_` |
 
-They share the retry-with-time-budget approach, the `--once` mode, the
+They share one retrying HTTP client with a time budget (`http_client.py`, see
+`../docs/adr/0008`), the `--once` mode, the
 `/metrics` + `/healthz` + index handler, and the "never serve a measurement you
 did not just verify" rule (the two battery exporters add a background poll loop,
 for upstreams far too big or too metered to fetch per scrape) — but they are
@@ -137,7 +139,8 @@ python3 -m unittest discover -s scrapers -t scrapers -v
 ./scrapers/test_wht_tbm_exporter.py                         # equivalent
 ```
 
-136 tests in this file (738 for all four exporters), about 15 seconds, **no network
+137 tests in this file (484 for the four exporters; 566 for the full
+`discover` run, which also exercises the shared modules), about 15 seconds, **no network
 access** — every upstream response is
 replayed from `scrapers/fixtures/`, captured verbatim from ArcGIS on
 2026-09-29. Verified offline by re-running with `socket.getaddrinfo` and every
@@ -298,7 +301,7 @@ Alert on `snowy_tantangara_scrape_success == 0` and on
 ### Tests
 
 ```bash
-python3 -m unittest discover -s scrapers -t scrapers    # all four, 726 tests
+python3 -m unittest discover -s scrapers -t scrapers    # all four plus shared modules, 566 tests
 ./scrapers/test_snowy_tantangara_exporter.py            # 121 tests, this one only
 ```
 
@@ -772,7 +775,7 @@ python3 scrapers/aemo_battery_exporter.py --fleet-cache-file=/oefleet/fleet.json
 
 ### Tests
 
-166 tests in this file, **no network access** — upstream responses are synthetic
+168 tests in this file, **no network access** — upstream responses are synthetic
 zips built in-test against the real column indices, and the parsers have been run
 against real captures (details in `NOTES.md`). Alert on `aemo_battery_scrape_success
 == 0` or `time() - aemo_battery_report_newest_interval_timestamp_seconds` being

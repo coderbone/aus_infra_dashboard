@@ -60,22 +60,27 @@ Standard library only.
 from __future__ import annotations
 
 import argparse
-import errno
 import json
 import logging
 import os
-import random
-import socket
 import sys
 import threading
 import time
-import urllib.error
 import urllib.parse
+# Bound here for the suites: their fetch seam patches
+# `exporter.urllib.request.urlopen`, and that name must resolve in this
+# namespace even though the loop calling urlopen now lives in http_client.
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from exposition import escape_label, fmt
+# The one retrying client (docs/adr/0008), bound by name the way exposition's
+# two helpers are. All four of its names are bound here: the suite reaches
+# `exporter.is_transient` and `exporter.describe_http_error` through this
+# namespace, and test_http_client pins each name as http_client's definition
+# by identity, so a private copy cannot creep back in unnoticed.
+from http_client import ScrapeError, describe_http_error, http_get, is_transient
 
 DEFAULT_DATA_URL = (
     "https://www.snowyhydro.com.au/wp-content/themes/snowyhydro/inc/getData.php"
@@ -106,128 +111,15 @@ DEFAULT_YEARS_BACK = 1
 # multi-hour staleness threshold, and irrelevant for a once-daily series.
 LOCAL_UTC_OFFSET_HOURS = 10
 
-# An error body is a single short line ("Error: yearA and yearB must be between
-# 1954 and 2026"), but the cap keeps a misrouted HTML error page from bloating
-# every log line.
-MAX_ERROR_BODY = 200
-
-RETRY_BASE_DELAY = 0.5
-
 log = logging.getLogger("snowy_tantangara_exporter")
-
-
-class ScrapeError(Exception):
-    """Raised when the upstream cannot be read or understood."""
 
 
 # --------------------------------------------------------------------------- #
 # HTTP helpers
 # --------------------------------------------------------------------------- #
-
-
-# Same set as wht_tbm_exporter: the faults a second attempt a moment later can
-# plausibly clear. The one that actually bites inside a container is EAI_AGAIN
-# (-3, "Try again") from getaddrinfo, which Docker's embedded resolver at
-# 127.0.0.11 raises intermittently when forwarding to systemd-resolved.
-# HTTP error responses are deliberately absent - the server answered, so an
-# immediate retry is unlikely to differ.
-TRANSIENT_ERRNOS = frozenset(
-    {
-        socket.EAI_AGAIN,  # -3, only in socket, not errno
-        errno.EAGAIN,
-        errno.ECONNRESET,
-        errno.ECONNABORTED,
-    }
-)
-
-
-def is_transient(reason: object) -> bool:
-    """True for faults a second attempt a moment later can plausibly clear."""
-    if isinstance(reason, (TimeoutError, ConnectionResetError, ConnectionAbortedError)):
-        return True
-    return getattr(reason, "errno", None) in TRANSIENT_ERRNOS
-
-
-def describe_http_error(exc: urllib.error.HTTPError) -> str:
-    """`GET url -> HTTP 400: Error: yearA and yearB must be between 1954 and 2026`
-
-    Unlike the WHT exporter, this endpoint answers errors with a *plain-text*
-    body that says exactly what was wrong, and those two messages are the whole
-    reason a year-range bug would ever be diagnosable. HTTPError is a file-like
-    object, so the body is read here and reported rather than discarded.
-    """
-    detail = ""
-    try:
-        body = exc.read()
-    except Exception:  # noqa: BLE001 - a broken error body must not mask the status
-        body = b""
-    finally:
-        exc.close()
-    if body:
-        text = body.decode("utf-8", "replace").strip()
-        if text:
-            detail = ": " + " ".join(text.split())[:MAX_ERROR_BODY]
-    return "GET %s -> HTTP %s%s" % (exc.url or "?", exc.code, detail)
-
-
-def http_get(url: str, timeout: float, retries: int = 0, retry_budget: float = 0.0) -> bytes:
-    """Fetch a URL, retrying transient faults.
-
-    `retries` caps the attempt count and `retry_budget` caps the total time
-    spent retrying. The budget is the one that matters: a failing DNS lookup
-    inside a container takes ~5s to give up, so an uncapped retry loop can
-    outlast Prometheus's `scrape_timeout` and turn a recoverable gap into a
-    target marked down. Bounding by time keeps the failure local to the request.
-    """
-    request = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-            "Accept": "application/json, text/html;q=0.9, */*;q=0.8",
-            "Accept-Encoding": "identity",
-            "Accept-Language": "en-AU,en;q=0.9",
-        },
-    )
-    started = time.monotonic()
-    for attempt in range(retries + 1):
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                return response.read()
-        except urllib.error.HTTPError as exc:
-            # Never retried, and the plain-text body is folded into the message
-            # because for this endpoint it is the entire explanation.
-            raise ScrapeError(describe_http_error(exc)) from exc
-        except urllib.error.URLError as exc:
-            if not is_transient(exc.reason):
-                raise ScrapeError("GET %s -> %s" % (url, exc.reason)) from exc
-            if attempt >= retries:
-                raise ScrapeError("GET %s -> %s" % (url, exc.reason)) from exc
-            spent = time.monotonic() - started
-            if retry_budget and spent >= retry_budget:
-                log.warning(
-                    "giving up on %s after %.1fs of retry budget: %s",
-                    url,
-                    spent,
-                    exc.reason,
-                )
-                raise ScrapeError("GET %s -> %s" % (url, exc.reason)) from exc
-            # Exponential backoff with jitter. The failures arrive in correlated
-            # bursts, so a flat short delay just walks into the same outage and
-            # lockstep retries de-synchronise nothing.
-            delay = RETRY_BASE_DELAY * (2**attempt)
-            delay *= 0.75 + 0.5 * random.random()
-            log.warning(
-                "transient failure (attempt %d of %d) on %s: %s; retrying in %.1fs",
-                attempt + 1,
-                retries + 1,
-                url,
-                exc.reason,
-                delay,
-            )
-            time.sleep(delay)
-            continue
-    raise ScrapeError("GET %s -> gave up after %d attempts" % (url, retries + 1))
+# The fetch itself - the transient predicate, the HTTP-error message with the
+# body this endpoint's 400s hinge on, the scrape exception and the retry loop -
+# is http_client's (docs/adr/0008). What stays here is the JSON shape.
 
 
 def http_get_json(url: str, timeout: float, retries: int = 0, retry_budget: float = 0.0) -> dict:

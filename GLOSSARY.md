@@ -109,6 +109,24 @@ Consumers read it (`scrapers/soc_policy.py`); none restates it beside them.
 _Avoid_: policy (that is `inference.Policy`, the explicit input to one
 estimator call)
 
+## Scraping
+
+**Scrape error**:
+`ScrapeError` — the exception raised when a required upstream request cannot be
+read or understood: a fault, a non-2xx answer, or a body that will not parse.
+Exporters treat it as "this cycle's data is missing" and fall back to the last
+good value; they never crash on it.
+_Avoid_: HTTP error (that is one cause; this is what callers catch)
+
+**Retrying HTTP client**:
+The single definition of how an upstream fetch happens: the scrape error, the
+transient-fault predicate, the HTTP-error message with the response body
+folded in, and the retry loop with its attempt cap, time budget and jittered
+backoff (`scrapers/http_client.py`). All four exporters fetch through it;
+none carries a private copy. The budget is what bounds a request in time, so
+a failing lookup cannot outlast a Prometheus scrape.
+_Avoid_: http_get (that is one function; this is the contract)
+
 ## Exposition
 
 **Exposition formatter**:

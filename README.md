@@ -207,16 +207,21 @@ to be cloned should read its own key from the cloner. That is what
 python3 -m unittest discover -s scrapers -t scrapers   # the four exporters
 python3 -m unittest discover -s webmap -t webmap       # the web map's live feed
 python3 -m unittest discover -s tools -t tools         # the dashboard builder
+node --test webmap/test_model.js                       # the web map's model layer
 ```
 
-Three roots, because `unittest discover` takes a single start directory and the
-importable top-level directory has to match it (`-t`), and the map's server is
-not an exporter. All run from the repo root, offline: the
-exporters replay captured upstream responses from `scrapers/fixtures/`, the
-map's payload builder is tested against an in-memory snapshot source, with the
-Prometheus adapter's batched queries stubbed at the HTTP boundary, and the
-dashboard builder is imported (which writes nothing) and compared against the
-committed JSON.
+Three Python roots, because `unittest discover` takes a single start directory
+and the importable top-level directory has to match it (`-t`), and the map's
+server is not an exporter. The fourth is JavaScript: the map's model layer
+(`webmap/static/model.js`) is pure — no DOM, no Leaflet — so its tests run in
+Node. It needs Node only for that one file and for the payload-pin test inside
+the webmap suite (`ModelPayloadContractTest`, which executes the model to read
+its declared field list). All run from the repo root, offline: the exporters
+replay captured upstream responses from `scrapers/fixtures/`, the map's payload
+builder is tested against an in-memory snapshot source, with the Prometheus
+adapter's batched queries stubbed at the HTTP boundary, and the dashboard
+builder is imported (which writes nothing) and compared against the committed
+JSON.
 
 ## Verify
 

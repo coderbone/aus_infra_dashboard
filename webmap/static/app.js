@@ -54,6 +54,13 @@ let showStatus = {
   committed: true
 };
 
+// The toggle state the model's visibility gate reads, rebuilt from the live
+// toggle globals on each call. The model never reads these globals itself -
+// they travel in - so it stays a pure function of (payload, toggles).
+function visToggles() {
+  return { showIdle, showStatus };
+}
+
 const map = L.map("map", { zoomControl: true, attributionControl: false }).setView([-33.2, 145.0], 5);
 
 const regionLayers = {}; // code -> path layer
@@ -121,20 +128,6 @@ const COMMISSION_ARC = "#ab9bf0";
 const COMMISSION_ARC_INNER = 0.58;
 const LINE_COLORS = { low: "#5ec1e6", mid: "#f2c84b", high: "#ef5b3f", nodata: "#64758b", snowy: "#3dd6c7" };
 
-function regionMetricValue(code) {
-  const r = state.regions[code];
-  if (!r) return null;
-  if (metric === "stored") return typeof r.stored_mwh === "number" ? r.stored_mwh : null;
-  if (metric === "fossil") return typeof r.fossil_mw === "number" ? r.fossil_mw : null;
-  if (metric === "curtail") {
-    const c = r.curtail || {};
-    let sum = 0, any = false;
-    for (const v of Object.values(c)) { if (typeof v === "number") { sum += v; any = true; } }
-    return any ? sum : null;
-  }
-  return null;
-}
-
 /* ---------- geometry init ---------- */
 
 async function initGeometry() {
@@ -190,7 +183,7 @@ async function initGeometry() {
 
 function applyRegions() {
   for (const [code, layer] of Object.entries(regionLayers)) {
-    const val = regionMetricValue(code);
+    const val = Model.regionMetricValue(state, metric, code);
     layer.setStyle({
       fillColor: metric === "none" ? "#16283f" : (val == null ? "#1b2740" : ramp(val, stopsForMetric())),
     });
@@ -203,7 +196,10 @@ const stopsForMetric = () => (metric === "stored" ? STOPS_STORED : metric === "f
 function regionTip(code, r) {
   const bits = ['<b>' + code + '</b>'];
   if (typeof r.stored_mwh === "number") bits.push("stored " + r.stored_mwh.toFixed(0) + " MWh");
-  if (typeof r.fossil_mw === "number") bits.push("fossil " + r.fossil_mw.toFixed(0) + " MW");
+  // Fossil is the model's one coal+gas+distillate rollup - the same number the
+  // region fill paints and the popup ring's fossil bands sum to.
+  const fossilMw = Model.regionFossilMw(state, code);
+  if (fossilMw != null) bits.push("fossil " + fossilMw.toFixed(0) + " MW");
   if (typeof r.rooftop_mw === "number") bits.push("rooftop " + r.rooftop_mw.toFixed(0) + " MW");
   if (typeof r.import_mw === "number") bits.push("import " + r.import_mw.toFixed(0) + " MW");
   if (typeof r.export_mw === "number") bits.push("export " + r.export_mw.toFixed(0) + " MW");
@@ -226,92 +222,14 @@ const RING_COLOR = {
   imports: "#f472b6", exports: "#a3e635",
 };
 
-// Everything the region popup needs, aggregated from data already on the page:
-// the per-DUID live MW in state.units (all generators and loads), the freshest
-// battery power (unitPower: AEMO 5-min SCADA) and the per-fuel curtailment the
-// AEMO exporter publishes per region. Generation and load are kept apart; within
-// each, a fuel total can net several units. A category with no live series is
-// left out rather than drawn as zero.
-function regionFlows(code) {
-  const gen = [], load = [];
-  const add = (arr, key, label, color, value) => {
-    if (typeof value !== "number" || !isFinite(value) || value <= 0.5) return;
-    const hit = arr.find((s) => s.key === key);
-    if (hit) hit.value += value; else arr.push({ key, label, color, value });
-  };
-  const unitMw = (duid) => {
-    const m = state.units && state.units[duid];
-    return m && typeof m.power_mw === "number" ? m.power_mw : null;
-  };
-  // Sum the positive output of a region's facilities, optionally filtered to one
-  // fueltech; null (rather than 0) when nothing in the region reported.
-  const genSum = (facs, pick) => {
-    let sum = 0, any = false;
-    for (const fac of facs || []) {
-      if (fac.region !== code) continue;
-      for (const u of fac.units || []) {
-        if (pick && !pick(u)) continue;
-        const mw = unitMw(u.code);
-        if (typeof mw !== "number") continue;
-        any = true;
-        sum += Math.max(0, mw);
-      }
-    }
-    return any ? sum : null;
-  };
-  add(gen, "coal", "Coal", RING_COLOR.coal, genSum(state.coal));
-  add(gen, "gas", "Gas", RING_COLOR.gas, genSum(state.gas));
-  add(gen, "distillate", "Distillate", RING_COLOR.distillate, genSum(state.distillate));
-  add(gen, "hydro", "Hydro", RING_COLOR.hydro, genSum(state.hydro, (u) => u.fueltech_id === "hydro"));
-  add(gen, "wind", "Wind", RING_COLOR.wind, genSum(state.renewables, (u) => u.fueltech_id === "wind" || u.fueltech_id === "wind_farm"));
-  add(gen, "solar", "Solar", RING_COLOR.solar, genSum(state.renewables, (u) => u.fueltech_id === "solar" || u.fueltech_id === "solar_utility"));
-  const rooftopMw = (state.regions[code] || {}).rooftop_mw;
-  add(gen, "rooftop", "Rooftop solar", RING_COLOR.rooftop, (typeof rooftopMw === "number" && isFinite(rooftopMw) && rooftopMw >= 0) ? rooftopMw : null);
-  // Imports from other regions count as supply, so they sit in the
-  // generation band; exports are demand and sit in the load band. The
-  // AEMO exporter derives both per region from the interconnector flows.
-  const region = state.regions[code] || {};
-  add(gen, "imports", "Imports", RING_COLOR.imports, region.import_mw);
-
-  // Batteries are bidirectional: discharging is generation, charging is load.
-  // unitPower picks the freshest of the two power sources, exactly as the
-  // markers do, so the ring agrees with what is on the map.
-  let batGen = 0, batLoad = 0, batAny = false;
-  for (const fac of state.fleet || []) {
-    if (fac.region !== code) continue;
-    for (const u of fac.units || []) {
-      const p = unitPower(u.code);
-      if (!p || typeof p.mw !== "number") continue;
-      batAny = true;
-      if (p.mw > 0) batGen += p.mw; else batLoad += -p.mw;
-    }
-  }
-  add(gen, "battery", "Battery", RING_COLOR.battery, batAny ? batGen : null);
-  add(load, "battery", "Battery charge", RING_COLOR.battery, batAny ? batLoad : null);
-
-  // Pumps are the load DUIDs behind pumped hydro; AEMO signs them negative.
-  let pumpLoad = 0, pumpAny = false;
-  for (const fac of state.hydro || []) {
-    if (fac.region !== code) continue;
-    for (const u of fac.units || []) {
-      if (u.fueltech_id !== "pumps") continue;
-      const mw = unitMw(u.code);
-      if (typeof mw !== "number") continue;
-      pumpAny = true;
-      pumpLoad += Math.max(0, -mw);
-    }
-  }
-  add(load, "pumps", "Pumps", RING_COLOR.pumps, pumpAny ? pumpLoad : null);
-  add(load, "exports", "Exports", RING_COLOR.exports, region.export_mw);
-
-  // Per-region curtailment, added to the generation band as unrealised output.
-  const cur = (state.regions[code] || {}).curtail || {};
-  add(gen, "wind_curt", "Wind curtailed", RING_COLOR.wind, cur.wind);
-  add(gen, "solar_curt", "Solar curtailed", RING_COLOR.solar, cur.solar);
-
-  const totalGen = gen.reduce((a, s) => a + s.value, 0);
-  const totalLoad = load.reduce((a, s) => a + s.value, 0);
-  return { gen, load, totalGen, totalLoad, max: Math.max(totalGen, totalLoad) };
+// The model returns each region-flow segment as {key, label, value}; colour is
+// drawing, so it is attached here by key. A curtailed fuel reuses its own
+// hue (see ringSwatch / regionRingSVG) so "spilled generation" reads as the
+// same resource the region could have used, not a separate one.
+function ringSegColor(seg) {
+  if (seg.key === "wind_curt") return RING_COLOR.wind;
+  if (seg.key === "solar_curt") return RING_COLOR.solar;
+  return RING_COLOR[seg.key];
 }
 
 // A point on a circle whose 0 degrees is 12 o'clock, sweeping clockwise - the
@@ -384,11 +302,13 @@ function ringSwatch(s) {
 }
 
 function regionPopup(code, name) {
-  const f = regionFlows(code);
+  const f = Model.regionFlows(state, code);
+  for (const seg of f.gen) seg.color = ringSegColor(seg);
+  for (const seg of f.load) seg.color = ringSegColor(seg);
   const list = (segs, sign) => segs.length
     ? segs.map((s) => '<div class="rrow">' + ringSwatch(s) + s.label + ': ' + sign + Math.round(s.value) + ' MW</div>').join("")
     : '<div class="rrow"><span style="color:#7d8fa5">no live data</span></div>';
-  const total = (v, sign) => v > 0.5 ? sign + Math.round(v) + ' MW' : '&ndash;';
+  const total = (v, sign) => v > Model.IDLE_MW ? sign + Math.round(v) + ' MW' : '&ndash;';
   return '<div class="pop rpop"><div class="rhead"><b>' + (name || code) + '</b> <k>' + code + '</k></div>' +
     regionRingSVG(f) +
     '<div class="rsect"><div class="rtitle"><b>Generation</b> (' + total(f.totalGen, "") + ')</div>' +
@@ -443,7 +363,7 @@ function num(v, digits) {
 
 function updateLineTip(e, f) {
   const p = e.feat.properties;
-  const stale = f && typeof f.age === "number" && f.age > 900;
+  const stale = Model.isStaleAge(f && f.age);
   let html = '<b>' + p.name + '</b><br>' + p.id;
   if (!f) { html += ' &middot; no data'; }
   else {
@@ -493,7 +413,7 @@ function bearing(a, b) {
 }
 
 function updateArrow(e, f) {
-  if (!(f && typeof f.flow === "number") || Math.abs(f.flow) < 0.5) { hideArrow(e); return; }
+  if (!(f && typeof f.flow === "number") || Math.abs(f.flow) < Model.IDLE_MW) { hideArrow(e); return; }
   const mid = segmentMidpoint(e.feat.geometry.coordinates, 0.5);
   let deg = mid.deg;
   if (f.flow < 0) deg = (deg + 180) % 360;
@@ -513,136 +433,8 @@ function hideArrow(e) {
 
 /* ---------- batteries ---------- */
 
-function facilityTotal(fac) {
-  let total = 0;
-  for (const u of fac.units) total += u.capacity_mwh || 0;
-  return total;
-}
-
-// A facility is "committed" when none of its units are yet active. Committed
-// facilities are built but not operating, so they are hidden when the toggle is
-// off while remaining available when thinking about future capacity.
-function isCommitted(fac) {
-  const units = fac.units || [];
-  return units.length > 0 && units.every((u) => u.status === "committed");
-}
-
-function isCommissioning(fac) {
-  return (fac.units || []).some((u) => u.status === "commissioning");
-}
-
-function isIdleFacility(fac) {
-  if (!fac || !fac.units) return false;
-  // Batteries are idle if not charging/discharging significantly
-  if (fac.kind === "battery") {
-    let sumMw = 0;
-    let has = false;
-    for (const u of fac.units || []) {
-      const p = unitPower ? unitPower(u.code) : null;
-      if (p && typeof p.mw === "number") { sumMw += p.mw; has = true; }
-    }
-    if (!has) {
-      const fp = facilityPower(fac);
-      if (!fp || typeof fp.mw !== "number") return true;
-      return Math.abs(fp.mw) < 0.5;
-    }
-    return Math.abs(sumMw) < 0.5;
-  }
-  // For generators, check if they're producing significant power
-  if (fac.kind === "renewable") {
-    let gen = 0, measured = false;
-    for (const u of fac.units) {
-      const m = state.units && state.units[u.code];
-      if (!m || typeof m.power_mw !== "number") continue;
-      measured = true;
-      gen += Math.max(0, m.power_mw);
-    }
-    if (!measured) return true;
-    return gen < 0.5;
-  }
-  if (fac.kind === "hydro") {
-    let activity = 0, measured = false;
-    for (const u of fac.units || []) {
-      const m = state.units && state.units[u.code];
-      if (!m || typeof m.power_mw !== "number") continue;
-      measured = true;
-      activity += Math.abs(m.power_mw);
-    }
-    if (!measured) {
-      const agg = hydroAgg ? hydroAgg(fac) : null;
-      if (agg && agg.measured) return (agg.activity || 0) < 0.5;
-      return false;
-    }
-    return activity < 0.5;
-  }
-  if (fac.kind === "coal" || fac.kind === "gas" || fac.kind === "distillate") {
-    const agg = thermalAgg(fac);
-    if (!agg.measured) {
-      // If we don't have live data, don't hide based on idle
-      return false;
-    }
-    return agg.gen < 0.5;
-  }
-  // Fallback: check any unit power
-  let anyMw = null;
-  for (const u of fac.units) {
-    const p = unitPower && unitPower(u.code);
-    if (p && typeof p.mw === "number") { anyMw = p.mw; break; }
-  }
-  if (anyMw !== null) return Math.abs(anyMw) < 0.5;
-  return false;
-}
-
-function facilityStatusVisible(fac) {
-  if (!fac || !fac.units) return false;
-  const units = fac.units || [];
-  // Apply idle filter first - applies to units of any fuel type
-  if (typeof showIdle !== 'undefined' && !showIdle) {
-    if (fac.kind === 'battery' || fac.kind === 'hydro' || fac.kind === 'coal' || fac.kind === 'gas' || fac.kind === 'distillate' || fac.kind === 'renewable') {
-      if (isIdleFacility(fac)) return false;
-    }
-  }
-  // If any unit is in a selected status, show. Also handle facilities that are all committed.
-  for (const u of units) {
-    const st = (u.status || "").toLowerCase();
-    if (st === "operating" && showStatus.operating) return true;
-    if (st === "operational" && showStatus.operational) return true;
-    if (st === "commissioning" && showStatus.commissioning) return true;
-    if (st === "committed" && showStatus.committed) return true;
-  }
-  // If no unit matched known statuses, check by facility-level flags
-  if (isCommitted(fac) && showStatus.committed) return true;
-  if (isCommissioning(fac) && showStatus.commissioning) return true;
-  return false;
-}
-
-
-// Two numbers drive a commissioning facility's marker:
-//   frac  peak stored energy over the commissioning window / registered storage
-//         capacity - how much of the battery has been energised. There is no
-//         module count upstream, so this is the physical proxy - energy can only
-//         be stored in cells that exist and are connected - and it is a lower
-//         bound, since a unit that has never charged to its ceiling reads low.
-//   fill  current inferred stored energy / peak stored so far - how charged the
-//         energised plant is right now, as a fraction of the most it has ever
-//         held. This drives the arc's colour (red near empty, green near peak).
-// Null when the unit publishes no peak series (e.g. the WEM facilities), in
-// which case no arc is drawn.
-function facilityCommission(fac) {
-  let peak = 0, cur = 0, cap = 0, anyPeak = false, anyCur = false;
-  for (const u of fac.units || []) {
-    const c = u.capacity_mwh || 0;
-    if (c <= 0) continue;
-    cap += c;
-    const m = state.batteries[u.code];
-    if (m && typeof m.peak_stored_mwh === "number") { peak += m.peak_stored_mwh; anyPeak = true; }
-    if (m && typeof m.inf_stored_mwh === "number") { cur += m.inf_stored_mwh; anyCur = true; }
-  }
-  if (!anyPeak || cap <= 0) return null;
-  const frac = Math.max(0, Math.min(1, peak / cap));
-  const fill = anyCur && peak > 0 ? Math.max(0, Math.min(1, cur / peak)) : null;
-  return { frac, fill };
-}
+// The domain answers - visibility, idle, power, SoC, commissioning progress -
+// come from the model (Model.*): this file only draws what it is told.
 
 // A donut sector (annular wedge) sized in metres, drawn as a lat/lng polygon so
 // it overlays the L.circle. Leaflet renders that circle as an ellipse whose
@@ -703,59 +495,13 @@ function radiusFor(mwh) {
   return Math.min(14800, 2800 + 12000 * mwh / (mwh + 3000)) * viewScale();
 }
 
-function unitPower(code) {
-  // AEMO's 5-min Dispatch_SCADA MW is the only per-unit power source now: the
-  // OE exporter retired its `power` family on 2026-10-20 once AEMO coverage
-  // proved a superset. Positive is discharging, negative charging.
-  const m = state.batteries[code];
-  if (!m || typeof m.aemo_power_mw !== "number") return null;
-  return {
-    mw: m.aemo_power_mw,
-    src: "aemo",
-    age: typeof m.aemo_power_age_s === "number" ? m.aemo_power_age_s : Infinity,
-  };
-}
-function facilityPower(fac) {
-  let sumMw = 0;
-  let has = false;
-  for (const u of fac.units) {
-    const p = unitPower(u.code);
-    if (p) { sumMw += p.mw; has = true; }
-  }
-  return has ? { mw: sumMw } : null;
-}
-
-// AEMO sign convention: positive = discharging, negative = charging.
+// AEMO sign convention: positive = discharging, negative = charging. The idle
+// bar is the model's one threshold, so the label and the idle filter agree.
 function rateLabel(mw) {
   if (typeof mw !== "number" || !isFinite(mw)) return "&ndash;";
-  if (mw > 0.5) return '<span style="color:#ef4444">discharging ' + mw.toFixed(1) + " MW</span>";
-  if (mw < -0.5) return '<span style="color:#22c55e">charging ' + Math.abs(mw).toFixed(1) + " MW</span>";
+  if (mw > Model.IDLE_MW) return '<span style="color:#ef4444">discharging ' + mw.toFixed(1) + " MW</span>";
+  if (mw < -Model.IDLE_MW) return '<span style="color:#22c55e">charging ' + Math.abs(mw).toFixed(1) + " MW</span>";
   return "idle";
-}
-
-function unitSoc(code, capacityMwh) {
-  // AEMO's live inferred SOC (daily anchor + integrated 5-min SCADA) is the
-  // only per-unit SOC now; the OE exporter retired its measured ratio on
-  // 2026-10-20. Inference is flagged so the UI can label it as an estimate.
-  const m = state.batteries[code];
-  if (!m || typeof m.inf_stored_mwh !== "number" || !(capacityMwh > 0)) return null;
-  return {
-    soc: m.inf_stored_mwh / capacityMwh,
-    src: "inferred",
-    age: typeof m.inf_age_s === "number" ? m.inf_age_s : Infinity,
-  };
-}
-
-function facilitySoc(fac) {
-  let wsum = 0, w = 0;
-  for (const u of fac.units) {
-    const s = unitSoc(u.code, u.capacity_mwh);
-    if (!s) continue;
-    wsum += s.soc * u.capacity_mwh;
-    w += u.capacity_mwh;
-  }
-  if (!w) return null;
-  return { soc: wsum / w, src: "inferred" };
 }
 
 function removeBattery(facility) {
@@ -769,18 +515,20 @@ function applyBatteries() {
   for (const fac of state.fleet) {
     const loc = fac.location;
     let layer = batteryLayers[fac.facility];
-    if (!loc || !loc.lat || !loc.lng || !showBatteries || !facilityStatusVisible(fac) || (typeof showIdle !== 'undefined' && !showIdle && isIdleFacility(fac))) {
+    // One gate: the model's visibility answer already folds in the idle
+    // filter, so there is no second idle check to drift from it.
+    if (!loc || !loc.lat || !loc.lng || !showBatteries || !Model.facilityStatusVisible(fac, state, visToggles())) {
       removeBattery(fac.facility);
       continue;
     }
     const live = unitLiveStatus(fac);
-    const fsoc = facilitySoc(fac);
+    const fsoc = Model.facilitySoc(fac, state);
     const soc = fsoc ? fsoc.soc : null;
     const monitored = !!live || !!fsoc;
-    const total = facilityTotal(fac);
-    const fp = facilityPower(fac);
-    const commissioning = isCommissioning(fac);
-    const commission = commissioning ? facilityCommission(fac) : null;
+    const total = Model.facilityTotal(fac);
+    const fp = Model.facilityPower(fac, state);
+    const commissioning = Model.isCommissioning(fac);
+    const commission = commissioning ? Model.facilityCommission(fac, state) : null;
     const ring = !commissioning && fp && Math.abs(fp.mw) > 5 ? true : false;
     const ringWeight = fp ? Math.min(6, 2 + Math.abs(fp.mw) / 20) : 0;
     const ringColor = fp && fp.mw < 0 ? "#22c55e" : (fp && fp.mw > 0 ? "#ef4444" : "#101a2b");
@@ -883,14 +631,14 @@ function batteryTip(fac, live, soc, total, commission) {
 
 function batteryPopup(fac) {
   const live = unitLiveStatus(fac);
-  const total = facilityTotal(fac);
-  const fp = facilityPower(fac);
-  const fsoc = facilitySoc(fac);
+  const total = Model.facilityTotal(fac);
+  const fp = Model.facilityPower(fac, state);
+  const fsoc = Model.facilitySoc(fac, state);
   const st = fac.units.map((u) => u.status).filter(Boolean)[0] || "";
   let rows = '<tr><th>unit</th><th class="num">cap</th><th class="num">SoC</th><th class="num">rate</th></tr>';
   for (const u of fac.units) {
-    const soc = unitSoc(u.code, u.capacity_mwh);
-    const p = unitPower(u.code);
+    const soc = Model.unitSoc(u.code, u.capacity_mwh, state);
+    const p = Model.unitPower(u.code, state);
     rows += '<tr><td>' + u.code + '</td>' +
       '<td class="num">' + (u.capacity_mwh || 0).toFixed(0) + ' MWh</td>' +
       '<td class="num">' + (soc != null ? (soc.soc * 100).toFixed(0) + '%' : '&ndash;') + '</td>' +
@@ -932,7 +680,7 @@ function updateHeader() {
   const mm = String(d.getMinutes()).padStart(2, "0");
   const ss = String(d.getSeconds()).padStart(2, "0");
   timeEl.textContent = hh + ":" + mm + ":" + ss;
-  timeEl.className = age <= 120 ? "fresh" : age <= 600 ? "stale" : "down";
+  timeEl.className = Model.headerFreshness(age);
   promEl.textContent = state.prom === "ok" ? "prometheus ok" : state.prom === "degraded" ? "degraded" : "down";
   promEl.className = state.prom === "ok" ? "fresh" : "down";
 }
@@ -1267,20 +1015,17 @@ function applyRenewables() {
     const loc = fac.location;
     if (!loc || !loc.lat || !loc.lng) continue;
     for (const u of fac.units || []) {
-      const ust = (u.status || "").toLowerCase();
-      if (ust === "committed" && !showStatus.committed) continue;
-      if (ust === "commissioning" && !showStatus.commissioning) continue;
-      if ((ust === "operating" || ust === "operational") && !(showStatus.operating || showStatus.operational)) continue;
-      if (typeof showIdle !== 'undefined' && !showIdle) {
-        const unitPow = (state.units && state.units[u.code] && state.units[u.code].power_mw);
-        if (typeof unitPow === 'number' && Math.abs(unitPow) < 0.5) continue;
-      }
+      // One status gate and one idle threshold, shared with every other
+      // marker path via the model - this used to be an inline copy with its
+      // own rules (issue #14).
+      if (!Model.unitStatusPasses(u.status, showStatus)) continue;
+      if (!showIdle && Model.renewableUnitIdle(u, state)) continue;
       const ft = u.fueltech_id || (u.code && u.code.includes("WF") ? "wind" : "solar");
       const isWind = (ft === "wind" || ft === "wind_farm");
       const isSolar = (ft === "solar" || ft === "solar_utility");
       if (isWind && !showWind) continue;
       if (isSolar && !showSolar) continue;
-      const cap = u.capacity_mw || u.capacity || 0;
+      const cap = u.capacity_mw || 0;
       const key = renMarkerKey(fac, u);
       existing.delete(key);
       // Only the unit's own measured MW (aemo_unit_power_mw, keyed by DUID) drives
@@ -1324,11 +1069,8 @@ function applyRenewables() {
 
 /* ---------- hydro ---------- */
 
-// Output at or above which a hydro marker pulses. A station trickling a few MW
-// out of a 1,500 MW scheme is not "running", so the bar is 5% of registered
-// capacity - but never below 1 MW, since 5% of a 1.4 MW mini-hydro is noise.
-const HYDRO_PULSE_FRAC = 0.05;
-const HYDRO_PULSE_MIN_MW = 1;
+// The pulse decision (5% of capacity, 1 MW floor) lives in the model, as
+// hydroAgg's `pulse`: one threshold owner with the rest of the idle bar.
 
 // Pumped storage and classic hydro share one upstream fueltech (OpenNEM has no
 // pumped_hydro), so the server tags each facility with a `pumped` flag derived
@@ -1354,28 +1096,6 @@ function polyPoints(lat, lng, rMeters, sides, scale, offsetDeg) {
   return pts;
 }
 
-// One marker per facility rather than per unit: Tumut 3's eight units all share
-// a single coordinate, so per-unit polygons would stack invisibly. Generation
-// and pumping are summed separately - they come from different DUIDs (the
-// `hydro` unit vs the sibling `pumps` unit) and read differently in the tooltip.
-function hydroAgg(fac) {
-  let gen = 0, pump = 0, cap = 0, measured = false, age = Infinity;
-  for (const u of fac.units || []) {
-    cap += u.capacity_mw || 0;
-    const m = state.units && state.units[u.code];
-    if (!m || typeof m.power_mw !== "number") continue;
-    const mw = Math.max(0, m.power_mw);
-    measured = true;
-    if (u.fueltech_id === "pumps") pump += mw; else gen += mw;
-    if (typeof m.age_s === "number" && m.age_s < age) age = m.age_s;
-  }
-  const activity = gen + pump;
-  const frac = cap > 0 ? Math.max(0, Math.min(1, activity / cap)) : null;
-  const pulse = measured && activity >= Math.max(HYDRO_PULSE_MIN_MW, HYDRO_PULSE_FRAC * cap);
-  const status = (fac.units || []).map((u) => u.status).filter(Boolean)[0] || "";
-  return { gen, pump, cap, activity, frac, measured, pulse, age, status };
-}
-
 function hydroTip(fac, agg) {
   const kind = fac.pumped ? "pumped hydro" : "hydro";
   let html = '<b>' + fac.name + '</b> (' + fac.facility + ')<br>' +
@@ -1386,8 +1106,8 @@ function hydroTip(fac, agg) {
     return html;
   }
   const lines = [];
-  if (agg.gen > 0.5) lines.push('<span style="color:#6cd968">generating ' + agg.gen.toFixed(0) + ' MW</span>');
-  if (agg.pump > 0.5) lines.push('<span style="color:#5ec1e6">pumping ' + agg.pump.toFixed(0) + ' MW</span>');
+  if (agg.gen > Model.IDLE_MW) lines.push('<span style="color:#6cd968">generating ' + agg.gen.toFixed(0) + ' MW</span>');
+  if (agg.pump > Model.IDLE_MW) lines.push('<span style="color:#5ec1e6">pumping ' + agg.pump.toFixed(0) + ' MW</span>');
   html += '<br>' + (lines.length ? lines.join(' + ') : 'idle');
   if (agg.frac != null) html += ' &middot; ' + Math.round(agg.frac * 100) + '% of capacity';
   if (isFinite(agg.age)) html += ' &middot; ' + agg.age.toFixed(0) + 's old';
@@ -1419,12 +1139,17 @@ function removeHydro(facility) {
   if (ring) { map.removeLayer(ring); delete hydroRings[facility]; }
 }
 
+// One marker per facility rather than per unit: Tumut 3's eight units all share
+// a single coordinate, so per-unit polygons would stack invisibly. Generation
+// and pumping are summed by the model (hydroAgg) - they come from different
+// DUIDs (the `hydro` unit vs the sibling `pumps` unit) and read differently in
+// the tooltip.
 function applyHydro() {
   if (!state.hydro) state.hydro = [];
   for (const fac of state.hydro) {
     const loc = fac.location;
-    const agg = hydroAgg(fac);
-    if (!showHydro || !loc || !loc.lat || !loc.lng || !facilityStatusVisible(fac) || (typeof showIdle !== 'undefined' && !showIdle && isIdleFacility(fac))) {
+    const agg = Model.hydroAgg(fac, state);
+    if (!showHydro || !loc || !loc.lat || !loc.lng || !Model.facilityStatusVisible(fac, state, visToggles())) {
       removeHydro(fac.facility);
       continue;
     }
@@ -1502,23 +1227,6 @@ const FUEL_LABEL = {
   distillate: "distillate",
 };
 
-function thermalAgg(fac) {
-  let cap = 0, gen = 0, measured = false, age = Infinity;
-  const fuels = {};
-  for (const u of fac.units || []) {
-    cap += u.capacity_mw || 0;
-    fuels[u.fueltech_id] = (fuels[u.fueltech_id] || 0) + 1;
-    const m = state.units && state.units[u.code];
-    if (!m || typeof m.power_mw !== "number") continue;
-    measured = true;
-    gen += Math.max(0, m.power_mw);
-    if (typeof m.age_s === "number" && m.age_s < age) age = m.age_s;
-  }
-  const frac = cap > 0 ? Math.max(0, Math.min(1, gen / cap)) : null;
-  const status = (fac.units || []).map((u) => u.status).filter(Boolean)[0] || "";
-  return { cap, gen, measured, frac, age, status, fuels };
-}
-
 function fuelSummary(fuels) {
   return Object.keys(fuels).map((k) => (FUEL_LABEL[k] || k) + (fuels[k] > 1 ? " x" + fuels[k] : "")).join(", ");
 }
@@ -1557,12 +1265,12 @@ function thermalPopup(kind, fac, agg) {
 function applyThermal(kind, facs, show, layers) {
   for (const fac of facs || []) {
     const loc = fac.location;
-    if (!show || !loc || !loc.lat || !loc.lng || !facilityStatusVisible(fac) || (typeof showIdle !== 'undefined' && !showIdle && isIdleFacility(fac))) {
+    if (!show || !loc || !loc.lat || !loc.lng || !Model.facilityStatusVisible(fac, state, visToggles())) {
       const l = layers[fac.facility];
       if (l) { map.removeLayer(l); delete layers[fac.facility]; }
       continue;
     }
-    const agg = thermalAgg(fac);
+    const agg = Model.thermalAgg(fac, state);
     const fill = agg.measured
       ? ramp(agg.frac, STOPS_GEN)
       : (STATUS_COLOR[agg.status] || "#54657a");

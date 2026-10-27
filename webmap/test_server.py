@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -603,6 +604,80 @@ class PayloadContractTest(unittest.TestCase):
         historical = self.build(at=1700000000.0)
         self.assert_contract(historical)
         self.assertEqual(historical["at"], 1700000000.0)
+
+
+MODEL_JS = os.path.join(HERE, "static", "model.js")
+
+
+def resolve_shape(shape, path: str):
+    """Resolve a dotted model-read path against a LIVE_PAYLOAD shape.
+
+    The path language is the one model.js declares in PAYLOAD_FIELDS: `*`
+    steps into a wildcard member (a region/unit map) or a facility list's
+    element shape. Returns the sub-shape at that path, or None when the
+    contract does not declare it - which is the failure this exists to catch.
+    """
+    current = shape
+    for seg in path.split("."):
+        if isinstance(current, dict):
+            if seg == "*":
+                if "*" not in current:
+                    return None
+                current = current["*"]
+            elif seg in current:
+                current = current[seg]
+            elif "?" + seg in current:
+                current = current["?" + seg]
+            else:
+                return None
+        elif isinstance(current, list):
+            if seg != "*" or not current:
+                return None
+            current = current[0]
+        else:
+            return None
+    return current
+
+
+def model_payload_fields() -> list[str]:
+    """The model layer's declared payload reads, read from model.js itself.
+
+    Node executes the module and returns PAYLOAD_FIELDS, so the list lives in
+    exactly one place - beside the code that does the reading - and this test
+    cannot drift from it by being a second hand-maintained copy.
+    """
+    out = subprocess.check_output(
+        ["node", "-e",
+         "console.log(JSON.stringify(require(process.argv[1]).PAYLOAD_FIELDS))",
+         MODEL_JS],
+        text=True,
+    )
+    return json.loads(out)
+
+
+class ModelPayloadContractTest(unittest.TestCase):
+    """The model layer's payload reads, pinned to the server's contract.
+
+    The map's model (webmap/static/model.js) reads the /data/live payload
+    through names it declares in PAYLOAD_FIELDS. PayloadContractTest walks a
+    built payload against the server's declaration; this test walks the
+    model's declaration against the same server contract, so a field renamed
+    on either side of the browser seam fails here instead of blanking a map
+    layer in production. It needs Node (the model is JavaScript); the rest of
+    the webmap suite does not.
+    """
+
+    def test_every_field_the_model_reads_is_declared_by_the_contract(self):
+        for path in model_payload_fields():
+            self.assertIsNotNone(
+                resolve_shape(server.LIVE_PAYLOAD, path),
+                f"the model reads {path}, which server.LIVE_PAYLOAD does not declare",
+            )
+
+    def test_the_model_declaration_is_not_empty(self):
+        """A broken require would hand back nothing, and an empty pin walks
+        over an empty list without noticing."""
+        self.assertTrue(model_payload_fields())
 
 
 class SoCPolicyTest(unittest.TestCase):

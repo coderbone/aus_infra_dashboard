@@ -134,6 +134,37 @@ USER_AGENT = "aus-infra-dashboard/1.0 (+battery-soc-exporter)"
 # are not separate rows - see scrapers/README.md.
 BATTERY_FUELTECH = "battery"
 
+# Series families retired on 2026-10-20 in favour of the AEMO exporter. They
+# must not come back: a second, slower source for the same number is what that
+# change removed, and a stale duplicate on a dashboard is worse than a gap.
+# This list is the exporter's own exposition contract - the exporter test pins
+# the /metrics surface against it, and the dashboard generator pins its queries
+# against it (tools/build_battery_dashboard.py), so a retired family cannot
+# creep back into either. See scrapers/README.md.
+RETIRED_METRICS = (
+    "oe_battery_soc_ratio",
+    "oe_battery_energy_stored_mwh",
+    "oe_battery_power_mw",
+    "oe_battery_last_sample_timestamp_seconds",
+    "oe_battery_sample_age_seconds",
+    "oe_battery_power_sample_timestamp_seconds",
+    "oe_battery_power_sample_age_seconds",
+    "oe_battery_anchor_age_hours",
+    "oe_battery_anchor_timestamp_seconds",
+    "oe_battery_soc_inferred_ratio",
+    "oe_battery_energy_inferred_mwh",
+    "oe_battery_inferred_timestamp_seconds",
+    "oe_battery_inferred_age_seconds",
+    "oe_battery_inferred_saturated",
+    "oe_battery_inferred_hold_hours",
+    "oe_battery_inferred_calibration_pairs",
+    "oe_battery_inferred_calibration_error_ratio",
+    "oe_battery_inferred_calibration_recommended_efficiency",
+    "oe_battery_inferred_calibration_plausible_pairs",
+    "oe_batteries_inferred",
+    "oe_poll_cycle_duration_seconds",
+)
+
 DEFAULT_POLL_INTERVAL = 24 * 3600.0
 
 # Metadata is essentially static - capacity changes a few times a year - so

@@ -68,3 +68,13 @@ identity; compose restates nothing). The dashboard generator has no test seam
 of its own yet — that is issue #8 — so its guarantee here is the regeneration
 diff: change a value in the module, re-run `tools/build_battery_dashboard.py`,
 and the panel prose changes with it.
+
+*Update (issue #12): the generator now has a seam. `build_dashboard()` runs
+`check_semantic_invariants` on the assembled dict before returning, pinning
+the `on(unit)` join (docs/adr/0001), the bar gauge's threshold steps to
+`SOC_RAMP`, the quoted bridge limit to `MAX_GAP_HOURS`, and every query
+against the OE exporter's `RETIRED_METRICS`; the golden-bytes and
+import-safety tests stay. The guarantee here is no longer only the
+regeneration diff. The generator does import the exporter for that one list -
+the opposite of the rejected option above - but only for a fact two programs
+now consume; the policy numbers still come from `soc_policy` alone.*

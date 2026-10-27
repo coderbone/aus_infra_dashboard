@@ -10,7 +10,11 @@ sort_keys=True to match the other committed dashboards.
 
 Importing is safe: the write happens only under `__main__`, so the test suite
 imports the module, rebuilds the dashboard in memory and compares it with the
-committed file. See tools/test_build_battery_dashboard.py.
+committed file. `build_dashboard()` runs two checkers before returning: the
+structural `check_invariants` (grid geometry) and `check_semantic_invariants`
+(the board's claims - the on(unit) join, the SoC policy ramp and gap-limit
+prose, no retired OE series), so a regeneration cannot launder a semantic
+change through the golden-bytes test. See tools/test_build_battery_dashboard.py.
 """
 
 from __future__ import annotations
@@ -32,11 +36,27 @@ OUT = os.path.join(
 # prose changes with it. See docs/adr/0005.
 sys.path.insert(0, os.path.join(REPO, "scrapers"))
 import soc_policy  # noqa: E402
+# The retired OE series families, by the exporter that owns the list; see
+# scrapers/oe_battery_exporter.py and docs/adr/0005.
+import oe_battery_exporter as exporter  # noqa: E402
 
 # Formatted once, %g, so 6.0 reads "6" and 0.91 reads "0.91" in prose; a
 # future fit of 0.908 would read "0.908" without a hand edit here.
 GAP_H = "%g" % soc_policy.MAX_GAP_HOURS
 CHARGE_EFF = "%g" % soc_policy.CHARGE_EFFICIENCY
+
+
+def soc_ramp_steps():
+    """The SoC policy ramp as Grafana threshold steps.
+
+    One derivation, used by the bar gauge and checked by
+    `check_semantic_invariants`: the bar gauge and the map's battery markers
+    draw the same colours from soc_policy's list. See docs/adr/0005.
+    """
+    return [
+        {"color": "#%02X%02X%02X" % rgb, "value": value}
+        for value, rgb in soc_policy.SOC_RAMP
+    ]
 
 # `last_over_time` wraps the instant panels' selectors, and a plain selector
 # serves the range panels. The exporter holds a reading between polls, so both
@@ -796,11 +816,9 @@ panels.append(
         "unit is eligible for a bar.",
         # The SoC ramp itself: soc_policy's percent stops rendered as Grafana
         # threshold steps, so the bar gauge and the map's battery markers draw
-        # the same colours from the same list. See docs/adr/0005.
-        steps=[
-            {"color": "#%02X%02X%02X" % rgb, "value": value}
-            for value, rgb in soc_policy.SOC_RAMP
-        ],
+        # the same colours from the same list. See docs/adr/0005; the
+        # semantic invariants pin this to the policy at build time.
+        steps=soc_ramp_steps(),
     )
 )
 
@@ -1279,6 +1297,131 @@ def check_invariants(panels):
             raise ValueError("panels %d and %d overlap" % (ids[i - 1], ids[i]))
 
 
+# `on(duid)` - the join ADR-0001 retired. The old `label_replace` bridge
+# copied `unit` into `duid` so this would match; without the bridge it
+# silently loses every unit whose AEMO code differs from its fleet code.
+_ON_DUID = re.compile(r"\bon\(\s*[^\)]*\bduid\b")
+
+# The join key ADR-0001 requires. Matched as a regex, not a substring, so
+# PromQL's optional spacing (`on (unit)`) counts too.
+_ON_UNIT = re.compile(r"\bon\(\s*unit\s*\)")
+
+# An AEMO per-unit series paired with the OE fleet gauges (capacity, info) is
+# the fleet join of ADR-0001 and must key on `unit`. Region-level AEMO series
+# pair with each other (`on(region)`), never with the fleet gauges, so they
+# fall outside this rule.
+_AEMO_METRIC = re.compile(r"\baemo_battery_[a-z0-9_]+")
+_FLEET_METRIC = re.compile(r"\boe_battery_fleet_[a-z0-9_]+")
+
+# "6h bridge limit" (or "12h bridge limit", when the number has drifted): the
+# number must be GAP_H - %g of soc_policy.MAX_GAP_HOURS - everywhere it is
+# quoted. Generated prose interpolates GAP_H, so a mismatch means a restated
+# literal somewhere in the descriptions.
+_GAP_QUOTE = re.compile(r"(\d+(?:\.\d+)?)h bridge limit")
+
+# Whole-name references to the retired OE families. Identifier boundaries on
+# both sides: `oe_battery_soc_ratio_total` is a different metric and must not
+# trip the ban.
+_RETIRED_RE = [
+    (
+        name,
+        re.compile(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % re.escape(name)),
+    )
+    for name in exporter.RETIRED_METRICS
+]
+
+
+def _target_exprs(dashboard):
+    """Every Prometheus query expression on the board: panel targets and
+    template-variable queries. Prose is not a query and is checked separately."""
+    for panel in dashboard.get("panels", []):
+        for target in panel.get("targets", []) or []:
+            expr = target.get("expr")
+            if expr:
+                yield panel, expr
+    for variable in dashboard.get("templating", {}).get("list", []):
+        query = variable.get("query")
+        if isinstance(query, dict):
+            query = query.get("query")
+        if query:
+            yield None, query
+
+
+def _where(panel):
+    """Name the offender for an error message: a panel's title, or the
+    template-variable case."""
+    return "panel %s" % panel["title"] if panel else "a template variable"
+
+
+def check_semantic_invariants(dashboard):
+    """Enforce the board's semantic rules on a built dashboard dict.
+
+    The structural rules in `check_invariants` pin the grid; these pin the
+    *claims* - what the queries join on and what the prose asserts - so a
+    regeneration cannot launder a semantic change through the golden-bytes
+    test. Raises ValueError, like the structural checker. See
+    tools/test_build_battery_dashboard.py.
+    """
+    for panel, expr in _target_exprs(dashboard):
+        if _ON_DUID.search(expr):
+            raise ValueError(
+                "%s joins on(duid); the fleet join is on(unit) (docs/adr/0001)"
+                % _where(panel)
+            )
+        for name, pattern in _RETIRED_RE:
+            if pattern.search(expr):
+                raise ValueError(
+                    "%s queries the retired series %s" % (_where(panel), name)
+                )
+        # The fleet-join rule is about queries that *join*; a template
+        # variable's `label_values(...)` only discovers label values and pairs
+        # no series, so it is exempt (the on(duid) ban still covers it).
+        if (
+            panel is not None
+            and _AEMO_METRIC.search(expr)
+            and _FLEET_METRIC.search(expr)
+            and not _ON_UNIT.search(expr)
+        ):
+            raise ValueError(
+                "panel %s pairs an AEMO metric with fleet metadata without "
+                "on(unit) (docs/adr/0001)" % panel["title"]
+            )
+
+    ramp = soc_ramp_steps()
+    for panel in dashboard.get("panels", []):
+        if panel.get("type") != "bargauge":
+            continue
+        steps = panel["fieldConfig"]["defaults"]["thresholds"]["steps"]
+        if steps != ramp:
+            raise ValueError(
+                "panel %s threshold steps are not the SoC policy ramp "
+                "(docs/adr/0005)" % panel["title"]
+            )
+
+    # Prose that quotes the bridge limit must quote the policy's number: the
+    # descriptions used to spell "6h" by hand, so a regeneration after a
+    # policy change left the board describing the old model (docs/adr/0005).
+    # At least one quote must survive - the limit is a load-bearing claim of
+    # this board, not an optional garnish.
+    quotes = []
+    prose = [dashboard.get("description", "")]
+    for panel in dashboard.get("panels", []):
+        prose.append(panel.get("description", ""))
+        content = (panel.get("options") or {}).get("content")
+        if content:
+            prose.append(content)
+    for text in prose:
+        quotes.extend(_GAP_QUOTE.findall(text))
+    if not quotes:
+        raise ValueError("no description quotes the SoC policy bridge limit")
+    for quoted in quotes:
+        if quoted != GAP_H:
+            raise ValueError(
+                "prose quotes a %sh bridge limit; the SoC policy says %sh "
+                "(docs/adr/0005)" % (quoted, GAP_H)
+            )
+
+
 def build_dashboard():
     """Assemble the dashboard dict: assign panel ids, enforce the invariants.
 
@@ -1291,7 +1434,7 @@ def build_dashboard():
     for index, panel in enumerate(panels, start=1):
         panel["id"] = index
     check_invariants(panels)
-    return {
+    dashboard = {
         "annotations": {
             "list": [
                 {
@@ -1407,6 +1550,11 @@ def build_dashboard():
         "version": 1,
         "panels": panels,
     }
+    # The semantic claims run on the whole assembled dict - queries, ramp
+    # steps and prose together - so `main()` cannot write a board that fails
+    # them and the test suite rebuilds through the same gate.
+    check_semantic_invariants(dashboard)
+    return dashboard
 
 
 def main():

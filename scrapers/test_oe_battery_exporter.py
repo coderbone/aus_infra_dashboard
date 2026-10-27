@@ -20,7 +20,7 @@ plus its own API-budget metrics. Live state of charge, stored energy and power
 come from the sibling AEMO exporter (aemo_battery_*). The per-facility time
 series - and every metric derived from them (SOC, energy, inferred SOC,
 efficiency calibration, liveness, request-window optimisation) - were retired
-with that change, and RETIRED_METRICS below pins them as gone.
+with that change, and RETIRED_METRICS (in the exporter) pins them as gone.
 
 The expectations are the upstream's own numbers read out of the fixtures, not
 values invented next to the parser - Eraring is 1997 MWh, and the fleet totals
@@ -54,6 +54,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fleet  # noqa: E402
 import oe_battery_exporter as exporter  # noqa: E402
 from oe_battery_exporter import (  # noqa: E402
+    RETIRED_METRICS,
     AuthError,
     ScrapeError,
 )
@@ -219,32 +220,8 @@ PER_UNIT_METRICS = (
     "oe_battery_fleet_capacity_storage_mwh",
 )
 
-# Families retired on 2026-10-20 in favour of the AEMO exporter. They must not
-# come back: a second, slower source for the same number is what this change
-# removed, and a stale duplicate on a dashboard is worse than a gap.
-RETIRED_METRICS = (
-    "oe_battery_soc_ratio",
-    "oe_battery_energy_stored_mwh",
-    "oe_battery_power_mw",
-    "oe_battery_last_sample_timestamp_seconds",
-    "oe_battery_sample_age_seconds",
-    "oe_battery_power_sample_timestamp_seconds",
-    "oe_battery_power_sample_age_seconds",
-    "oe_battery_anchor_age_hours",
-    "oe_battery_anchor_timestamp_seconds",
-    "oe_battery_soc_inferred_ratio",
-    "oe_battery_energy_inferred_mwh",
-    "oe_battery_inferred_timestamp_seconds",
-    "oe_battery_inferred_age_seconds",
-    "oe_battery_inferred_saturated",
-    "oe_battery_inferred_hold_hours",
-    "oe_battery_inferred_calibration_pairs",
-    "oe_battery_inferred_calibration_error_ratio",
-    "oe_battery_inferred_calibration_recommended_efficiency",
-    "oe_battery_inferred_calibration_plausible_pairs",
-    "oe_batteries_inferred",
-    "oe_poll_cycle_duration_seconds",
-)
+# RETIRED_METRICS lives in oe_battery_exporter - the exporter's exposition
+# contract, also pinned against the dashboard generator's queries.
 
 
 class RenderTest(unittest.TestCase):

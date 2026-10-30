@@ -512,6 +512,46 @@
     return null;
   }
 
+  /* ---------- the interconnector flow bar ---------- */
+
+  // Scale positions for the tooltip's flow bar, as fractions of one bar. The
+  // bar spans the link's own signed range, (-nominal_reverse, +nominal_forward)
+  // - AEMO's MWFLOW sign convention, so forward is positive - which puts zero
+  // off centre on an asymmetric link (VIC1-NSW1 is 1700 one way, 1450 the
+  // other) and keeps both halves to one scale.
+  //
+  // Null when the bar cannot be drawn honestly: no flow reading, or no usable
+  // nominal to size the range with. A missing reading is absent, never zero -
+  // the caller falls back to the text rows instead of a bar that says idle.
+  //
+  // The limit markers take the verbatim signed EXPORTLIMIT/IMPORTLIMIT: AEMO
+  // publishes them on the same axis as the flow (NSW1-QLD1 reads 864 / -1185,
+  // and T-V-MNSP1 reports both negative), so they map straight across. One
+  // outside the nominal range is pinned to the bar's end rather than dropped:
+  // the dynamic dispatch limit genuinely runs past the static rating (QNI has
+  // exported at 902.9 against a 900 nominal, Heywood imported -600 against a
+  // -550 reverse rating), so every limit gets its tick - and the text row
+  // still states the exact value, which is the number to trust when the tick
+  // is sitting on the end.
+  function flowBar(f) {
+    if (!f) return null;
+    if (typeof f.flow !== "number" || !isFinite(f.flow)) return null;
+    const fwd = f.nominal_forward, rev = f.nominal_reverse;
+    if (typeof fwd !== "number" || typeof rev !== "number") return null;
+    if (!isFinite(fwd) || !isFinite(rev) || fwd <= 0 || rev <= 0) return null;
+    const min = -rev, span = rev + fwd;
+    const frac = (v) => (v - min) / span;
+    const pin = (v) => Math.max(0, Math.min(1, frac(v)));
+    const marker = (v) =>
+      typeof v === "number" && isFinite(v) ? pin(v) : null;
+    return {
+      zero: frac(0),
+      flow: pin(f.flow),
+      exp: marker(f.export_limit),
+      imp: marker(f.import_limit),
+    };
+  }
+
   /* ---------- staleness ---------- */
 
   function isStaleAge(ageS) {
@@ -546,6 +586,7 @@
     regionFossilMw,
     regionFlows,
     regionMetricValue,
+    flowBar,
     isStaleAge,
     headerFreshness,
   };

@@ -128,6 +128,15 @@ const COMMISSION_ARC = "#ab9bf0";
 const COMMISSION_ARC_INNER = 0.58;
 const LINE_COLORS = { low: "#5ec1e6", mid: "#f2c84b", high: "#ef5b3f", nodata: "#64758b", snowy: "#3dd6c7" };
 
+// Utilisation -> colour, the scale the map line and the tooltip's flow bar
+// share so the two can never disagree. Anything not finite has no rating to
+// state (Model.flowBar returns null in that case too) and reads as no-data
+// grey rather than as idle.
+function lineColorFor(u) {
+  if (typeof u !== "number" || !isFinite(u)) return LINE_COLORS.nodata;
+  return u > 0.85 ? LINE_COLORS.high : u > 0.6 ? LINE_COLORS.mid : LINE_COLORS.low;
+}
+
 /* ---------- geometry init ---------- */
 
 async function initGeometry() {
@@ -348,7 +357,7 @@ function applyLines() {
       continue;
     }
     const loaded = Math.min(1.2, u);
-    const col = loaded > 0.85 ? LINE_COLORS.high : loaded > 0.6 ? LINE_COLORS.mid : LINE_COLORS.low;
+    const col = lineColorFor(u);
     e.layer.setStyle({ color: col, weight: 1.5 + 3.5 * Math.min(loaded, 1), opacity: 0.95, dashArray: null });
     updateLineTip(e, f);
     updateArrow(e, f);
@@ -361,12 +370,55 @@ function num(v, digits) {
   return typeof v === "number" && isFinite(v) ? v.toFixed(digits) : "n/a";
 }
 
+// The tooltip's flow bar: one fixed 200x18 SVG over the link's own signed
+// range (-reverse .. zero .. +forward). The faint track is that whole range,
+// the thin tick is zero - off centre on an asymmetric link, because both
+// halves share one scale - the fill is the flow in the line's own utilisation
+// colour, and the cased dashed ticks are the dispatch limits. Model.flowBar
+// decides the geometry (and refuses to draw when the bar cannot be honest);
+// this only draws it. Empty string when there is no bar.
+function flowBarSVG(f) {
+  const b = Model.flowBar(f);
+  if (!b) return "";
+  const W = 200, H = 18, y = 4, h = 10;
+  const px = (frac) => frac * W;
+  const n = (v) => v.toFixed(2);
+  const at = (frac) => n(px(frac));
+  let svg = '<svg class="fbar" width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '">';
+  // Faint track so a zero or idle flow still shows the bar it sits on.
+  svg += '<rect x="0" y="' + y + '" width="' + W + '" height="' + h +
+    '" rx="2" fill="rgba(214,226,240,0.08)"/>';
+  const a = Math.min(px(b.flow), px(b.zero));
+  const w = Math.abs(px(b.flow) - px(b.zero));
+  if (w > 0) {
+    svg += '<rect x="' + n(a) + '" y="' + y + '" width="' + n(w) + '" height="' + h +
+      '" rx="2" fill="' + lineColorFor(f.utilisation) + '"/>';
+  }
+  // Zero draws over the fill, so the origin of the scale is never swallowed.
+  svg += '<line x1="' + at(b.zero) + '" y1="' + y + '" x2="' + at(b.zero) +
+    '" y2="' + (y + h) + '" stroke="rgba(214,226,240,0.35)" stroke-width="1"/>';
+  // Limits are cased: a light dashed tick over a panel-coloured line reads
+  // over both the dark track and the coloured fill. An off-scale limit pins to
+  // the bar's end (Model.flowBar), so the drawn x is inset by half a stroke -
+  // at x=0/x=200 the viewBox edge would clip the tick away.
+  const mark = (frac) => {
+    const mx = n(Math.max(1.5, Math.min(W - 1.5, px(frac))));
+    return '<line x1="' + mx + '" y1="1" x2="' + mx + '" y2="17" stroke="#0f1b2d" stroke-width="3"/>' +
+      '<line x1="' + mx + '" y1="1" x2="' + mx + '" y2="17" stroke="#e8f0fa" stroke-width="1" stroke-dasharray="2 2"/>';
+  };
+  if (b.exp != null) svg += mark(b.exp);
+  if (b.imp != null) svg += mark(b.imp);
+  return svg + "</svg>";
+}
+
 function updateLineTip(e, f) {
   const p = e.feat.properties;
   const stale = Model.isStaleAge(f && f.age);
   let html = '<b>' + p.name + '</b><br>' + p.id;
   if (!f) { html += ' &middot; no data'; }
   else {
+    const bar = flowBarSVG(f);
+    if (bar) html += '<br>' + bar;
     html += '<br>flow ' + num(f.flow, 1) + ' MW';
     if (typeof f.metered === "number") html += ' &middot; metered ' + num(f.metered, 1) + ' MW';
     if (typeof f.utilisation === "number" && isFinite(f.utilisation))

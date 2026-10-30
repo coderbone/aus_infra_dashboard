@@ -399,6 +399,81 @@ test("thermal aggregate: generation as a share of capacity, fuels tallied whethe
   assert.deepEqual(agg.fuels, { coal_black: 2, coal_brown: 1 });
 });
 
+/* ---------- the interconnector flow bar ---------- */
+
+// The worked example: VIC1-NSW1, AEMO's own numbers from a dispatch interval
+// where it was binding on export. The range is (-1450, +1700), zero sits at
+// 1450/3150 of the bar rather than the middle, and both limits land inside
+// it - the export marker on the flow itself, because the link was binding.
+function vicLink(over) {
+  return Object.assign({
+    flow: 690.80116,
+    export_limit: 690.80116,
+    import_limit: -595.36292,
+    nominal_forward: 1700,
+    nominal_reverse: 1450,
+  }, over);
+}
+
+test("flow bar: an asymmetric link's signed range puts zero off centre, flow and limits mapped across", () => {
+  const b = Model.flowBar(vicLink());
+  const span = 1450 + 1700;
+  assert.equal(b.zero, 1450 / span);
+  assert.equal(b.flow, (690.80116 + 1450) / span);
+  assert.equal(b.exp, (690.80116 + 1450) / span);   // binding: marker on the flow
+  assert.equal(b.imp, (-595.36292 + 1450) / span);
+  assert.ok(b.imp < b.zero && b.zero < b.flow && b.flow <= 1);
+});
+
+test("flow bar: flow beyond its own nominal clamps to the bar's end, zero flow fills nothing", () => {
+  assert.equal(Model.flowBar(vicLink({ flow: 2500 })).flow, 1);
+  assert.equal(Model.flowBar(vicLink({ flow: -9999 })).flow, 0);
+  const idle = Model.flowBar(vicLink({ flow: 0 }));
+  assert.equal(idle.flow, idle.zero);   // fill from zero to zero
+});
+
+test("flow bar: an off-scale limit pins to the bar's end, an absent one is absent", () => {
+  // AEMO's dynamic limits run past the static nominal (QNI has exported at
+  // 902.9 against a 900 nominal), so outside means "pinned to the end", not
+  // "not drawn" - every limit keeps its tick and the text row states the MW.
+  const b = Model.flowBar(vicLink({ export_limit: 4000, import_limit: -5000 }));
+  assert.equal(b.exp, 1);
+  assert.equal(b.imp, 0);
+  assert.equal(Model.flowBar(vicLink({ export_limit: undefined })).exp, null);
+  assert.equal(Model.flowBar(vicLink({ export_limit: NaN })).exp, null);
+  // On the range itself maps to the very end / very start, same numbers.
+  assert.equal(Model.flowBar(vicLink({ export_limit: 1700 })).exp, 1);
+  assert.equal(Model.flowBar(vicLink({ import_limit: -1450 })).imp, 0);
+});
+
+test("flow bar: T-V-MNSP1's both-negative limits both land left of zero", () => {
+  const b = Model.flowBar({
+    flow: -100, export_limit: -185, import_limit: -220,
+    nominal_forward: 594, nominal_reverse: 478,
+  });
+  const span = 478 + 594;
+  assert.equal(b.exp, (-185 + 478) / span);
+  assert.equal(b.imp, (-220 + 478) / span);
+  assert.ok(b.imp < b.exp && b.exp < b.zero);
+});
+
+test("flow bar: no reading or no usable rating is null - absent, never an idle bar", () => {
+  assert.equal(Model.flowBar(null), null);
+  assert.equal(Model.flowBar(undefined), null);
+  assert.equal(Model.flowBar(vicLink({ flow: undefined })), null);
+  assert.equal(Model.flowBar(vicLink({ flow: NaN })), null);
+  assert.equal(Model.flowBar(vicLink({ flow: Infinity })), null);
+  assert.equal(Model.flowBar(vicLink({ nominal_forward: undefined })), null);
+  assert.equal(Model.flowBar(vicLink({ nominal_reverse: 0 })), null);
+  assert.equal(Model.flowBar(vicLink({ nominal_forward: -1700 })), null);
+});
+
+test("flow bar: a link with flow but no nominal has nothing to scale to, so no bar", () => {
+  // No nominals at all: the registry's own contract says such a link publishes
+  // flow and limits but has no rating - the bar has nothing to scale to.
+  assert.equal(Model.flowBar({ flow: 100, export_limit: 150, import_limit: -150 }), null);
+});
+
 /* ---------- staleness: one table ---------- */
 
 test("staleness: the header's fresh/stale/down cutoffs", () => {

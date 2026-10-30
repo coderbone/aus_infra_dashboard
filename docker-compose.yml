@@ -333,6 +333,12 @@ services:
         condition: service_healthy
       aemobattery-exporter:
         condition: service_healthy
+      # node-exporter joined the scrape list (job `node`, 15s) after this
+      # block was written for the four exporters. The image ships no
+      # healthcheck, so order on start only - Prometheus retries scrapes
+      # anyway; this is boot-order hygiene, same as the four above.
+      node-exporter:
+        condition: service_started
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:9090/-/healthy"]
       interval: 15s
@@ -414,6 +420,16 @@ services:
       - ./webmap/static:/app/static:ro
       - ./webmap/data:/app/data:ro
       - battery-fleet-cache:/cache:ro
+    # /data/live queries Prometheus on every request, so on a cold stack
+    # start the map would otherwise serve a degraded "prom down" payload
+    # until the frontend's next poll. Same condition grafana already uses.
+    # Deliberately no edge on battery-exporter: the fleet cache is read on
+    # mtime per request and self-heals - the same race the AEMO exporter
+    # documents as designed (a cold start routinely beats the OE exporter
+    # to the shared volume).
+    depends_on:
+      prometheus:
+        condition: service_healthy
     networks: [monitoring]
     ports:
       - "9119:9119"

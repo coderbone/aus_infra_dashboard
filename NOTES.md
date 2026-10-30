@@ -435,6 +435,9 @@ grafana/provisioning/datasources/prometheus.yml            # the Prometheus data
 grafana/provisioning/dashboards/default.yml                # the dashboard file provider
 grafana/provisioning/dashboards/western-harbour-tbm.json   # WHT TBM progress dashboard
 grafana/provisioning/dashboards/snowy-tantangara.json      # Snowy reservoir levels dashboard
+grafana/provisioning/dashboards/battery-state-of-charge.json  # NEM battery SoC (generated)
+grafana/provisioning/dashboards/host-metrics.json          # Host system metrics dashboard
+grafana/provisioning/dashboards/interconnectors.json       # NEM interconnector flows (generated)
 ```
 
 **The datasource URL is `http://prometheus:9090`, not
@@ -455,10 +458,12 @@ let provisioning recreate it.
 **The dashboard uid `adr468z` must stay stable too.** Provisioning matches an
 existing dashboard by uid, so keeping it updates the dashboard in place;
 changing it creates a second copy of the same dashboard. This applies to every
-dashboard, and there are now two: `adr468z` for the TBM dashboard and
-`snowy-tantangara` for the reservoir one. Neither uid may be reused for a
+dashboard, and there are now five: `adr468z` (TBM), `snowy-tantangara`
+(reservoirs), `nembattery-soc` (battery SoC), `host-metrics` and
+`interconnectors` (interconnector flows). None may be reused for a
 different dashboard either — `snowy-tantangara` is spelled out in full rather
-than using a Grafana-style random uid precisely so it reads as what it is.
+than using a Grafana-style random uid precisely so it reads as what it is,
+and `interconnectors` follows that example.
 
 `allowUiUpdates: true` lets a dashboard be saved from the UI. **The file only
 wins once the file changes** — provisioning pushes the file into the database

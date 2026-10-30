@@ -18,11 +18,15 @@
 #   western-harbour-tbm.json  adr468z            WHT TBM progress
 #   snowy-tantangara.json     snowy-tantangara   Snowy reservoir levels
 #   battery-state-of-charge.json nembattery-soc  NEM battery state of charge
+#   host-metrics.json         host-metrics       Host system metrics
+#   interconnectors.json      interconnectors    NEM interconnector flows
 #
-# All three are generated/edited with indent=2, sort_keys=True to match the
-# committed files; see NOTES.md section 7. battery-state-of-charge.json is not
-# hand-edited: it is written by tools/build_battery_dashboard.py, so a change
-# belongs there and a re-run keeps the rest of the file byte-identical.
+# All five are written with indent=2, sort_keys=True to match the committed
+# files; see NOTES.md section 7. Two are not hand-edited:
+# battery-state-of-charge.json is written by tools/build_battery_dashboard.py
+# and interconnectors.json by tools/build_interconnector_dashboard.py, so a
+# change belongs in the builder and a re-run keeps the rest of the file
+# byte-identical (both builders' suites fail if the two disagree).
 apiVersion: 1
 
 providers:
